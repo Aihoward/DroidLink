@@ -26,6 +26,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -42,6 +43,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
@@ -295,12 +297,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable private fun MainMenuActions() = Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        BrandHeader(logoSize = 122.dp, subtitle = "READY TO CONNECT")
-        Spacer(Modifier.height(12.dp))
-        NeonButton("HOST GAME") { mode = "host" }
-        NeonButton("JOIN GAME", filled = false) { mode = "client" }
-        Text("0.9.8 BETA", color = mutedText, fontSize = 11.sp, letterSpacing = 2.sp)
+    @Composable private fun MainMenuActions() = BoxWithConstraints(Modifier.fillMaxSize()) {
+        val compact = maxHeight < 430.dp
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = if (compact) 4.dp else 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            BrandHeader(logoSize = if (compact) 72.dp else 122.dp, subtitle = "READY TO CONNECT")
+            Spacer(Modifier.height(if (compact) 6.dp else 18.dp))
+            NeonButton("HOST GAME") { mode = "host" }
+            Spacer(Modifier.height(10.dp))
+            NeonButton("JOIN GAME", filled = false) { mode = "client" }
+            Spacer(Modifier.height(8.dp))
+            Text("0.9.8 BETA • REVISION 2", color = mutedText, fontSize = 11.sp, letterSpacing = 1.5.sp)
+        }
     }
 
     @Composable private fun BrandHeader(logoSize: androidx.compose.ui.unit.Dp, subtitle: String) = Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -329,11 +340,13 @@ class MainActivity : ComponentActivity() {
         OutlinedTextField(
             value = code, onValueChange = onCode, singleLine = true,
             textStyle = LocalTextStyle.current.copy(textAlign = TextAlign.Center, fontSize = 30.sp, fontWeight = FontWeight.Bold, letterSpacing = 5.sp),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { if (code.length == 6 && !sessionStarting) onConnect() }),
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = neonGreen, unfocusedBorderColor = Color.DarkGray, focusedTextColor = Color.White, unfocusedTextColor = Color.White),
             modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth()
         )
-        NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN GAME", enabled = !sessionStarting && code.length == 6, onClick = onConnect)
+        Text("Enter the 6-digit code shown on the host device.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+        NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN HOST", enabled = !sessionStarting, onClick = onConnect)
         StatusCard { Text(clientStatus, color = Color.White, textAlign = TextAlign.Center); Text(audioStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center) }
     }
 
@@ -504,7 +517,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable private fun ScreenFrame(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
-        Column(Modifier.fillMaxSize().background(Color.Black).padding(20.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(Modifier.fillMaxSize().background(Color.Black).imePadding().padding(20.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 NeonTextButton("‹ BACK", compact = true, onClick = onBack)
                 Text(title, Modifier.weight(1f), color = Color.White, fontWeight = FontWeight.Black, textAlign = TextAlign.Center, letterSpacing = 2.sp)
