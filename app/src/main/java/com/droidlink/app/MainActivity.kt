@@ -21,17 +21,34 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
-import androidx.compose.material3.Button
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.droidlink.app.ui.theme.DroidLinkTheme
+import kotlinx.coroutines.delay
 import org.webrtc.*
 
 class MainActivity : ComponentActivity() {
@@ -52,6 +69,14 @@ class MainActivity : ComponentActivity() {
     private var sessionActive by mutableStateOf(false)
     private var sessionMenuOpen by mutableStateOf(false)
     private var sessionStatsOpen by mutableStateOf(false)
+    private var sessionSettingsOpen by mutableStateOf(false)
+    private var menuButtonVisible by mutableStateOf(false)
+    private var menuRevealGeneration by mutableLongStateOf(0L)
+    private var mainPage by mutableStateOf("home")
+    private var introVisible by mutableStateOf(true)
+    private var showIntroAnimation by mutableStateOf(true)
+    private var keepScreenAwake by mutableStateOf(true)
+    private var qualityPreset by mutableStateOf("Auto")
     private var controllerInputTestOpen by mutableStateOf(false)
     private var controllerTestDisplayState by mutableStateOf(ControllerInputState())
     private var logicalControllerState = ControllerInputState()
@@ -190,57 +215,126 @@ class MainActivity : ComponentActivity() {
             override fun handleOnBackPressed() {
                 when { controllerInputTestOpen -> controllerInputTestOpen = false
                     sessionStatsOpen -> { sessionStatsOpen = false; sessionMenuOpen = true }
+                    sessionSettingsOpen -> { sessionSettingsOpen = false; sessionMenuOpen = true }
                     sessionMenuOpen -> sessionMenuOpen = false
-                    sessionActive -> sessionMenuOpen = true }
+                    sessionActive -> Unit }
             }
         }
         onBackPressedDispatcher.addCallback(this, sessionBackCallback)
+        getSharedPreferences("droid_link_ui", MODE_PRIVATE).also { preferences ->
+            showIntroAnimation = preferences.getBoolean("show_intro", true)
+            keepScreenAwake = preferences.getBoolean("keep_awake", true)
+            qualityPreset = preferences.getString("quality", "Auto") ?: "Auto"
+            introVisible = showIntroAnimation
+        }
         setContent {
             DroidLinkTheme {
                 var joinCode by remember { mutableStateOf("") }
                 Box(Modifier.fillMaxSize()) {
-                    when (mode) {
-                        "host" -> HostScreen(onStart = ::startHost, onBack = ::returnToMenu)
-                        "client" -> if (clientConnected) VideoScreen() else JoinScreen(
-                            code = joinCode,
-                            onCode = { joinCode = it.filter(Char::isDigit).take(6) },
-                            onConnect = { startJoin(joinCode) },
-                            onBack = ::returnToMenu
-                        )
-                        else -> MenuScreen()
+                    if (introVisible && showIntroAnimation) {
+                        IntroScreen()
+                    } else {
+                        when (mode) {
+                            "host" -> if (sessionActive) HostGameplayScreen() else HostScreen(onStart = ::startHost, onBack = ::returnToMenu)
+                            "client" -> if (clientConnected) VideoScreen() else JoinScreen(
+                                code = joinCode,
+                                onCode = { joinCode = it.filter(Char::isDigit).take(6) },
+                                onConnect = { startJoin(joinCode) },
+                                onBack = ::returnToMenu
+                            )
+                            else -> MainShell()
+                        }
+                        if (sessionActive && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen) SessionMenuRevealLayer()
+                        if (sessionMenuOpen) SessionMenu()
+                        if (sessionStatsOpen) SessionStats()
+                        if (sessionSettingsOpen) SettingsScreen(inSession = true)
                     }
-                    if (sessionMenuOpen) SessionMenu()
-                    if (sessionStatsOpen) SessionStats()
                 }
                 LaunchedEffect(sessionStatsOpen) { setPerformanceDiagnosticsActive(sessionStatsOpen) }
+                LaunchedEffect(Unit) {
+                    if (showIntroAnimation) delay(1_150L)
+                    introVisible = false
+                }
+                LaunchedEffect(keepScreenAwake, sessionActive) {
+                    if (keepScreenAwake && sessionActive) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
             }
         }
     }
 
-    @Composable private fun MenuScreen() = Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text("DroidLink")
-        Button(onClick = { mode = "host" }) { Text("Host") }
-        Button(onClick = { mode = "client" }) { Text("Join") }
+    private val neonGreen = Color(0xFF55FF33)
+    private val panelBlack = Color(0xFF111411)
+    private val mutedText = Color(0xFFA9B1AA)
+
+    @Composable private fun IntroScreen() {
+        var entered by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) { entered = true }
+        val alpha by animateFloatAsState(if (entered) 1f else 0f, tween(350), label = "introAlpha")
+        val scale by animateFloatAsState(if (entered) 1f else 0.94f, tween(350), label = "introScale")
+        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            Box(Modifier.alpha(alpha).scale(scale)) { BrandHeader(logoSize = 154.dp, subtitle = "CONNECT  •  STREAM  •  PLAY") }
+        }
     }
 
-    @Composable private fun HostScreen(onStart: () -> Unit, onBack: () -> Unit) = Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text("DroidLink Host")
-        Button(onClick = onStart, enabled = !sessionStarting) { Text("Start Host") }
-        if (hostRoomCode.isNotEmpty()) Text("Connection Code: $hostRoomCode")
-        if (hostStatus.isNotEmpty()) Text(hostStatus)
-        Text(captureStatus)
-        Text(audioStatus)
-        Text("Controller Backend: ${controllerBackend.status.label}")
-        Button(onClick = onBack) { Text("Back") }
+    @Composable private fun MainShell() = Column(Modifier.fillMaxSize().background(Color.Black).padding(20.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            NeonTextButton("SETTINGS", compact = true) { mainPage = "settings" }
+        }
+        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            when (mainPage) {
+                "settings" -> SettingsScreen(inSession = false)
+                "stats" -> ConnectionStatsSummary(showBack = false)
+                else -> MainMenuActions()
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            NavButton("HOME", mainPage == "home") { mainPage = "home" }
+            NavButton("STATS", mainPage == "stats") { mainPage = "stats" }
+            NavButton("SETTINGS", mainPage == "settings") { mainPage = "settings" }
+        }
     }
 
-    @Composable private fun JoinScreen(code: String, onCode: (String) -> Unit, onConnect: () -> Unit, onBack: () -> Unit) = Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text("DroidLink Client")
-        OutlinedTextField(value = code, onValueChange = onCode, label = { Text("6-Digit Room Code") }, singleLine = true)
-        Button(onClick = onConnect, enabled = !sessionStarting) { Text("Connect") }
-        Text(clientStatus)
-        Text(audioStatus)
-        Button(onClick = onBack) { Text("Back") }
+    @Composable private fun MainMenuActions() = Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        BrandHeader(logoSize = 122.dp, subtitle = "READY TO CONNECT")
+        Spacer(Modifier.height(12.dp))
+        NeonButton("HOST GAME") { mode = "host" }
+        NeonButton("JOIN GAME", filled = false) { mode = "client" }
+        Text("0.9.8 BETA", color = mutedText, fontSize = 11.sp, letterSpacing = 2.sp)
+    }
+
+    @Composable private fun BrandHeader(logoSize: androidx.compose.ui.unit.Dp, subtitle: String) = Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(logoSize))
+        Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 30.sp, letterSpacing = 3.sp)
+        Text(subtitle, color = neonGreen, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, letterSpacing = 2.sp)
+    }
+
+    @Composable private fun HostScreen(onStart: () -> Unit, onBack: () -> Unit) = ScreenFrame("DROID LINK HOST", onBack) {
+        StatusCard {
+            Text("ROOM CODE", color = mutedText, fontSize = 12.sp, letterSpacing = 2.sp)
+            Text(hostRoomCode.ifEmpty { "— — — — — —" }, color = neonGreen, fontWeight = FontWeight.Black, fontSize = 38.sp, letterSpacing = 6.sp)
+            Text(hostStatus.ifEmpty { "Ready to start" }, color = Color.White, textAlign = TextAlign.Center)
+        }
+        NeonButton(if (sessionStarting) "STARTING…" else "START HOST", enabled = !sessionStarting, onClick = onStart)
+        PlayerSlot("PLAYER 1", "HOST", true)
+        PlayerSlot("PLAYER 2", if (sessionActive) "CONNECTED" else "WAITING", sessionActive)
+        PlayerSlot("PLAYER 3", "COMING LATER", false)
+        PlayerSlot("PLAYER 4", "COMING LATER", false)
+        Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+        Text(audioStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+    }
+
+    @Composable private fun JoinScreen(code: String, onCode: (String) -> Unit, onConnect: () -> Unit, onBack: () -> Unit) = ScreenFrame("DROID LINK JOIN", onBack) {
+        Text("ENTER ROOM CODE", color = mutedText, fontSize = 12.sp, letterSpacing = 2.sp)
+        OutlinedTextField(
+            value = code, onValueChange = onCode, singleLine = true,
+            textStyle = LocalTextStyle.current.copy(textAlign = TextAlign.Center, fontSize = 30.sp, fontWeight = FontWeight.Bold, letterSpacing = 5.sp),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = neonGreen, unfocusedBorderColor = Color.DarkGray, focusedTextColor = Color.White, unfocusedTextColor = Color.White),
+            modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth()
+        )
+        NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN GAME", enabled = !sessionStarting && code.length == 6, onClick = onConnect)
+        StatusCard { Text(clientStatus, color = Color.White, textAlign = TextAlign.Center); Text(audioStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center) }
     }
 
     @Composable private fun VideoScreen() {
@@ -266,50 +360,66 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable private fun SessionMenu() = Box(Modifier.fillMaxSize().background(Color(0x99000000)), contentAlignment = Alignment.Center) {
-        Column(Modifier.background(Color(0xEE202020)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("DroidLink", color = Color.White)
-            Button(onClick = { sessionMenuOpen = false }) { Text("Resume") }
-            Button(onClick = { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }) { Text("Stats") }
-            Button(onClick = { disconnectSession() }) { Text("Disconnect") }
+    @Composable private fun HostGameplayScreen() = Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("DROID LINK HOST", color = neonGreen, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+            Text(hostRoomCode, color = Color.White, fontWeight = FontWeight.Black, fontSize = 42.sp, letterSpacing = 7.sp)
+            Text(hostStatus, color = mutedText)
+        }
+    }
+
+    @Composable private fun SessionMenuRevealLayer() {
+        LaunchedEffect(menuRevealGeneration) {
+            if (menuButtonVisible) { delay(3_000L); menuButtonVisible = false }
+        }
+        Box(
+            Modifier.fillMaxSize().pointerInput(sessionActive) {
+                detectTapGestures { menuButtonVisible = true; menuRevealGeneration++ }
+            }
+        ) {
+            if (menuButtonVisible) {
+                Box(Modifier.align(Alignment.TopEnd).padding(14.dp).sizeIn(minWidth = 56.dp, minHeight = 48.dp)
+                    .clip(RoundedCornerShape(10.dp)).background(Color(0xDD080B08)).border(1.dp, neonGreen, RoundedCornerShape(10.dp))
+                    .clickable { sessionMenuOpen = true; menuButtonVisible = false }.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+                    Text("MENU", color = neonGreen, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                }
+            }
+        }
+    }
+
+    @Composable private fun SessionMenu() = Box(Modifier.fillMaxSize().background(Color(0xB8000000)), contentAlignment = Alignment.Center) {
+        Column(Modifier.widthIn(max = 360.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 3.sp)
+            NeonButton("RESUME") { sessionMenuOpen = false; menuButtonVisible = false }
+            NeonButton("STATS", filled = false) { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }
+            NeonButton("SETTINGS", filled = false) { sessionMenuOpen = false; sessionSettingsOpen = true }
+            TextButton(onClick = { disconnectSession() }) { Text("DISCONNECT", color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold) }
         }
     }
 
     @Composable private fun SessionStats() = Box(Modifier.fillMaxSize().background(Color(0xBB000000)), contentAlignment = Alignment.Center) {
-        if (controllerInputTestOpen) ControllerInputTestPanel() else DiagnosticsPanel()
+        if (controllerInputTestOpen) ControllerInputTestPanel() else ConnectionStatsSummary(showBack = true)
     }
 
-    @Composable private fun DiagnosticsPanel() {
+    @Composable private fun ConnectionStatsSummary(showBack: Boolean) {
         val d = betaDiagnostics
-        Column(Modifier.background(Color(0xCC101010)).padding(10.dp)) {
-            Text("DroidLink Beta Diagnostics", color = Color.White)
-            diagnosticLine("Connection", "${d.connectionState} / ICE ${d.iceState}")
-            diagnosticLine("Route", d.route)
-            diagnosticLine("Candidate pair", d.candidatePair)
-            diagnosticLine("RTT", d.rttMs?.let { "%.1f ms".format(it) } ?: "—")
-            diagnosticLine("Resolution", d.resolution)
-            diagnosticLine("FPS", d.fps?.let { "%.1f".format(it) } ?: "—")
-            diagnosticLine("Video bitrate", "${d.videoBitrateBps / 1_000} kbps")
-            diagnosticLine("Packet loss", d.packetLoss.toString())
-            diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—")
-            diagnosticLine("Frames", "enc ${d.framesEncoded} / dec ${d.framesDecoded}")
-            diagnosticLine("Dropped frames", d.framesDropped.toString())
-            diagnosticLine("Controller packets/sec", "%.1f".format(d.controllerPacketsPerSecond))
-            diagnosticLine("Player 2", d.player2Status)
-            diagnosticLine("Android classification", d.player2Classification)
-            diagnosticLine("Control RTT", lastControlRoundTripMs?.let { "$it ms" } ?: "—")
-            diagnosticLine("Control latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—")
-            diagnosticLine("Average / recent max", "${d.averageControllerLatencyMs ?: "—"} / ${d.maxControllerLatencyMs ?: "—"} ms")
-            diagnosticLine("Control p95", d.controllerP95LatencyMs?.let { "$it ms" } ?: "—")
-            diagnosticLine("Control p50", d.controllerP50LatencyMs?.let { "$it ms" } ?: "—")
-            diagnosticLine("Packet age", d.controllerPacketAgeMs?.let { "$it ms" } ?: "—")
-            diagnosticLine("Digital / analog queue", "${d.digitalQueueDepth} / ${d.analogQueueDepth}")
-            diagnosticLine("DataChannel buffered", "${d.controlBufferedBytes} bytes")
-            diagnosticLine("Dropped stale analog", d.droppedStaleAnalogPackets.toString())
-            diagnosticLine("Duplicate / out-of-order", "${d.duplicateControlPacketsDropped} / ${d.outOfOrderControlPacketsDropped}")
-            diagnosticLine("Audio", audioStatus)
-            diagnosticLine("Controller backend", controllerBackend.status.label)
-            Button(onClick = { controllerInputTestOpen = true; controllerTestDisplayState = logicalControllerState }) { Text("PLAYER 2 INPUT TEST") }
+        val connectionQuality = when { d.connectionState.contains("CONNECTED", true) && (d.rttMs ?: 0.0) < 80 -> "EXCELLENT"; d.connectionState.contains("CONNECTED", true) -> "GOOD"; else -> "OFFLINE" }
+        Column(Modifier.widthIn(max = 620.dp).fillMaxWidth().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("CONNECTION STATS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+            StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
+            StatSection("VIDEO") { diagnosticLine("Resolution", d.resolution); diagnosticLine("FPS", d.fps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Bitrate", "${d.videoBitrateBps / 1_000} kbps"); diagnosticLine("Dropped frames", d.framesDropped.toString()) }
+            StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
+            StatSection("CONTROLLER") { diagnosticLine("Player 2", d.player2Status); diagnosticLine("Latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—"); diagnosticLine("Packets/sec", "%.1f".format(d.controllerPacketsPerSecond)) }
+            StatSection("AUDIO") { diagnosticLine("Status", audioStatus) }
+            var advanced by remember { mutableStateOf(false) }
+            NeonTextButton(if (advanced) "HIDE ADVANCED DIAGNOSTICS" else "ADVANCED DIAGNOSTICS") { advanced = !advanced }
+            if (advanced) {
+                diagnosticLine("Candidate pair", d.candidatePair); diagnosticLine("Frames encoded / decoded", "${d.framesEncoded} / ${d.framesDecoded}")
+                diagnosticLine("Queue digital / analog", "${d.digitalQueueDepth} / ${d.analogQueueDepth}"); diagnosticLine("DataChannel buffer", "${d.controlBufferedBytes} bytes")
+                diagnosticLine("Duplicate / out-of-order", "${d.duplicateControlPacketsDropped} / ${d.outOfOrderControlPacketsDropped}")
+            }
+            NeonButton("PLAYER 2 INPUT TEST", filled = false) { controllerInputTestOpen = true; controllerTestDisplayState = logicalControllerState }
+            if (showBack) NeonTextButton("BACK TO SESSION MENU") { sessionStatsOpen = false; sessionMenuOpen = true }
         }
     }
 
@@ -344,6 +454,85 @@ class MainActivity : ComponentActivity() {
     @Composable private fun dpadCell(label: String, active: Boolean) {
         Text(label, color = if (active) Color.Green else Color.Gray, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
     }
+
+    @Composable private fun SettingsScreen(inSession: Boolean) {
+        Column(Modifier.fillMaxSize().background(if (inSession) Color(0xE8000000) else Color.Transparent).padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("SETTINGS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 26.sp, letterSpacing = 3.sp)
+            SettingSection("STREAMING") {
+                Text("Quality preset", color = mutedText)
+                listOf(listOf("Auto", "Low Latency"), listOf("Balanced", "High Quality")).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEach { preset ->
+                            FilterChip(selected = qualityPreset == preset, onClick = {
+                                qualityPreset = preset
+                                getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("quality", preset).apply()
+                            }, label = { Text(preset, fontSize = 11.sp) }, modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+                SettingInfo("Resolution / FPS", when (qualityPreset) { "Low Latency" -> "720p / 60 FPS target"; "Balanced" -> "720p / Auto FPS"; "High Quality" -> "1080p / 30 FPS target"; else -> "Automatic (recommended)" })
+                SettingInfo("Bitrate", "Automatic WebRTC adaptation")
+            }
+            SettingSection("CONTROLLER") {
+                SettingInfo("Player 2", betaDiagnostics.player2Status)
+                SettingInfo("Controller slot", "Automatic")
+                SettingInfo("Stick deadzone", "Hardware/default mapping")
+                SettingInfo("Players 3–4", "Coming later")
+                NeonTextButton("CONTROLLER TEST") { controllerInputTestOpen = true; sessionSettingsOpen = false; sessionStatsOpen = true }
+            }
+            SettingSection("AUDIO") {
+                SettingInfo("Game audio", audioStatus)
+                SettingInfo("Volume", "Controlled by device")
+            }
+            SettingSection("CONNECTION") {
+                SettingInfo("Connection mode", "Automatic (recommended)")
+                SettingInfo("Current route", betaDiagnostics.route)
+                SettingInfo("Auto reconnect", "Enabled by session recovery")
+            }
+            SettingSection("APP") {
+                SettingSwitch("Show intro animation", showIntroAnimation) {
+                    showIntroAnimation = it; getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putBoolean("show_intro", it).apply()
+                }
+                SettingSwitch("Keep screen awake while hosting", keepScreenAwake) {
+                    keepScreenAwake = it; getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putBoolean("keep_awake", it).apply()
+                }
+                SettingInfo("Theme", "Droid Link Neon")
+                SettingInfo("Version", "0.9.8-beta")
+            }
+            if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
+        }
+    }
+
+    @Composable private fun ScreenFrame(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+        Column(Modifier.fillMaxSize().background(Color.Black).padding(20.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                NeonTextButton("‹ BACK", compact = true, onClick = onBack)
+                Text(title, Modifier.weight(1f), color = Color.White, fontWeight = FontWeight.Black, textAlign = TextAlign.Center, letterSpacing = 2.sp)
+                Spacer(Modifier.width(62.dp))
+            }
+            Spacer(Modifier.height(6.dp)); content()
+        }
+    }
+
+    @Composable private fun NeonButton(label: String, filled: Boolean = true, enabled: Boolean = true, onClick: () -> Unit) {
+        Button(onClick = onClick, enabled = enabled, modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth().heightIn(min = 56.dp), shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = if (filled) neonGreen else panelBlack, contentColor = if (filled) Color.Black else neonGreen, disabledContainerColor = Color(0xFF263026)),
+            border = if (filled) null else androidx.compose.foundation.BorderStroke(1.dp, neonGreen)) { Text(label, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp) }
+    }
+
+    @Composable private fun NeonTextButton(label: String, compact: Boolean = false, onClick: () -> Unit) = TextButton(onClick = onClick, modifier = if (compact) Modifier else Modifier.fillMaxWidth()) { Text(label, color = neonGreen, fontWeight = FontWeight.Bold, fontSize = if (compact) 11.sp else 13.sp) }
+
+    @Composable private fun NavButton(label: String, selected: Boolean, onClick: () -> Unit) = Text(label, color = if (selected) neonGreen else mutedText, fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.clickable(onClick = onClick).padding(14.dp))
+
+    @Composable private fun StatusCard(content: @Composable ColumnScope.() -> Unit) = Column(Modifier.widthIn(max = 460.dp).fillMaxWidth().background(panelBlack, RoundedCornerShape(14.dp)).border(1.dp, Color(0xFF244324), RoundedCornerShape(14.dp)).padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp), content = content)
+
+    @Composable private fun PlayerSlot(player: String, status: String, active: Boolean) = Row(Modifier.widthIn(max = 460.dp).fillMaxWidth().background(panelBlack, RoundedCornerShape(10.dp)).padding(13.dp), verticalAlignment = Alignment.CenterVertically) { Text(player, Modifier.weight(1f), color = Color.White, fontWeight = FontWeight.Bold); Text(status, color = if (active) neonGreen else mutedText, fontSize = 12.sp) }
+
+    @Composable private fun StatSection(title: String, content: @Composable ColumnScope.() -> Unit) = Column(Modifier.fillMaxWidth().background(panelBlack, RoundedCornerShape(12.dp)).border(1.dp, Color(0xFF244324), RoundedCornerShape(12.dp)).padding(13.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) { Text(title, color = neonGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp, letterSpacing = 2.sp); content() }
+
+    @Composable private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) = StatSection(title, content)
+    @Composable private fun SettingInfo(label: String, value: String) = Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) { Text(label, Modifier.weight(1f), color = Color.White); Text(value, color = mutedText, textAlign = TextAlign.End) }
+    @Composable private fun SettingSwitch(label: String, checked: Boolean, onChecked: (Boolean) -> Unit) = Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(label, Modifier.weight(1f), color = Color.White); Switch(checked, onChecked, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = neonGreen)) }
 
     private fun setPerformanceDiagnosticsActive(active: Boolean) {
         if (diagnosticsPerfActive == active) return
@@ -785,12 +974,13 @@ class MainActivity : ComponentActivity() {
         val metrics = resources.displayMetrics
         val sourceWidth = metrics.widthPixels.coerceAtLeast(2)
         val sourceHeight = metrics.heightPixels.coerceAtLeast(2)
-        val scale = minOf(1.0, 1280.0 / maxOf(sourceWidth, sourceHeight))
+        val targetLongEdge = when (qualityPreset) { "Low Latency" -> 960.0; "High Quality" -> 1920.0; else -> 1280.0 }
+        val scale = minOf(1.0, targetLongEdge / maxOf(sourceWidth, sourceHeight))
         val width = ((sourceWidth * scale).toInt() / 2 * 2).coerceAtLeast(2)
         val height = ((sourceHeight * scale).toInt() / 2 * 2).coerceAtLeast(2)
         val refreshRate = display?.refreshRate ?: 60f
-        val fps = if (refreshRate >= 50f) 60 else 30
-        Log.d(TAG, "Capture profile selected: ${width}x$height@$fps source=${sourceWidth}x$sourceHeight refreshRate=$refreshRate")
+        val fps = when (qualityPreset) { "Balanced", "High Quality" -> 30; else -> if (refreshRate >= 50f) 60 else 30 }
+        Log.d(TAG, "Capture profile selected: preset=$qualityPreset ${width}x$height@$fps source=${sourceWidth}x$sourceHeight refreshRate=$refreshRate")
         return Triple(width, height, fps)
     }
 
@@ -800,8 +990,8 @@ class MainActivity : ComponentActivity() {
 
     private fun updateSessionActive(active: Boolean) {
         sessionActive = active
-        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen
-        if (!active) { sessionMenuOpen = false; sessionStatsOpen = false; controllerInputTestOpen = false }
+        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen
+        if (!active) { sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
     }
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
