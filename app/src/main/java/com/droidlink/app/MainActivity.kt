@@ -64,8 +64,6 @@ class MainActivity : ComponentActivity() {
     private val firebase = FirebaseRoomManager()
     private val hostRtc by lazy { WebRtcManager(this) }
     private val clientRtc by lazy { WebRtcManager(this) }
-    private val voiceRtcDelegate = lazy { VoiceChatManager(this) }
-    private val voiceRtc by voiceRtcDelegate
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -81,7 +79,6 @@ class MainActivity : ComponentActivity() {
     private var sessionStatsOpen by mutableStateOf(false)
     private var sessionSettingsOpen by mutableStateOf(false)
     private var sessionGameAudioOpen by mutableStateOf(false)
-    private var sessionVoiceOpen by mutableStateOf(false)
     private var menuButtonVisible by mutableStateOf(false)
     private var menuRevealGeneration by mutableLongStateOf(0L)
     private var mainPage by mutableStateOf("home")
@@ -99,20 +96,6 @@ class MainActivity : ComponentActivity() {
     private var controlChannelOpen by mutableStateOf(false)
     private var gameAudioEnabled by mutableStateOf(true)
     private var gameAudioVolume by mutableFloatStateOf(1f)
-    private var voiceChatStartEnabled by mutableStateOf(false)
-    private var localDisplayName by mutableStateOf("")
-    private var hostPlayer by mutableStateOf(SessionPlayer("", "Player 1", 1, "host", false, false))
-    private var joinerPlayer by mutableStateOf(SessionPlayer("", "Player 2", 2, "joiner", false, false))
-    private var localSpeaking by mutableStateOf(false)
-    private var remoteSpeaking by mutableStateOf(false)
-    private var voiceChatEnabled by mutableStateOf(false)
-    private var voiceMuted by mutableStateOf(false)
-    private var remoteVoiceEnabled by mutableStateOf(true)
-    private var voiceVolume by mutableFloatStateOf(1f)
-    private var voiceStatus by mutableStateOf("OFF")
-    private var voiceDiagnostics by mutableStateOf(VoiceDiagnostics())
-    private var voiceSignalingReady = false
-    private var voiceHostRole = false
     private var controllerInputTestOpen by mutableStateOf(false)
     private var controllerTestDisplayState by mutableStateOf(ControllerInputState())
     private var logicalControllerState = ControllerInputState()
@@ -167,7 +150,6 @@ class MainActivity : ComponentActivity() {
     private var dpadDuplicateDrops = 0L
     private var activeSessionId = "none"
     private var sessionGeneration = 0L
-    private var activeJoinGeneration = -1L
     private val mainHandler = Handler(Looper.getMainLooper())
     private var backendUnavailableLogged = false
     private var controllerWindowStart = android.os.SystemClock.elapsedRealtime()
@@ -253,15 +235,6 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "AUDIO_UNAVAILABLE_REASON: RECORD_AUDIO permission denied")
         }
     }
-    private val voicePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) enableVoiceAfterPermission() else {
-            voiceChatEnabled = false
-            updateLocalPlayerVoice(false)
-            voiceStatus = "MICROPHONE PERMISSION DENIED"
-            Log.w(TAG, "VOICE_PERMISSION_DENIED: game session continues")
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ContextCompat.registerReceiver(this, projectionReadyReceiver, IntentFilter(ScreenCaptureService.ACTION_READY), ContextCompat.RECEIVER_NOT_EXPORTED)
@@ -270,7 +243,6 @@ class MainActivity : ComponentActivity() {
         sessionBackCallback = object : OnBackPressedCallback(false) {
             override fun handleOnBackPressed() {
                 when { controllerInputTestOpen -> controllerInputTestOpen = false
-                    sessionVoiceOpen -> { sessionVoiceOpen = false; sessionMenuOpen = true }
                     sessionGameAudioOpen -> { sessionGameAudioOpen = false; sessionMenuOpen = true }
                     sessionStatsOpen -> { sessionStatsOpen = false; sessionMenuOpen = true }
                     sessionSettingsOpen -> { sessionSettingsOpen = false; sessionMenuOpen = true }
@@ -286,8 +258,6 @@ class MainActivity : ComponentActivity() {
             animatedBackground = preferences.getBoolean("animated_background", true)
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
-            voiceChatStartEnabled = preferences.getBoolean("voice_chat_start_enabled", false)
-            localDisplayName = preferences.getString("display_name", "") ?: ""
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
             introVisible = showIntroAnimation
         }
@@ -312,12 +282,11 @@ class MainActivity : ComponentActivity() {
                             "disconnecting" -> DisconnectedScreen()
                             else -> MainShell()
                         }
-                        if (sessionActive && !readinessVisible && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen && !sessionVoiceOpen && !sessionGameAudioOpen) SessionMenuRevealLayer()
+                        if (sessionActive && !readinessVisible && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen && !sessionGameAudioOpen) SessionMenuRevealLayer()
                         if (sessionMenuOpen) SessionMenu()
                         if (sessionStatsOpen) SessionStats()
                         if (sessionSettingsOpen) SettingsScreen(inSession = true)
                         if (sessionGameAudioOpen) GameAudioPanel()
-                        if (sessionVoiceOpen) VoiceChatPanel()
                         if (sessionActive && readinessVisible) PreGameReadiness()
                     }
                 }
@@ -420,7 +389,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.2.2", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.0.1", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -442,8 +411,8 @@ class MainActivity : ComponentActivity() {
             Text(friendlyStatus(hostStatus.ifEmpty { "Ready to start" }), color = Color.White, textAlign = TextAlign.Center)
         }
         NeonButton(if (sessionStarting) "STARTING…" else "START HOST", enabled = !sessionStarting, onClick = onStart)
-        PlayerSlot("PLAYER 1", if (hostPlayer.sessionId.isEmpty()) effectiveDisplayName(true) else hostPlayer.displayName, "HOST • ${if (hostPlayer.connected) "CONNECTED" else "READY"}", true)
-        PlayerSlot("PLAYER 2", joinerPlayer.displayName, if (joinerPlayer.connected) "CONNECTED" else "WAITING", joinerPlayer.connected)
+        PlayerSlot("PLAYER 1", "Player 1", "HOST • ${if (sessionActive) "CONNECTED" else "READY"}", true)
+        PlayerSlot("PLAYER 2", "Player 2", if (sessionActive) "CONNECTED" else "WAITING", sessionActive)
         PlayerSlot("PLAYER 3", "", "COMING SOON", false)
         PlayerSlot("PLAYER 4", "", "COMING SOON", false)
         Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
@@ -462,7 +431,6 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth()
         )
         Text("Enter the 6-digit code shown on the host device.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
-        if (hostPlayer.sessionId == code && hostPlayer.displayName.isNotBlank()) Text("Connecting to: ${hostPlayer.displayName}", color = neonGreen, fontWeight = FontWeight.Bold)
         NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN HOST", enabled = !sessionStarting, onClick = onConnect)
         StatusCard { Text(friendlyStatus(clientStatus), color = Color.White, textAlign = TextAlign.Center); Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center) }
         if (isFailureStatus(clientStatus)) ErrorActions(if (clientStatus.contains("room", true)) "ROOM NOT FOUND" else "CONNECTION FAILED", friendlyStatus(clientStatus), onRetry = onConnect, onBack = onBack)
@@ -551,10 +519,9 @@ class MainActivity : ComponentActivity() {
     @Composable private fun SessionMenu() = Box(Modifier.fillMaxSize().background(Color(0xB8000000)), contentAlignment = Alignment.Center) {
         Column(Modifier.widthIn(max = 360.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 3.sp)
-            Text(if (mode == "host") "Player 2: ${joinerPlayer.displayName}" else "Host: ${hostPlayer.displayName}", color = neonGreen, fontWeight = FontWeight.Bold)
+            Text(if (mode == "host") "Player 2" else "Player 1 Host", color = neonGreen, fontWeight = FontWeight.Bold)
             NeonButton("RESUME") { sessionMenuOpen = false; menuButtonVisible = false }
             NeonButton("GAME AUDIO", filled = false) { sessionMenuOpen = false; sessionGameAudioOpen = true }
-            NeonButton("VOICE CHAT", filled = false) { sessionMenuOpen = false; sessionVoiceOpen = true }
             NeonButton("CONNECTION STATS", filled = false) { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }
             NeonButton("SETTINGS", filled = false) { sessionMenuOpen = false; sessionSettingsOpen = true }
             TextButton(onClick = { disconnectSession() }) { Text("DISCONNECT", color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold) }
@@ -576,28 +543,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable private fun VoiceChatPanel() = Box(Modifier.fillMaxSize().background(Color(0xE8000000)), contentAlignment = Alignment.Center) {
-        Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("VOICE CHAT", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
-            Text("Microphone use is always opt-in. Headphones provide the best echo protection.", color = mutedText, fontSize = 12.sp)
-            SettingSwitch("Voice Chat", voiceChatEnabled) { updateVoiceChatEnabled(it) }
-            SettingSwitch("Mute Myself", voiceMuted) { muted ->
-                voiceMuted = muted
-                if (voiceChatEnabled) voiceRtc.enableMicrophone(!muted)
-                updateLocalPlayerVoice(voiceChatEnabled && !muted)
-            }
-            SettingSwitch("Remote Voice", remoteVoiceEnabled) { enabled -> remoteVoiceEnabled = enabled; voiceRtc.setRemoteVoiceEnabled(enabled) }
-            Text("Voice Volume ${(voiceVolume * 100).toInt()}%", color = mutedText)
-            Slider(value = voiceVolume, onValueChange = { voiceVolume = it; voiceRtc.setRemoteVolume(it) }, enabled = remoteVoiceEnabled, colors = SliderDefaults.colors(thumbColor = neonGreen, activeTrackColor = neonGreen))
-            SettingInfo("Status", voiceStatus)
-            SettingInfo("Microphone", if (!voiceChatEnabled || voiceMuted) "Muted" else if (voiceDiagnostics.micLevel > 0.01) "Speaking" else "Silent")
-            SettingInfo("Remote voice", if (voiceDiagnostics.bytesReceived > 0L) "Receiving" else "Waiting")
-            SettingInfo("Echo cancellation", if (voiceDiagnostics.aecAvailable) "Active when supported" else "Unavailable")
-            SettingInfo("Noise suppression", if (voiceDiagnostics.nsAvailable) "Active when supported" else "Unavailable")
-            NeonButton("BACK TO SESSION MENU", filled = false) { sessionVoiceOpen = false; sessionMenuOpen = true }
-        }
-    }
-
     @Composable private fun SessionStats() = Box(Modifier.fillMaxSize().background(Color(0xBB000000)), contentAlignment = Alignment.Center) {
         if (controllerInputTestOpen) ControllerInputTestPanel() else ConnectionStatsSummary(showBack = true)
     }
@@ -607,12 +552,7 @@ class MainActivity : ComponentActivity() {
         val connectionQuality = connectionQuality()
         Column(Modifier.widthIn(max = 620.dp).fillMaxWidth().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("CONNECTION STATS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
-            StatSection("SESSION") {
-                diagnosticLine("Host", hostPlayer.displayName)
-                diagnosticLine("Player 2", joinerPlayer.displayName)
-                diagnosticLine(hostPlayer.displayName, if (hostPlayer.voiceEnabled) "Voice active" else "Voice off / muted")
-                diagnosticLine(joinerPlayer.displayName, if (joinerPlayer.voiceEnabled) "Voice active" else "Voice off / muted")
-            }
+            StatSection("SESSION") { diagnosticLine("Player 1", "Host"); diagnosticLine("Player 2", "Joiner") }
             StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
             StatSection("VIDEO") {
                 diagnosticLine("Resolution", d.resolution); diagnosticLine("Capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "—")
@@ -626,11 +566,6 @@ class MainActivity : ComponentActivity() {
             StatSection("GAME AUDIO") {
                 diagnosticLine("Capture", friendlyAudioStatus()); diagnosticLine("RTP sent", "${d.gameAudioPacketsSent} packets / ${d.gameAudioBytesSent} bytes")
                 diagnosticLine("RTP received", "${d.gameAudioPacketsReceived} packets / ${d.gameAudioBytesReceived} bytes"); diagnosticLine("Playing", if (gameAudioEnabled) "Enabled" else "Disabled")
-            }
-            StatSection("VOICE") {
-                diagnosticLine("Status", voiceStatus); diagnosticLine("Mic", if (voiceChatEnabled && !voiceMuted) "Enabled" else "Muted")
-                diagnosticLine("Sending", "${voiceDiagnostics.bytesSent} bytes"); diagnosticLine("Receiving", "${voiceDiagnostics.bytesReceived} bytes")
-                diagnosticLine("AEC / NS / AGC", "${voiceDiagnostics.aecAvailable} / ${voiceDiagnostics.nsAvailable} / ${voiceDiagnostics.agcAvailable}")
             }
             var advanced by remember { mutableStateOf(false) }
             NeonTextButton(if (advanced) "HIDE ADVANCED DIAGNOSTICS" else "ADVANCED DIAGNOSTICS") { advanced = !advanced }
@@ -723,31 +658,6 @@ class MainActivity : ComponentActivity() {
             SettingSection("AUDIO") {
                 SettingInfo("Game audio", friendlyAudioStatus())
                 SettingInfo("Volume", "Controlled by device")
-                SettingSwitch("Voice Chat", voiceChatStartEnabled) { enabled ->
-                    voiceChatStartEnabled = enabled
-                    getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putBoolean("voice_chat_start_enabled", enabled).apply()
-                    Log.d(TAG, "VOICE_PRESESSION_SETTING: ${if (enabled) "ON" else "OFF"}")
-                    if (sessionActive) updateVoiceChatEnabled(enabled)
-                }
-                SettingInfo("Voice start", if (voiceChatStartEnabled) "Enabled for new sessions" else "Off (microphone inactive)")
-            }
-            SettingSection("PROFILE") {
-                OutlinedTextField(
-                    value = localDisplayName,
-                    onValueChange = { raw ->
-                        if (!inSession) {
-                            localDisplayName = sanitizeDisplayName(raw)
-                            getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("display_name", localDisplayName).apply()
-                        }
-                    },
-                    enabled = !inSession,
-                    singleLine = true,
-                    label = { Text("Display Name") },
-                    placeholder = { Text("Player 1 / Player 2") },
-                    supportingText = { Text(if (inSession) "Disconnect to change display name." else "Up to 16 characters") },
-                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = neonGreen, unfocusedBorderColor = Color.DarkGray, focusedTextColor = Color.White, unfocusedTextColor = Color.White, disabledTextColor = mutedText),
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
             SettingSection("CONNECTION") {
                 SettingInfo("Connection mode", "Automatic (recommended)")
@@ -773,7 +683,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.2.2")
+                SettingInfo("Version", "Droid Link 1.0.1 Stable")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -823,47 +733,11 @@ class MainActivity : ComponentActivity() {
     private fun resetUiSettings() {
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
         animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
-        voiceChatStartEnabled = false; localDisplayName = ""
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
-    }
-
-    private fun sanitizeDisplayName(value: String): String = DisplayNamePolicy.sanitize(value)
-
-    private fun effectiveDisplayName(host: Boolean): String = DisplayNamePolicy.effective(localDisplayName, host)
-
-    private fun listenForPlayerMetadata(code: String, generation: Long = sessionGeneration) {
-        firebase.listenForPlayers(code, { players -> runOnUiThread {
-            if (!isCurrentSession(generation, code)) { staleSessionCallback("player metadata", generation); return@runOnUiThread }
-            runCatching {
-                players.firstOrNull { it.role == "host" }?.let { hostPlayer = it.copy(speaking = hostPlayer.speaking) }
-                players.firstOrNull { it.role == "joiner" }?.let { joinerPlayer = it.copy(speaking = joinerPlayer.speaking) }
-                if (hostPlayer.displayName.isBlank()) hostPlayer = hostPlayer.copy(displayName = "Player 1")
-                if (joinerPlayer.displayName.isBlank()) joinerPlayer = joinerPlayer.copy(displayName = "Player 2")
-                if (mode == "client" && !joinSessionState.showsActiveSession && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
-                Log.d(TAG, "USERNAME_READY: host=${hostPlayer.displayName} joiner=${joinerPlayer.displayName}")
-            }.onFailure { error ->
-                hostPlayer = hostPlayer.copy(displayName = hostPlayer.displayName.ifBlank { "Player 1" })
-                joinerPlayer = joinerPlayer.copy(displayName = joinerPlayer.displayName.ifBlank { "Player 2" })
-                Log.e(TAG, "USERNAME_FALLBACK: optional metadata processing failed; continuing session", error)
-            }
-        } }, { error -> runOnUiThread {
-            if (!isCurrentSession(generation, code)) { staleSessionCallback("player metadata failure", generation); return@runOnUiThread }
-            hostPlayer = hostPlayer.copy(displayName = hostPlayer.displayName.ifBlank { "Player 1" })
-            joinerPlayer = joinerPlayer.copy(displayName = joinerPlayer.displayName.ifBlank { "Player 2" })
-            Log.e(TAG, "USERNAME_FALLBACK: $error; continuing core session")
-        } })
-    }
-
-    private fun updateLocalPlayerVoice(enabled: Boolean) {
-        if (activeSessionId == "none") return
-        val role = if (mode == "host") "host" else "joiner"
-        firebase.updatePlayerState(activeSessionId, role, voiceEnabled = enabled)
-        if (mode == "host") hostPlayer = hostPlayer.copy(voiceEnabled = enabled) else joinerPlayer = joinerPlayer.copy(voiceEnabled = enabled)
     }
 
     private fun beginSessionGeneration(role: String): Long {
         sessionGeneration++
-        activeJoinGeneration = -1L
         Log.d(TAG, "SESSION_${role.uppercase()}_STARTED: generation=$sessionGeneration")
         return sessionGeneration
     }
@@ -927,98 +801,6 @@ class MainActivity : ComponentActivity() {
         ControllerBackendStatus.UNSUPPORTED -> "Virtual gamepad unavailable on this device"
     }
 
-    private fun setupVoiceSignaling(code: String, isHost: Boolean) {
-        if (voiceSignalingReady || activeSessionId != code) return
-        val generation = sessionGeneration
-        voiceSignalingReady = true; voiceHostRole = isHost
-        voiceRtc.onStatus = { status -> runOnUiThread { if (isCurrentSession(generation, code)) voiceStatus = status.removePrefix("VOICE_").replace('_', ' ') else staleSessionCallback("voice status", generation) } }
-        voiceRtc.onDiagnostics = { value -> runOnUiThread { if (isCurrentSession(generation, code)) voiceDiagnostics = value else staleSessionCallback("voice diagnostics", generation) } }
-        voiceRtc.onLocalSpeakingChanged = { speaking -> runOnUiThread {
-            if (!isCurrentSession(generation, code)) { staleSessionCallback("local speaking", generation); return@runOnUiThread }
-            localSpeaking = speaking
-            if (isHost) hostPlayer = hostPlayer.copy(speaking = speaking) else joinerPlayer = joinerPlayer.copy(speaking = speaking)
-        } }
-        voiceRtc.onRemoteSpeakingChanged = { speaking -> runOnUiThread {
-            if (!isCurrentSession(generation, code)) { staleSessionCallback("remote speaking", generation); return@runOnUiThread }
-            remoteSpeaking = speaking
-            if (isHost) joinerPlayer = joinerPlayer.copy(speaking = speaking) else hostPlayer = hostPlayer.copy(speaking = speaking)
-        } }
-        voiceRtc.onIceCandidate = { candidate ->
-            val side = if (isHost) "voiceHost" else "voiceClient"
-            firebase.saveIceCandidate(code, side, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { Log.e(TAG, "VOICE ICE save failed: $it") }
-        }
-        val remoteSide = if (isHost) "voiceClient" else "voiceHost"
-        firebase.listenForIceCandidates(code, remoteSide, { candidate, mid, line -> voiceRtc.addIceCandidate(candidate, mid, line) }, { Log.e(TAG, "VOICE ICE listener failed: $it") })
-        if (isHost) {
-            firebase.listenForVoiceRequest(code, { negotiateVoiceAsHost(code) }, { Log.e(TAG, "VOICE request listener failed: $it") })
-            firebase.listenForVoiceAnswer(code, { answer ->
-                voiceRtc.setRemoteAnswer(answer, { Log.d(TAG, "VOICE_REMOTE_ANSWER_SET") }, { Log.e(TAG, "VOICE answer failed: $it") })
-            }, { Log.e(TAG, "VOICE answer listener failed: $it") })
-        } else {
-            firebase.listenForVoiceOffer(code, { offer ->
-                ensureVoiceReady {
-                    voiceRtc.setRemoteOffer(offer, {
-                        voiceRtc.createAnswer({ answer -> firebase.saveVoiceAnswer(code, answer, { Log.d(TAG, "VOICE_ANSWER_STORED") }, { Log.e(TAG, "VOICE answer save failed: $it") }) }, { Log.e(TAG, "VOICE answer create failed: $it") })
-                    }, { Log.e(TAG, "VOICE offer failed: $it") })
-                }
-            }, { Log.e(TAG, "VOICE offer listener failed: $it") })
-        }
-        Log.d(TAG, "VOICE_SIGNALING_READY: role=${if (isHost) "host" else "joiner"}")
-    }
-
-    private fun ensureVoiceReady(onReady: () -> Unit) {
-        val generation = sessionGeneration
-        val code = activeSessionId
-        voiceRtc.initialize { result ->
-            result.onSuccess { runOnUiThread {
-                if (!isCurrentSession(generation, code) || !sessionActive) { staleSessionCallback("voice ready", generation); return@runOnUiThread }
-                voiceRtc.setRemoteVoiceEnabled(voiceChatEnabled && remoteVoiceEnabled); voiceRtc.setRemoteVolume(voiceVolume)
-                Log.d(TAG, "VOICE_READY")
-                onReady()
-            } }
-                .onFailure { error -> runOnUiThread { if (isCurrentSession(generation, code)) { voiceStatus = "ERROR: ${error.message}"; Log.e(TAG, "Voice optional initialization failed; core session continues", error) } else staleSessionCallback("voice failure", generation) } }
-        }
-    }
-
-    private fun negotiateVoiceAsHost(code: String) {
-        if (activeSessionId != code) return
-        ensureVoiceReady {
-            voiceRtc.createOffer({ offer ->
-                firebase.saveVoiceOffer(code, offer, { Log.d(TAG, "VOICE_OFFER_STORED") }, { Log.e(TAG, "VOICE offer save failed: $it") })
-            }, { Log.e(TAG, "VOICE offer create failed: $it") })
-        }
-    }
-
-    private fun updateVoiceChatEnabled(enabled: Boolean) {
-        if (!enabled) {
-            voiceChatEnabled = false; voiceStatus = "OFF"
-            localSpeaking = false; remoteSpeaking = false
-            updateLocalPlayerVoice(false)
-            if (voiceRtcDelegate.isInitialized()) {
-                voiceRtc.enableMicrophone(false)
-                voiceRtc.setRemoteVoiceEnabled(false)
-            }
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            voicePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        } else enableVoiceAfterPermission()
-    }
-
-    private fun enableVoiceAfterPermission() {
-        if (!sessionActive) { voiceStatus = "SESSION NOT READY"; return }
-        if (!voiceSignalingReady) setupVoiceSignaling(activeSessionId, mode == "host")
-        voiceChatEnabled = true; voiceStatus = "CONNECTING"
-        updateLocalPlayerVoice(true)
-        ensureVoiceReady {
-            voiceRtc.setRemoteVoiceEnabled(remoteVoiceEnabled)
-            voiceRtc.setRemoteVolume(voiceVolume)
-            voiceRtc.enableMicrophone(!voiceMuted).onFailure { voiceStatus = "MIC ERROR: ${it.message}" }
-            if (voiceHostRole) negotiateVoiceAsHost(activeSessionId)
-            else firebase.requestVoiceNegotiation(activeSessionId) { voiceStatus = "SIGNALING ERROR: $it" }
-        }
-    }
-
     private fun setPerformanceDiagnosticsActive(active: Boolean) {
         if (diagnosticsPerfActive == active) return
         diagnosticsPerfActive = active
@@ -1073,10 +855,6 @@ class MainActivity : ComponentActivity() {
             if (generation != sessionGeneration) { staleSessionCallback("create room", generation); return@createRoom }
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
-            hostPlayer = SessionPlayer(code, effectiveDisplayName(true), 1, "host", false, false)
-            joinerPlayer = SessionPlayer(code, "Player 2", 2, "joiner", false, false)
-            firebase.publishPlayer(code, "host", hostPlayer.displayName, 1, false, false) { Log.e(TAG, "Host player metadata failed: $it") }
-            listenForPlayerMetadata(code, generation)
             controllerBackend.close()
             controllerBackend = ControllerBackendSelector.select()
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
@@ -1095,9 +873,6 @@ class MainActivity : ComponentActivity() {
                     PeerConnection.PeerConnectionState.CONNECTED -> {
                         mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
                         hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true)
-                        firebase.updatePlayerState(code, "host", connected = true)
-                        if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
-                        else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
                         uiFeedback(window.decorView, success = true)
                     }
                     PeerConnection.PeerConnectionState.DISCONNECTED -> {
@@ -1149,9 +924,6 @@ class MainActivity : ComponentActivity() {
         firebase.joinRoom(code, {
             if (!isCurrentSession(generation, code)) { staleSessionCallback("join room success", generation); return@joinRoom }
             transitionJoinState(JoinSessionState.Negotiating, "room found", "Loading WebRTC offer...")
-            joinerPlayer = SessionPlayer(code, effectiveDisplayName(false), 2, "joiner", false, false)
-            firebase.publishPlayer(code, "joiner", joinerPlayer.displayName, 2, false, false) { Log.e(TAG, "Joiner player metadata failed: $it") }
-            listenForPlayerMetadata(code, generation)
             firebase.getOffer(code, { offer -> if (isCurrentSession(generation, code)) prepareJoinPeer(code, offer, generation) else staleSessionCallback("offer loaded", generation) }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Offer load failed: $it") else staleSessionCallback("offer failure", generation) })
         }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Join failed: $it") else staleSessionCallback("join failure", generation) })
     }
@@ -1180,17 +952,6 @@ class MainActivity : ComponentActivity() {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     clientControlActive = true; sessionStarting = false
                     transitionJoinState(JoinSessionState.Connected, "PeerConnection CONNECTED", if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing")
-                    if (activeJoinGeneration == generation) {
-                        Log.d(TAG, "JOIN_CONNECTED_INIT_ALREADY_DONE: generation=$generation")
-                        return@runOnUiThread
-                    }
-                    Log.d(TAG, "JOIN_CONNECTED_INIT_START: generation=$generation")
-                    activeJoinGeneration = generation
-                    firebase.updatePlayerState(code, "joiner", connected = true)
-                    if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
-                    else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
-                    Log.d(TAG, "SPEAKING_UI_DISABLED_FOR_STABILITY")
-                    Log.d(TAG, "JOIN_SESSION_STABLE: generation=$generation")
                     uiFeedback(window.decorView, success = true)
                     mainHandler.postDelayed({
                         if (joinSessionState.showsActiveSession && remoteTrack == null) {
@@ -1588,7 +1349,7 @@ class MainActivity : ComponentActivity() {
 
     private fun updateSessionActive(active: Boolean, showReadiness: Boolean = true) {
         sessionActive = active
-        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen || sessionGameAudioOpen || sessionVoiceOpen
+        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen || sessionGameAudioOpen
         if (active && showReadiness && !readinessShownForSession) {
             readinessShownForSession = true
             readinessVisible = true
@@ -1598,22 +1359,19 @@ class MainActivity : ComponentActivity() {
             readinessVisible = false
             Log.d(TAG, "JOIN_UI_STATE: optional capability readiness overlay skipped for active joiner session")
         }
-        if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; sessionGameAudioOpen = false; sessionVoiceOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
+        if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; sessionGameAudioOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
     }
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
         sessionGeneration++
-        activeJoinGeneration = -1L
         sendNeutralReset("session cleanup")
         resetRemoteInput("session cleanup")
-        if (activeSessionId != "none" && mode == "client") firebase.removePlayer(activeSessionId, "joiner")
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         mainHandler.removeCallbacksAndMessages(null)
         // Remove the renderer sink while its receiver-owned VideoTrack and PeerConnection are still valid.
         detachRenderer(); remoteTrack = null
         hostRtc.close(); clientRtc.close()
-        if (voiceRtcDelegate.isInitialized()) voiceRtc.close()
         stopService(Intent(this, ScreenCaptureService::class.java))
         controllerBackend.close(); controllerBackend = TransportOnlyBackend()
         clientControlActive = false; controlChannelOpen = false
@@ -1622,11 +1380,6 @@ class MainActivity : ComponentActivity() {
         clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
-        voiceChatEnabled = false; voiceMuted = false; remoteVoiceEnabled = true; voiceVolume = 1f
-        voiceStatus = "OFF"; voiceDiagnostics = VoiceDiagnostics(); voiceSignalingReady = false; voiceHostRole = false
-        localSpeaking = false; remoteSpeaking = false
-        hostPlayer = SessionPlayer("", "Player 1", 1, "host", false, false)
-        joinerPlayer = SessionPlayer("", "Player 2", 2, "joiner", false, false)
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
         lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
@@ -1785,7 +1538,6 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)
         hostRtc.release(); clientRtc.release()
-        if (voiceRtcDelegate.isInitialized()) voiceRtc.close()
         if (receiverRegistered) { try { unregisterReceiver(projectionReadyReceiver) } catch (_: Exception) {}; receiverRegistered = false }
         try { (getSystemService(Context.INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener) } catch (_: Exception) {}
         super.onDestroy()

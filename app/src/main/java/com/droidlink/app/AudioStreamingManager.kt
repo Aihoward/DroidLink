@@ -12,9 +12,7 @@ class AudioStreamingManager(private val context: Context) {
     private var audioRecord: AudioRecord? = null
     @Volatile private var pcmLogged = false
     private var silentCallbacks = 0
-    private var lastLevelLogMs = 0L
     var onStatus: ((String) -> Unit)? = null
-    var onLevel: ((Double) -> Unit)? = null
 
     fun createAudioDeviceModule(): JavaAudioDeviceModule = JavaAudioDeviceModule.builder(context.applicationContext)
         .setSampleRate(SAMPLE_RATE).setInputSampleRate(SAMPLE_RATE).setOutputSampleRate(SAMPLE_RATE)
@@ -40,20 +38,18 @@ class AudioStreamingManager(private val context: Context) {
             }
             if (copied < wanted) while (buffer.position() < wanted) buffer.put(0)
             buffer.rewind()
-            if (copied > 0) {
+            if (copied > 0 && !pcmLogged) {
                 var sumSquares = 0.0; var samples = 0; var index = 0
                 while (index + 1 < copied) { val sample = buffer.getShort(index).toDouble() / Short.MAX_VALUE; sumSquares += sample * sample; samples++; index += 32 }
                 val rms = if (samples > 0) kotlin.math.sqrt(sumSquares / samples) else 0.0
-                if (!pcmLogged && rms > 0.0005) {
+                if (rms > 0.0005) {
                     pcmLogged = true
                     Log.d(TAG, "GAME_AUDIO_CAPTURE_ACTIVE: first non-silent PCM rms=$rms bytes=$copied")
                     onStatus?.invoke("GAME_AUDIO_CAPTURE_ACTIVE")
-                } else if (!pcmLogged && ++silentCallbacks == 500) {
+                } else if (++silentCallbacks == 500) {
                     Log.w(TAG, "GAME_AUDIO_CAPTURE_SILENT: playback capture remained silent for 5 seconds; source may be silent or opted out")
                     onStatus?.invoke("GAME_AUDIO_CAPTURE_SILENT")
                 }
-                val now = android.os.SystemClock.elapsedRealtime()
-                if (now - lastLevelLogMs >= 1_000L) { lastLevelLogMs = now; onLevel?.invoke(rms) }
             }
             buffer.rewind()
             captureTimeNs

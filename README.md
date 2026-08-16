@@ -29,8 +29,7 @@ The project is currently in beta. Builds are published for physical-device testi
 - Direct peer-to-peer connectivity with Cloudflare TURN fallback
 - WebRTC DataChannel controller transport
 - DroidLink Player 2 virtual controller integration
-- Game-audio streaming and optional two-way voice chat
-- Player display names, lobby identities, and speaking indicators
+- Game-audio streaming through Android playback capture
 - Adaptive bitrate, resolution, and frame-rate controls
 - In-session connection, video, audio, and controller diagnostics
 
@@ -47,7 +46,7 @@ Install the newest APK from [GitHub Releases](https://github.com/Aihoward/DroidL
 3. Share the six-digit room code.
 4. Select **Join Game** on the second device and enter the code.
 5. Connect a supported controller to the joining device.
-6. Use the in-session menu for voice, game audio, settings, and diagnostics.
+6. Use the in-session menu for game audio, settings, and diagnostics.
 
 ## Technology
 
@@ -59,14 +58,12 @@ Install the newest APK from [GitHub Releases](https://github.com/Aihoward/DroidL
 | NAT traversal | STUN and Cloudflare TURN |
 | Input | WebRTC DataChannel |
 | Game audio | Android playback capture |
-| Voice | Optional WebRTC Opus audio |
 
 ## Beta notes
 
 - Performance depends on both devices, the game, and network conditions.
 - Android playback-capture policy may prevent game audio from certain apps.
 - Controller injection compatibility varies by device, game, emulator, and permission environment.
-- Voice Chat is optional and defaults off.
 - DroidLink does not claim to bypass Android platform restrictions.
 
 ## Building
@@ -86,7 +83,6 @@ DroidLink is under active beta development. Physical-device results are the sour
 
 ## Security and privacy
 
-- Voice Chat is opt-in and requires Android microphone permission.
 - Screen capture requires Android's MediaProjection consent.
 - Temporary room/signaling metadata is stored in Firebase for the active session.
 - Private Firebase, TURN, Cloudflare, and signing credentials must not be published.
