@@ -73,7 +73,7 @@ class MainActivity : ComponentActivity() {
     private var hostStatus by mutableStateOf("")
     private var captureStatus by mutableStateOf("DroidLink is ready")
     private var clientStatus by mutableStateOf("Not connected")
-    private var clientConnected by mutableStateOf(false)
+    private var joinSessionState by mutableStateOf(JoinSessionState.Idle)
     private var audioStatus by mutableStateOf("Audio not evaluated")
     private var betaDiagnostics by mutableStateOf(BetaDiagnostics())
     private var sessionActive by mutableStateOf(false)
@@ -148,6 +148,7 @@ class MainActivity : ComponentActivity() {
     private var remoteTrack by mutableStateOf<VideoTrack?>(null)
     private var renderer: SurfaceViewRenderer? = null
     private var rendererTrack: VideoTrack? = null
+    private val releasedRenderers = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<SurfaceViewRenderer, Boolean>())
     private var pendingCaptureIntent: Intent? = null
     private var pendingOffer: (() -> Unit)? = null
     private var receiverRegistered = false
@@ -192,10 +193,9 @@ class MainActivity : ComponentActivity() {
         override fun onInputDeviceRemoved(deviceId: Int) { if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
     }
     private val disconnectGraceRunnable = Runnable {
-        if (clientPeerState == PeerConnection.PeerConnectionState.DISCONNECTED) {
-            clientConnected = false; clientControlActive = false
-            clientStatus = "Reconnection failed - retry the session"
-            updateSessionActive(false)
+        if (joinSessionState == JoinSessionState.Reconnecting) {
+            clientControlActive = false
+            transitionJoinState(JoinSessionState.Failed, "reconnect grace expired", "Reconnection failed - retry the session")
             Log.e(TAG, "RECONNECT GRACE EXPIRED: PeerConnection remained DISCONNECTED for 15 seconds")
         }
     }
@@ -301,7 +301,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         when (mode) {
                             "host" -> if (sessionActive) HostGameplayScreen() else HostScreen(onStart = ::startHost, onBack = ::returnToMenu)
-                            "client" -> if (clientConnected) VideoScreen() else JoinScreen(
+                            "client" -> if (joinSessionState.showsActiveSession) VideoScreen() else JoinScreen(
                                 code = joinCode,
                                 onCode = { joinCode = it.filter(Char::isDigit).take(6) },
                                 onConnect = { startJoin(joinCode) },
@@ -418,7 +418,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.2.0", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.2.1", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -467,12 +467,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable private fun VideoScreen() {
-        DisposableEffect(Unit) { onDispose { detachRenderer() } }
+        LaunchedEffect(Unit) { Log.d(TAG, "JOIN_ACTIVE_SESSION_SHOWN") }
         Box(Modifier.fillMaxSize()) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { context ->
                     SurfaceViewRenderer(context).apply {
+                        releasedRenderers.remove(this)
                         setZOrderMediaOverlay(false); setZOrderOnTop(false)
                         init(clientRtc.eglContext(), object : RendererCommon.RendererEvents {
                             override fun onFirstFrameRendered() { Log.d(TAG, "FIRST REMOTE FRAME RENDERED"); runOnUiThread { clientStatus = "Connected - video playing" } }
@@ -480,10 +481,12 @@ class MainActivity : ComponentActivity() {
                         })
                         setEnableHardwareScaler(true); setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT); setMirror(false)
                         renderer = this
+                        Log.d(TAG, "JOIN_RENDERER_CREATED: renderer=${System.identityHashCode(this)}")
                         remoteTrack?.let { attachTrack(this, it) }
                     }
                 },
-                update = { view -> remoteTrack?.let { if (rendererTrack !== it) attachTrack(view, it) } }
+                update = { view -> remoteTrack?.let { if (renderer !== view || rendererTrack !== it) attachTrack(view, it) } },
+                onRelease = { view -> releaseRenderer(view, "AndroidView onRelease") }
             )
             if (remoteTrack == null) Text(clientStatus, modifier = Modifier.align(Alignment.Center))
             SpeakingOverlay()
@@ -770,7 +773,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.2.0")
+                SettingInfo("Version", "Droid Link 1.2.1")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -851,7 +854,7 @@ class MainActivity : ComponentActivity() {
         firebase.listenForPlayers(code, { players -> runOnUiThread {
             players.firstOrNull { it.role == "host" }?.let { hostPlayer = it.copy(speaking = hostPlayer.speaking) }
             players.firstOrNull { it.role == "joiner" }?.let { joinerPlayer = it.copy(speaking = joinerPlayer.speaking) }
-            if (mode == "client" && !clientConnected && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
+            if (mode == "client" && !joinSessionState.showsActiveSession && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
         } }, { Log.e(TAG, "Player metadata listener failed: $it") })
     }
 
@@ -1011,10 +1014,28 @@ class MainActivity : ComponentActivity() {
     @Composable private fun diagnosticLine(label: String, value: String) { Text("$label: $value", color = Color.White) }
 
     private fun attachTrack(view: SurfaceViewRenderer, track: VideoTrack) {
+        val previousView = renderer
+        if (previousView != null && previousView !== view) releaseRenderer(previousView, "renderer replaced")
         rendererTrack?.let { old -> try { old.removeSink(view) } catch (_: Exception) {} }
         track.setEnabled(true)
-        track.addSink(view); rendererTrack = track
+        track.addSink(view); renderer = view; rendererTrack = track
+        Log.d(TAG, "JOIN_VIDEO_SINK_ATTACHED: trackId=${track.id()} renderer=${System.identityHashCode(view)}")
         Log.d(TAG, "REMOTE VIDEO SINK ATTACHED: trackId=${track.id()} enabled=${track.enabled()} renderer=${System.identityHashCode(view)}")
+    }
+
+    private fun releaseRenderer(view: SurfaceViewRenderer, reason: String) {
+        if (!releasedRenderers.add(view)) {
+            Log.d(TAG, "JOIN_CRASH_GUARD: duplicate renderer release ignored renderer=${System.identityHashCode(view)} reason=$reason")
+            return
+        }
+        val track = rendererTrack
+        if (track != null) {
+            try { track.removeSink(view); Log.d(TAG, "JOIN_VIDEO_SINK_REMOVED: trackId=${track.id()} renderer=${System.identityHashCode(view)} reason=$reason") }
+            catch (error: Exception) { Log.w(TAG, "JOIN_CRASH_GUARD: sink removal failed renderer=${System.identityHashCode(view)} reason=$reason", error) }
+        }
+        try { view.release(); Log.d(TAG, "JOIN_RENDERER_RELEASED: renderer=${System.identityHashCode(view)} reason=$reason") }
+        catch (error: Exception) { Log.w(TAG, "JOIN_CRASH_GUARD: renderer release failed renderer=${System.identityHashCode(view)} reason=$reason", error) }
+        if (renderer === view) { renderer = null; rendererTrack = null }
     }
 
     private fun startHost() {
@@ -1101,14 +1122,15 @@ class MainActivity : ComponentActivity() {
         if (sessionStarting) return
         cleanupSession(deleteHostRoom = true)
         activeSessionId = code
-        sessionStarting = true; clientStatus = "Looking for room..."
+        sessionStarting = true
+        transitionJoinState(JoinSessionState.LookingForRoom, "join button pressed", "Looking for room...")
         firebase.joinRoom(code, {
-            clientStatus = "Loading WebRTC offer..."
+            transitionJoinState(JoinSessionState.Negotiating, "room found", "Loading WebRTC offer...")
             joinerPlayer = SessionPlayer(code, effectiveDisplayName(false), 2, "joiner", false, false)
             firebase.publishPlayer(code, "joiner", joinerPlayer.displayName, 2, false, false) { Log.e(TAG, "Joiner player metadata failed: $it") }
             listenForPlayerMetadata(code)
-            firebase.getOffer(code, { offer -> prepareJoinPeer(code, offer) }, { clientStatus = "Offer load failed: $it"; sessionStarting = false })
-        }, { clientStatus = "Join failed: $it"; sessionStarting = false })
+            firebase.getOffer(code, { offer -> prepareJoinPeer(code, offer) }, { transitionJoinFailure("Offer load failed: $it") })
+        }, { transitionJoinFailure("Join failed: $it") })
     }
 
     private fun prepareJoinPeer(code: String, offer: String) {
@@ -1121,21 +1143,26 @@ class MainActivity : ComponentActivity() {
             if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) Log.w(TAG, "Client DataChannel closed: $label")
         } }
         clientRtc.onDiagnostics = { update -> runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) } }
-        clientRtc.onRemoteVideoTrack = { track -> Log.d(TAG, "Remote video track stored for renderer"); runOnUiThread { remoteTrack = track; clientStatus = "Connected - video track received" } }
+        clientRtc.onRemoteVideoTrack = { track -> Log.d(TAG, "Remote video track stored for renderer"); runOnUiThread {
+            if (activeSessionId != code || mode != "client") { Log.w(TAG, "JOIN_CRASH_GUARD: ignored remote track for disposed/stale session room=$code active=$activeSessionId mode=$mode"); return@runOnUiThread }
+            remoteTrack = track
+            if (joinSessionState.showsActiveSession) clientStatus = "Connected - video track received"
+        } }
         clientRtc.onConnectionStateChanged = { state -> runOnUiThread {
+            if (activeSessionId != code || mode != "client") { Log.w(TAG, "JOIN_CRASH_GUARD: ignored PeerConnection callback state=$state room=$code active=$activeSessionId mode=$mode"); return@runOnUiThread }
             clientPeerState = state
             when (state) {
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
-                    clientControlActive = true; clientConnected = true; sessionStarting = false
-                    updateSessionActive(true)
+                    val entered = transitionJoinState(JoinSessionState.Connected, "PeerConnection CONNECTED", if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing")
+                    if (!entered) return@runOnUiThread
+                    clientControlActive = true; sessionStarting = false
                     firebase.updatePlayerState(code, "joiner", connected = true)
                     if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
                     else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
                     uiFeedback(window.decorView, success = true)
-                    clientStatus = if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing"
                     mainHandler.postDelayed({
-                        if (clientConnected && remoteTrack == null) {
+                        if (joinSessionState.showsActiveSession && remoteTrack == null) {
                             clientStatus = "Connected, but no video track received"
                             Log.e(TAG, "VIDEO TRACK UNAVAILABLE: connected for 10 seconds without a remote video track")
                         }
@@ -1144,7 +1171,7 @@ class MainActivity : ComponentActivity() {
                 PeerConnection.PeerConnectionState.DISCONNECTED -> {
                     sendNeutralReset("connection interrupted")
                     clientControlActive = false
-                    clientStatus = "Connection interrupted - recovering..."
+                    transitionJoinState(JoinSessionState.Reconnecting, "PeerConnection DISCONNECTED", "Connection interrupted - recovering...")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     mainHandler.postDelayed(disconnectGraceRunnable, 15_000L)
                     Log.w(TAG, "CONNECTION INTERRUPTED: preserving renderer for 15-second automatic WebRTC recovery window")
@@ -1153,25 +1180,56 @@ class MainActivity : ComponentActivity() {
                 PeerConnection.PeerConnectionState.CLOSED -> {
                     sendNeutralReset("PeerConnection $state")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
-                    clientControlActive = false; clientConnected = false; sessionStarting = false
-                    clientStatus = "Connection failed"
-                    updateSessionActive(false)
+                    clientControlActive = false; sessionStarting = false
+                    transitionJoinState(if (state == PeerConnection.PeerConnectionState.FAILED) JoinSessionState.Failed else JoinSessionState.Disconnected, "PeerConnection $state", "Connection failed")
                 }
-                else -> clientStatus = connectionText(state)
+                PeerConnection.PeerConnectionState.CONNECTING -> transitionJoinState(JoinSessionState.Connecting, "PeerConnection CONNECTING", "Connecting...")
+                else -> if (!joinSessionState.showsActiveSession) clientStatus = connectionText(state)
             }
         } }
-        clientRtc.onIceCandidateReady = { candidate -> firebase.saveIceCandidate(code, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { clientStatus = "ICE save error: $it" } }
-        clientStatus = "Loading TURN credentials..."
+        clientRtc.onIceCandidateReady = { candidate -> firebase.saveIceCandidate(code, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE save error: $error" else Log.w(TAG, "Late ICE save error ignored after connection: $error") } } }
+        transitionJoinState(JoinSessionState.Negotiating, "preparing PeerConnection", "Loading TURN credentials...")
         clientRtc.createPeerConnection(false, onSuccess = {
-            firebase.listenForIceCandidates(code, "host", { c, mid, line -> clientRtc.addIceCandidate(c, mid, line) }, { clientStatus = "ICE listen error: $it" })
+            firebase.listenForIceCandidates(code, "host", { c, mid, line -> clientRtc.addIceCandidate(c, mid, line) }, { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE listen error: $error" else Log.w(TAG, "Late ICE listener error ignored after connection: $error") } })
             clientRtc.setRemoteOffer(offer, {
-                clientStatus = "Offer found; creating answer..."
+                transitionJoinState(JoinSessionState.Negotiating, "remote offer set", "Offer found; creating answer...")
                 clientRtc.createAnswer({ answer ->
                     Log.d(TAG, "Answer created")
-                    firebase.saveAnswer(code, answer, { clientStatus = "WebRTC answer sent - connecting..." }, { clientStatus = "Answer save failed: $it" })
-                }, { clientStatus = "Answer error: $it"; sessionStarting = false })
-            }, { clientStatus = "Offer error: $it"; sessionStarting = false })
-        }, onError = { clientStatus = "PeerConnection error: $it"; sessionStarting = false })
+                    firebase.saveAnswer(code, answer, { transitionJoinState(JoinSessionState.Connecting, "local answer stored", "WebRTC answer sent - connecting...") }, { transitionJoinFailure("Answer save failed: $it") })
+                }, { transitionJoinFailure("Answer error: $it") })
+            }, { transitionJoinFailure("Offer error: $it") })
+        }, onError = { transitionJoinFailure("PeerConnection error: $it") })
+    }
+
+    private fun transitionJoinState(next: JoinSessionState, reason: String, status: String): Boolean {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { transitionJoinState(next, reason, status) }
+            return false
+        }
+        val previous = joinSessionState
+        if (!previous.allows(next)) {
+            Log.d(TAG, "JOIN_SESSION_STATE: ignored $previous -> $next reason=$reason")
+            return false
+        }
+        joinSessionState = next
+        clientStatus = status
+        Log.d(TAG, "JOIN_SESSION_STATE: $previous -> $next reason=$reason")
+        Log.d(TAG, "JOIN_UI_STATE: state=$next status=$status")
+        if (next.showsActiveSession && !previous.showsActiveSession) {
+            updateSessionActive(true, showReadiness = false)
+            Log.d(TAG, "JOIN_CONNECTING_SCREEN_HIDDEN")
+        } else if (!next.showsActiveSession && previous.showsActiveSession) {
+            updateSessionActive(false)
+        }
+        if (!next.showsActiveSession && next !in setOf(JoinSessionState.Failed, JoinSessionState.Disconnected, JoinSessionState.Idle)) Log.d(TAG, "JOIN_CONNECTING_SCREEN_SHOWN: state=$next")
+        return true
+    }
+
+    private fun transitionJoinFailure(message: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { runOnUiThread { transitionJoinFailure(message) }; return }
+        sessionStarting = false
+        if (joinSessionState.showsActiveSession) Log.w(TAG, "JOIN_SESSION_STATE: late signaling failure ignored after connection: $message")
+        else transitionJoinState(JoinSessionState.Failed, "signaling failure", message)
     }
 
     private fun connectionText(state: PeerConnection.PeerConnectionState) = when (state) {
@@ -1495,12 +1553,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun updateSessionActive(active: Boolean) {
+    private fun updateSessionActive(active: Boolean, showReadiness: Boolean = true) {
         sessionActive = active
         sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen || sessionGameAudioOpen || sessionVoiceOpen
-        if (active && !readinessShownForSession) {
+        if (active && showReadiness && !readinessShownForSession) {
             readinessShownForSession = true
             readinessVisible = true
+        }
+        if (active && !showReadiness) {
+            readinessShownForSession = true
+            readinessVisible = false
+            Log.d(TAG, "JOIN_UI_STATE: optional capability readiness overlay skipped for active joiner session")
         }
         if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; sessionGameAudioOpen = false; sessionVoiceOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
     }
@@ -1512,11 +1575,15 @@ class MainActivity : ComponentActivity() {
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         mainHandler.removeCallbacksAndMessages(null)
+        // Remove the renderer sink while its receiver-owned VideoTrack and PeerConnection are still valid.
+        detachRenderer(); remoteTrack = null
         hostRtc.close(); clientRtc.close()
         if (voiceRtcDelegate.isInitialized()) voiceRtc.close()
         stopService(Intent(this, ScreenCaptureService::class.java))
         controllerBackend.close(); controllerBackend = TransportOnlyBackend()
-        detachRenderer(); remoteTrack = null; clientControlActive = false; clientConnected = false; controlChannelOpen = false
+        clientControlActive = false; controlChannelOpen = false
+        if (joinSessionState != JoinSessionState.Idle) Log.d(TAG, "JOIN_SESSION_DISPOSED: previousState=$joinSessionState")
+        joinSessionState = JoinSessionState.Idle
         clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
@@ -1538,10 +1605,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun detachRenderer() {
-        val view = renderer
-        if (view != null) rendererTrack?.let { try { it.removeSink(view) } catch (_: Exception) {} }
-        try { view?.release() } catch (_: Exception) {}
-        renderer = null; rendererTrack = null
+        renderer?.let { releaseRenderer(it, "session detach") }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
