@@ -64,6 +64,7 @@ class MainActivity : ComponentActivity() {
     private val firebase = FirebaseRoomManager()
     private val hostRtc by lazy { WebRtcManager(this) }
     private val clientRtc by lazy { WebRtcManager(this) }
+    private val voiceRtc by lazy { VoiceChatManager(this) }
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -78,6 +79,8 @@ class MainActivity : ComponentActivity() {
     private var sessionMenuOpen by mutableStateOf(false)
     private var sessionStatsOpen by mutableStateOf(false)
     private var sessionSettingsOpen by mutableStateOf(false)
+    private var sessionGameAudioOpen by mutableStateOf(false)
+    private var sessionVoiceOpen by mutableStateOf(false)
     private var menuButtonVisible by mutableStateOf(false)
     private var menuRevealGeneration by mutableLongStateOf(0L)
     private var mainPage by mutableStateOf("home")
@@ -93,6 +96,16 @@ class MainActivity : ComponentActivity() {
     private var readinessVisible by mutableStateOf(false)
     private var readinessShownForSession = false
     private var controlChannelOpen by mutableStateOf(false)
+    private var gameAudioEnabled by mutableStateOf(true)
+    private var gameAudioVolume by mutableFloatStateOf(1f)
+    private var voiceChatEnabled by mutableStateOf(false)
+    private var voiceMuted by mutableStateOf(false)
+    private var remoteVoiceEnabled by mutableStateOf(true)
+    private var voiceVolume by mutableFloatStateOf(1f)
+    private var voiceStatus by mutableStateOf("OFF")
+    private var voiceDiagnostics by mutableStateOf(VoiceDiagnostics())
+    private var voiceSignalingReady = false
+    private var voiceHostRole = false
     private var controllerInputTestOpen by mutableStateOf(false)
     private var controllerTestDisplayState by mutableStateOf(ControllerInputState())
     private var logicalControllerState = ControllerInputState()
@@ -195,7 +208,7 @@ class MainActivity : ComponentActivity() {
             try {
                 Log.d(TAG, "MediaProjection service ready; attaching host video track")
                 val capture = captureSettings()
-                hostRtc.startScreenShare(permission, capture.first, capture.second, capture.third)
+                hostRtc.startScreenShare(permission, capture.first, capture.second, capture.third, qualityPreset)
                 captureStatus = "WebRTC screen share started"
                 pendingOffer?.invoke()
             } catch (error: Exception) {
@@ -231,6 +244,13 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "AUDIO_UNAVAILABLE_REASON: RECORD_AUDIO permission denied")
         }
     }
+    private val voicePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) enableVoiceAfterPermission() else {
+            voiceChatEnabled = false
+            voiceStatus = "MICROPHONE PERMISSION DENIED"
+            Log.w(TAG, "VOICE_PERMISSION_DENIED: game session continues")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -240,6 +260,8 @@ class MainActivity : ComponentActivity() {
         sessionBackCallback = object : OnBackPressedCallback(false) {
             override fun handleOnBackPressed() {
                 when { controllerInputTestOpen -> controllerInputTestOpen = false
+                    sessionVoiceOpen -> { sessionVoiceOpen = false; sessionMenuOpen = true }
+                    sessionGameAudioOpen -> { sessionGameAudioOpen = false; sessionMenuOpen = true }
                     sessionStatsOpen -> { sessionStatsOpen = false; sessionMenuOpen = true }
                     sessionSettingsOpen -> { sessionSettingsOpen = false; sessionMenuOpen = true }
                     sessionMenuOpen -> sessionMenuOpen = false
@@ -278,10 +300,12 @@ class MainActivity : ComponentActivity() {
                             "disconnecting" -> DisconnectedScreen()
                             else -> MainShell()
                         }
-                        if (sessionActive && !readinessVisible && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen) SessionMenuRevealLayer()
+                        if (sessionActive && !readinessVisible && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen && !sessionVoiceOpen && !sessionGameAudioOpen) SessionMenuRevealLayer()
                         if (sessionMenuOpen) SessionMenu()
                         if (sessionStatsOpen) SessionStats()
                         if (sessionSettingsOpen) SettingsScreen(inSession = true)
+                        if (sessionGameAudioOpen) GameAudioPanel()
+                        if (sessionVoiceOpen) VoiceChatPanel()
                         if (sessionActive && readinessVisible) PreGameReadiness()
                     }
                 }
@@ -384,7 +408,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.0.0", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.1.0", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -512,9 +536,44 @@ class MainActivity : ComponentActivity() {
         Column(Modifier.widthIn(max = 360.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 3.sp)
             NeonButton("RESUME") { sessionMenuOpen = false; menuButtonVisible = false }
+            NeonButton("GAME AUDIO", filled = false) { sessionMenuOpen = false; sessionGameAudioOpen = true }
+            NeonButton("VOICE CHAT", filled = false) { sessionMenuOpen = false; sessionVoiceOpen = true }
             NeonButton("CONNECTION STATS", filled = false) { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }
             NeonButton("SETTINGS", filled = false) { sessionMenuOpen = false; sessionSettingsOpen = true }
             TextButton(onClick = { disconnectSession() }) { Text("DISCONNECT", color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold) }
+        }
+    }
+
+    @Composable private fun GameAudioPanel() = Box(Modifier.fillMaxSize().background(Color(0xE8000000)), contentAlignment = Alignment.Center) {
+        Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("GAME AUDIO", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+            SettingSwitch("Game Audio", gameAudioEnabled) { enabled ->
+                gameAudioEnabled = enabled; hostRtc.setGameAudioEnabled(enabled); clientRtc.setGameAudioEnabled(enabled)
+            }
+            Text("Volume ${(gameAudioVolume * 100).toInt()}%", color = mutedText)
+            Slider(value = gameAudioVolume, onValueChange = { gameAudioVolume = it; clientRtc.setGameAudioVolume(it) }, enabled = gameAudioEnabled, colors = SliderDefaults.colors(thumbColor = neonGreen, activeTrackColor = neonGreen))
+            SettingInfo("Capture", friendlyAudioStatus())
+            SettingInfo("RTP sent", "${betaDiagnostics.gameAudioPacketsSent} packets")
+            SettingInfo("RTP received", "${betaDiagnostics.gameAudioPacketsReceived} packets")
+            NeonButton("BACK TO SESSION MENU", filled = false) { sessionGameAudioOpen = false; sessionMenuOpen = true }
+        }
+    }
+
+    @Composable private fun VoiceChatPanel() = Box(Modifier.fillMaxSize().background(Color(0xE8000000)), contentAlignment = Alignment.Center) {
+        Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("VOICE CHAT", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+            Text("Microphone use is always opt-in. Headphones provide the best echo protection.", color = mutedText, fontSize = 12.sp)
+            SettingSwitch("Voice Chat", voiceChatEnabled) { updateVoiceChatEnabled(it) }
+            SettingSwitch("Mute Myself", voiceMuted) { muted -> voiceMuted = muted; if (voiceChatEnabled) voiceRtc.enableMicrophone(!muted) }
+            SettingSwitch("Remote Voice", remoteVoiceEnabled) { enabled -> remoteVoiceEnabled = enabled; voiceRtc.setRemoteVoiceEnabled(enabled) }
+            Text("Voice Volume ${(voiceVolume * 100).toInt()}%", color = mutedText)
+            Slider(value = voiceVolume, onValueChange = { voiceVolume = it; voiceRtc.setRemoteVolume(it) }, enabled = remoteVoiceEnabled, colors = SliderDefaults.colors(thumbColor = neonGreen, activeTrackColor = neonGreen))
+            SettingInfo("Status", voiceStatus)
+            SettingInfo("Microphone", if (!voiceChatEnabled || voiceMuted) "Muted" else if (voiceDiagnostics.micLevel > 0.01) "Speaking" else "Silent")
+            SettingInfo("Remote voice", if (voiceDiagnostics.bytesReceived > 0L) "Receiving" else "Waiting")
+            SettingInfo("Echo cancellation", if (voiceDiagnostics.aecAvailable) "Active when supported" else "Unavailable")
+            SettingInfo("Noise suppression", if (voiceDiagnostics.nsAvailable) "Active when supported" else "Unavailable")
+            NeonButton("BACK TO SESSION MENU", filled = false) { sessionVoiceOpen = false; sessionMenuOpen = true }
         }
     }
 
@@ -528,14 +587,29 @@ class MainActivity : ComponentActivity() {
         Column(Modifier.widthIn(max = 620.dp).fillMaxWidth().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("CONNECTION STATS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
             StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
-            StatSection("VIDEO") { diagnosticLine("Resolution", d.resolution); diagnosticLine("FPS", d.fps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Bitrate", "${d.videoBitrateBps / 1_000} kbps"); diagnosticLine("Dropped frames", d.framesDropped.toString()) }
+            StatSection("VIDEO") {
+                diagnosticLine("Resolution", d.resolution); diagnosticLine("Capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "—")
+                diagnosticLine("Encode FPS", d.encodeFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Decode FPS", d.decodeFps?.let { "%.1f".format(it) } ?: "—")
+                diagnosticLine("Render FPS", d.renderFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Bitrate", "${d.videoBitrateBps / 1_000} kbps")
+                diagnosticLine("Available outbound", "${d.availableOutgoingBitrateBps / 1_000} kbps"); diagnosticLine("Dropped frames", d.framesDropped.toString())
+                diagnosticLine("Bottleneck", d.videoBottleneck)
+            }
             StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
             StatSection("CONTROLLER") { diagnosticLine("Player 2", d.player2Status); diagnosticLine("Latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—"); diagnosticLine("Packets/sec", "%.1f".format(d.controllerPacketsPerSecond)) }
-            StatSection("AUDIO") { diagnosticLine("Status", friendlyAudioStatus()) }
+            StatSection("GAME AUDIO") {
+                diagnosticLine("Capture", friendlyAudioStatus()); diagnosticLine("RTP sent", "${d.gameAudioPacketsSent} packets / ${d.gameAudioBytesSent} bytes")
+                diagnosticLine("RTP received", "${d.gameAudioPacketsReceived} packets / ${d.gameAudioBytesReceived} bytes"); diagnosticLine("Playing", if (gameAudioEnabled) "Enabled" else "Disabled")
+            }
+            StatSection("VOICE") {
+                diagnosticLine("Status", voiceStatus); diagnosticLine("Mic", if (voiceChatEnabled && !voiceMuted) "Enabled" else "Muted")
+                diagnosticLine("Sending", "${voiceDiagnostics.bytesSent} bytes"); diagnosticLine("Receiving", "${voiceDiagnostics.bytesReceived} bytes")
+                diagnosticLine("AEC / NS / AGC", "${voiceDiagnostics.aecAvailable} / ${voiceDiagnostics.nsAvailable} / ${voiceDiagnostics.agcAvailable}")
+            }
             var advanced by remember { mutableStateOf(false) }
             NeonTextButton(if (advanced) "HIDE ADVANCED DIAGNOSTICS" else "ADVANCED DIAGNOSTICS") { advanced = !advanced }
             if (advanced) {
                 diagnosticLine("Candidate pair", d.candidatePair); diagnosticLine("Frames encoded / decoded", "${d.framesEncoded} / ${d.framesDecoded}")
+                diagnosticLine("Encode / decode time", "${d.averageEncodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"} / ${d.averageDecodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"}")
                 diagnosticLine("Queue digital / analog", "${d.digitalQueueDepth} / ${d.analogQueueDepth}"); diagnosticLine("DataChannel buffer", "${d.controlBufferedBytes} bytes")
                 diagnosticLine("Duplicate / out-of-order", "${d.duplicateControlPacketsDropped} / ${d.outOfOrderControlPacketsDropped}")
             }
@@ -647,7 +721,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "1.0.0")
+                SettingInfo("Version", "1.1.0")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -736,7 +810,9 @@ class MainActivity : ComponentActivity() {
 
     private fun friendlyAudioStatus(): String = when {
         audioStatus.contains("active", true) -> "Streaming"
-        audioStatus.contains("waiting", true) || audioStatus.contains("preparing", true) -> audioStatus
+        audioStatus.contains("waiting", true) || audioStatus.contains("preparing", true) || audioStatus.contains("starting", true) || audioStatus.contains("remote_track", true) -> "Checking captured game audio…"
+        audioStatus.contains("silent", true) -> "Game Audio Unavailable: the current game/device may block playback capture."
+        audioStatus.contains("blocked", true) -> "Game Audio Unavailable: playback capture was blocked."
         audioStatus.contains("not evaluated", true) -> "Available when a session starts"
         else -> "Audio unavailable: this app or device may not allow playback capture."
     }
@@ -746,6 +822,73 @@ class MainActivity : ComponentActivity() {
         ControllerBackendStatus.TRANSPORT_ONLY -> "Transport connected; virtual gamepad unavailable"
         ControllerBackendStatus.PERMISSION_REQUIRED -> "Virtual gamepad permission required"
         ControllerBackendStatus.UNSUPPORTED -> "Virtual gamepad unavailable on this device"
+    }
+
+    private fun setupVoiceSignaling(code: String, isHost: Boolean) {
+        if (voiceSignalingReady || activeSessionId != code) return
+        voiceSignalingReady = true; voiceHostRole = isHost
+        voiceRtc.onStatus = { status -> runOnUiThread { voiceStatus = status.removePrefix("VOICE_").replace('_', ' ') } }
+        voiceRtc.onDiagnostics = { value -> runOnUiThread { voiceDiagnostics = value } }
+        voiceRtc.onIceCandidate = { candidate ->
+            val side = if (isHost) "voiceHost" else "voiceClient"
+            firebase.saveIceCandidate(code, side, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { Log.e(TAG, "VOICE ICE save failed: $it") }
+        }
+        val remoteSide = if (isHost) "voiceClient" else "voiceHost"
+        firebase.listenForIceCandidates(code, remoteSide, { candidate, mid, line -> voiceRtc.addIceCandidate(candidate, mid, line) }, { Log.e(TAG, "VOICE ICE listener failed: $it") })
+        if (isHost) {
+            firebase.listenForVoiceRequest(code, { negotiateVoiceAsHost(code) }, { Log.e(TAG, "VOICE request listener failed: $it") })
+            firebase.listenForVoiceAnswer(code, { answer ->
+                voiceRtc.setRemoteAnswer(answer, { Log.d(TAG, "VOICE_REMOTE_ANSWER_SET") }, { Log.e(TAG, "VOICE answer failed: $it") })
+            }, { Log.e(TAG, "VOICE answer listener failed: $it") })
+        } else {
+            firebase.listenForVoiceOffer(code, { offer ->
+                ensureVoiceReady {
+                    voiceRtc.setRemoteOffer(offer, {
+                        voiceRtc.createAnswer({ answer -> firebase.saveVoiceAnswer(code, answer, { Log.d(TAG, "VOICE_ANSWER_STORED") }, { Log.e(TAG, "VOICE answer save failed: $it") }) }, { Log.e(TAG, "VOICE answer create failed: $it") })
+                    }, { Log.e(TAG, "VOICE offer failed: $it") })
+                }
+            }, { Log.e(TAG, "VOICE offer listener failed: $it") })
+        }
+        Log.d(TAG, "VOICE_SIGNALING_READY: role=${if (isHost) "host" else "joiner"}")
+    }
+
+    private fun ensureVoiceReady(onReady: () -> Unit) {
+        voiceRtc.initialize { result ->
+            result.onSuccess { runOnUiThread { voiceRtc.setRemoteVoiceEnabled(voiceChatEnabled && remoteVoiceEnabled); voiceRtc.setRemoteVolume(voiceVolume); onReady() } }
+                .onFailure { error -> runOnUiThread { voiceStatus = "ERROR: ${error.message}"; Log.e(TAG, "VOICE initialization failed", error) } }
+        }
+    }
+
+    private fun negotiateVoiceAsHost(code: String) {
+        if (activeSessionId != code) return
+        ensureVoiceReady {
+            voiceRtc.createOffer({ offer ->
+                firebase.saveVoiceOffer(code, offer, { Log.d(TAG, "VOICE_OFFER_STORED") }, { Log.e(TAG, "VOICE offer save failed: $it") })
+            }, { Log.e(TAG, "VOICE offer create failed: $it") })
+        }
+    }
+
+    private fun updateVoiceChatEnabled(enabled: Boolean) {
+        if (!enabled) {
+            voiceChatEnabled = false; voiceStatus = "OFF"
+            voiceRtc.enableMicrophone(false); voiceRtc.setRemoteVoiceEnabled(false)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            voicePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else enableVoiceAfterPermission()
+    }
+
+    private fun enableVoiceAfterPermission() {
+        if (!sessionActive || !voiceSignalingReady) { voiceStatus = "SESSION NOT READY"; return }
+        voiceChatEnabled = true; voiceStatus = "CONNECTING"
+        ensureVoiceReady {
+            voiceRtc.setRemoteVoiceEnabled(remoteVoiceEnabled)
+            voiceRtc.setRemoteVolume(voiceVolume)
+            voiceRtc.enableMicrophone(!voiceMuted).onFailure { voiceStatus = "MIC ERROR: ${it.message}" }
+            if (voiceHostRole) negotiateVoiceAsHost(activeSessionId)
+            else firebase.requestVoiceNegotiation(activeSessionId) { voiceStatus = "SIGNALING ERROR: $it" }
+        }
     }
 
     private fun setPerformanceDiagnosticsActive(active: Boolean) {
@@ -799,7 +942,7 @@ class MainActivity : ComponentActivity() {
                 when (state) {
                     PeerConnection.PeerConnectionState.CONNECTED -> {
                         mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
-                        hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true); uiFeedback(window.decorView, success = true)
+                        hostStatus = "Connected"; sessionStarting = false; setupVoiceSignaling(code, true); updateSessionActive(true); uiFeedback(window.decorView, success = true)
                     }
                     PeerConnection.PeerConnectionState.DISCONNECTED -> {
                         hostStatus = "Reconnecting…"; resetRemoteInput("PeerConnection $state")
@@ -868,6 +1011,7 @@ class MainActivity : ComponentActivity() {
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     clientControlActive = true; clientConnected = true; sessionStarting = false
+                    setupVoiceSignaling(code, false)
                     updateSessionActive(true)
                     uiFeedback(window.decorView, success = true)
                     clientStatus = if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing"
@@ -1234,12 +1378,12 @@ class MainActivity : ComponentActivity() {
 
     private fun updateSessionActive(active: Boolean) {
         sessionActive = active
-        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen
+        sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen || sessionGameAudioOpen || sessionVoiceOpen
         if (active && !readinessShownForSession) {
             readinessShownForSession = true
             readinessVisible = true
         }
-        if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
+        if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; sessionGameAudioOpen = false; sessionVoiceOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
     }
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
@@ -1248,11 +1392,14 @@ class MainActivity : ComponentActivity() {
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         mainHandler.removeCallbacksAndMessages(null)
-        hostRtc.close(); clientRtc.close(); stopService(Intent(this, ScreenCaptureService::class.java))
+        hostRtc.close(); clientRtc.close(); voiceRtc.close(); stopService(Intent(this, ScreenCaptureService::class.java))
         controllerBackend.close(); controllerBackend = TransportOnlyBackend()
         detachRenderer(); remoteTrack = null; clientControlActive = false; clientConnected = false; controlChannelOpen = false
         clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
         readinessVisible = false; readinessShownForSession = false
+        gameAudioEnabled = true; gameAudioVolume = 1f
+        voiceChatEnabled = false; voiceMuted = false; remoteVoiceEnabled = true; voiceVolume = 1f
+        voiceStatus = "OFF"; voiceDiagnostics = VoiceDiagnostics(); voiceSignalingReady = false; voiceHostRole = false
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
         lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
@@ -1413,7 +1560,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)
-        hostRtc.release(); clientRtc.release()
+        hostRtc.release(); clientRtc.release(); voiceRtc.close()
         if (receiverRegistered) { try { unregisterReceiver(projectionReadyReceiver) } catch (_: Exception) {}; receiverRegistered = false }
         try { (getSystemService(Context.INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener) } catch (_: Exception) {}
         super.onDestroy()

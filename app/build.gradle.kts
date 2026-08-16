@@ -14,8 +14,8 @@ android {
         applicationId = "com.droidlink.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 12
-        versionName = "1.0.0"
+        versionCode = 13
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild { ndkBuild { arguments += "NDK_APPLICATION_MK:=src/main/jni/Application.mk" } }

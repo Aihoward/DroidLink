@@ -32,7 +32,16 @@ class WebRtcManager(private val context: Context) {
     private var textureHelper: SurfaceTextureHelper? = null
     private var screenSource: VideoSource? = null
     private var screenTrack: VideoTrack? = null
+    private var videoSender: RtpSender? = null
+    private var adaptiveProfile = "Auto"
+    private var baseCaptureWidth = 1280
+    private var baseCaptureHeight = 720
+    private var baseCaptureFps = 60
+    private var adaptationLevel = 0
+    private var lastAdaptationMs = 0L
+    private var lastPacketsLost = 0L
     private var remoteVideoTrack: VideoTrack? = null
+    private var remoteGameAudioTrack: AudioTrack? = null
     private var remoteFrameSink: VideoSink? = null
     private var localAudioSource: AudioSource? = null
     private var localAudioTrack: AudioTrack? = null
@@ -43,6 +52,12 @@ class WebRtcManager(private val context: Context) {
     private var lastBytesReceived = 0L
     private var lastFramesDecoded = 0L
     private var lastFramesEncoded = 0L
+    private var lastAudioBytesSent = 0L
+    private var lastAudioBytesReceived = 0L
+    private var captureWindowStartMs = 0L
+    private var captureWindowFrames = 0
+    private var gameAudioSendConfirmed = false
+    private var gameAudioReceiveConfirmed = false
     private var stagnantDecodeIntervals = 0
     private var axisSendLogCounter = 0
     private var axisReceiveLogCounter = 0
@@ -62,6 +77,10 @@ class WebRtcManager(private val context: Context) {
             if (factory != null) return
             closed = false
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context.applicationContext).createInitializationOptions())
+            audioStreaming.onStatus = { status ->
+                Log.d(TAG, status)
+                onAudioStatus?.invoke(status)
+            }
             audioDeviceModule = audioStreaming.createAudioDeviceModule()
             factory = PeerConnectionFactory.builder()
                 .setAudioDeviceModule(audioDeviceModule)
@@ -152,10 +171,14 @@ class WebRtcManager(private val context: Context) {
     private fun handleRemoteVideoTrack(mediaTrack: MediaStreamTrack?, callback: String) {
         if (mediaTrack is AudioTrack) {
             mediaTrack.setEnabled(true)
+            remoteGameAudioTrack = mediaTrack
             peer?.setAudioPlayout(true)
-            Log.d(TAG, "REMOTE AUDIO TRACK RECEIVED: callback=$callback id=${mediaTrack.id()}")
-            Log.d(TAG, "AUDIO PLAYBACK STARTED: enabled=${mediaTrack.enabled()}")
-            onAudioStatus?.invoke("Game audio streaming")
+            Log.d(TAG, "GAME_AUDIO_REMOTE_TRACK_RECEIVED: callback=$callback id=${mediaTrack.id()}")
+            Log.d(TAG, "GAME_AUDIO_PLAYOUT_ACTIVE: enabled=${mediaTrack.enabled()}")
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            val routes = audioManager.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).joinToString { "${it.productName}/${it.type}" }
+            Log.d(TAG, "GAME_AUDIO_ROUTE: outputs=$routes mediaVolume=${audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)}/${audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)} muted=${audioManager.isStreamMute(android.media.AudioManager.STREAM_MUSIC)}")
+            onAudioStatus?.invoke("GAME_AUDIO_REMOTE_TRACK_RECEIVED")
             return
         }
         val track = mediaTrack as? VideoTrack ?: return
@@ -254,7 +277,8 @@ class WebRtcManager(private val context: Context) {
         var bytesSent = 0L; var bytesReceived = 0L
         var framesEncoded = 0L; var framesDecoded = 0L; var framesDropped = 0L
         var packetsLost = 0L; var rttMs: Double? = null; var jitterMs: Double? = null; var availableSendBps: Double? = null
-        var totalEncodeTimeSeconds = 0.0
+        var totalEncodeTimeSeconds = 0.0; var totalDecodeTimeSeconds = 0.0
+        var audioBytesSent = 0L; var audioPacketsSent = 0L; var audioBytesReceived = 0L; var audioPacketsReceived = 0L
         var codecId: String? = null; var codecImplementation: String? = null
         var selectedPair: RTCStats? = null
         val selectedPairId = report.statsMap.values.firstOrNull { it.type == "transport" }?.members?.get("selectedCandidatePairId")?.toString()
@@ -268,7 +292,7 @@ class WebRtcManager(private val context: Context) {
                     totalEncodeTimeSeconds += (m["totalEncodeTime"] as? Number)?.toDouble() ?: 0.0
                     codecId = m["codecId"]?.toString() ?: codecId
                     codecImplementation = m["encoderImplementation"]?.toString() ?: codecImplementation
-                }
+                } else if (kind == "audio") { audioBytesSent += number(m["bytesSent"]); audioPacketsSent += number(m["packetsSent"]) }
                 "inbound-rtp" -> if (kind == "video") {
                     bytesReceived += number(m["bytesReceived"])
                     framesDecoded += number(m["framesDecoded"])
@@ -277,7 +301,8 @@ class WebRtcManager(private val context: Context) {
                     jitterMs = (m["jitter"] as? Number)?.toDouble()?.times(1_000.0)
                     codecId = m["codecId"]?.toString() ?: codecId
                     codecImplementation = m["decoderImplementation"]?.toString() ?: codecImplementation
-                }
+                    totalDecodeTimeSeconds += (m["totalDecodeTime"] as? Number)?.toDouble() ?: 0.0
+                } else if (kind == "audio") { audioBytesReceived += number(m["bytesReceived"]); audioPacketsReceived += number(m["packetsReceived"]) }
                 "remote-inbound-rtp" -> if (kind == "video") {
                     packetsLost += number(m["packetsLost"])
                     rttMs = (m["roundTripTime"] as? Number)?.toDouble()?.times(1_000.0)
@@ -295,6 +320,8 @@ class WebRtcManager(private val context: Context) {
         val sendBitrate = if (lastStatsTimestampMs == 0L) 0L else ((bytesSent - lastBytesSent).coerceAtLeast(0L) * 8_000L / elapsed)
         val receiveBitrate = if (lastStatsTimestampMs == 0L) 0L else ((bytesReceived - lastBytesReceived).coerceAtLeast(0L) * 8_000L / elapsed)
         val encodedFps = if (lastStatsTimestampMs == 0L) null else (framesEncoded - lastFramesEncoded).coerceAtLeast(0L) * 1_000.0 / elapsed
+        val decodedFps = if (lastStatsTimestampMs == 0L) null else (framesDecoded - lastFramesDecoded).coerceAtLeast(0L) * 1_000.0 / elapsed
+        val recentPacketsLost = (packetsLost - lastPacketsLost).coerceAtLeast(0L)
         lastStatsTimestampMs = now; lastBytesSent = bytesSent; lastBytesReceived = bytesReceived
         if (framesDecoded > 0L && framesDecoded == lastFramesDecoded && diagnostics.connectionState == PeerConnection.PeerConnectionState.CONNECTED.name) {
             stagnantDecodeIntervals++
@@ -302,7 +329,7 @@ class WebRtcManager(private val context: Context) {
         } else {
             stagnantDecodeIntervals = 0
         }
-        lastFramesDecoded = framesDecoded; lastFramesEncoded = framesEncoded
+        lastFramesDecoded = framesDecoded; lastFramesEncoded = framesEncoded; lastPacketsLost = packetsLost
         val pair = selectedPair ?: selectedPairId?.let(report.statsMap::get)
         val local = pair?.members?.get("localCandidateId")?.toString()?.let(report.statsMap::get)
         val remote = pair?.members?.get("remoteCandidateId")?.toString()?.let(report.statsMap::get)
@@ -312,8 +339,20 @@ class WebRtcManager(private val context: Context) {
         val route = if (localType == "relay" || remoteType == "relay") "TURN relay" else if (pair != null) "Direct P2P" else "Unknown"
         val pairText = "$localType ↔ $remoteType ($protocol)"
         val codec = codecId?.let(report.statsMap::get)?.members?.get("mimeType")?.toString() ?: "unknown"
+        val encodeTimeMs = if (framesEncoded > 0L) totalEncodeTimeSeconds * 1_000.0 / framesEncoded else null
+        val decodeTimeMs = if (framesDecoded > 0L) totalDecodeTimeSeconds * 1_000.0 / framesDecoded else null
+        val bottleneck = when {
+            diagnostics.captureFps != null && diagnostics.captureFps!! < 24.0 -> "HOST PERFORMANCE LIMITED"
+            encodedFps != null && diagnostics.captureFps != null && encodedFps < diagnostics.captureFps!! * 0.72 -> "ENCODER LIMITED"
+            availableSendBps != null && sendBitrate > 0L && availableSendBps!! < sendBitrate * 1.15 -> "NETWORK LIMITED"
+            decodedFps != null && decodedFps < 24.0 && framesDecoded > 0L -> "DECODER LIMITED"
+            diagnostics.renderFps != null && decodedFps != null && diagnostics.renderFps!! < decodedFps * 0.72 -> "RENDER LIMITED"
+            diagnostics.connectionState == PeerConnection.PeerConnectionState.CONNECTED.name && (encodedFps ?: decodedFps ?: 0.0) >= 24.0 -> "HEALTHY"
+            else -> "UNKNOWN"
+        }
         if (pair != null) Log.d(TAG, "SELECTED ICE CANDIDATE PAIR: route=$route pair=$pairText local=${candidateAddress(local)} remote=${candidateAddress(remote)}")
         if (codec != "unknown") Log.d(TAG, "SELECTED VIDEO CODEC: $codec implementation=${codecImplementation ?: "unknown"}")
+        adaptVideoIfNeeded(now, encodedFps, rttMs, jitterMs, recentPacketsLost, availableSendBps, sendBitrate)
         updateDiagnostics {
             copy(
                 route = route,
@@ -326,6 +365,17 @@ class WebRtcManager(private val context: Context) {
                 framesEncoded = framesEncoded,
                 framesDecoded = framesDecoded,
                 framesDropped = framesDropped,
+                encodeFps = encodedFps,
+                decodeFps = decodedFps,
+                renderFps = fps,
+                availableOutgoingBitrateBps = availableSendBps?.toLong() ?: 0L,
+                averageEncodeTimeMs = encodeTimeMs,
+                averageDecodeTimeMs = decodeTimeMs,
+                videoBottleneck = bottleneck,
+                gameAudioPacketsSent = audioPacketsSent,
+                gameAudioBytesSent = audioBytesSent,
+                gameAudioPacketsReceived = audioPacketsReceived,
+                gameAudioBytesReceived = audioBytesReceived,
                 controlBufferedBytes = controlBufferedBytes,
                 digitalQueueDepth = digitalQueueDepth,
                 analogQueueDepth = analogQueueDepth,
@@ -336,6 +386,15 @@ class WebRtcManager(private val context: Context) {
         Log.d(TAG, "VIDEO_ENCODE_FPS: ${format(encodedFps)}")
         Log.d(TAG, "VIDEO_ENCODE_TIME: avgMs=${if (framesEncoded > 0L) format(totalEncodeTimeSeconds * 1_000.0 / framesEncoded) else "n/a"}")
         Log.d(TAG, "VIDEO_DROPPED_FRAMES: $framesDropped")
+        if (audioPacketsSent > 0L || audioBytesSent > lastAudioBytesSent) {
+            Log.d(TAG, "GAME_AUDIO_RTP_PACKETS_SENT: $audioPacketsSent GAME_AUDIO_RTP_BYTES_SENT: $audioBytesSent")
+            if (!gameAudioSendConfirmed) { gameAudioSendConfirmed = true; onAudioStatus?.invoke("GAME_AUDIO_SENDING_ACTIVE") }
+        }
+        if (audioPacketsReceived > 0L || audioBytesReceived > lastAudioBytesReceived) {
+            Log.d(TAG, "GAME_AUDIO_RTP_PACKETS_RECEIVED: $audioPacketsReceived GAME_AUDIO_RTP_BYTES_RECEIVED: $audioBytesReceived")
+            if (!gameAudioReceiveConfirmed) { gameAudioReceiveConfirmed = true; onAudioStatus?.invoke("GAME_AUDIO_PLAYOUT_ACTIVE") }
+        }
+        lastAudioBytesSent = audioBytesSent; lastAudioBytesReceived = audioBytesReceived
         Log.d(TAG, "CONTROL_DIGITAL_QUEUE_DEPTH: $digitalQueueDepth")
         Log.d(TAG, "CONTROL_ANALOG_QUEUE_DEPTH: $analogQueueDepth")
         Log.d(TAG, "CONTROL_BUFFERED_AMOUNT: aggregateBytes=$controlBufferedBytes")
@@ -433,7 +492,7 @@ class WebRtcManager(private val context: Context) {
         return sent
     }
 
-    fun startScreenShare(permissionData: Intent, width: Int = 1280, height: Int = 720, fps: Int = 60) {
+    fun startScreenShare(permissionData: Intent, width: Int = 1280, height: Int = 720, fps: Int = 60, profile: String = "Auto") {
         val currentFactory = factory ?: error("WebRTC factory has not been initialized")
         val currentPeer = peer ?: error("PeerConnection has not been created")
         check(screenCapturer == null) { "Screen capture is already active" }
@@ -447,6 +506,15 @@ class WebRtcManager(private val context: Context) {
             override fun onCapturerStopped() { Log.d(TAG, "Screen capturer stopped"); real.onCapturerStopped() }
             override fun onFrameCaptured(frame: VideoFrame) {
                 frames++
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (captureWindowStartMs == 0L) captureWindowStartMs = now
+                captureWindowFrames++
+                if (now - captureWindowStartMs >= 5_000L) {
+                    val captureFps = captureWindowFrames * 1_000.0 / (now - captureWindowStartMs)
+                    updateDiagnostics { copy(captureFps = captureFps) }
+                    Log.d(TAG, "VIDEO_CAPTURE_FPS: ${format(captureFps)}")
+                    captureWindowStartMs = now; captureWindowFrames = 0
+                }
                 if (frames == 1) {
                     Log.d(TAG, "First host video frame captured: ${frame.buffer.width}x${frame.buffer.height}")
                     updateDiagnostics { copy(resolution = "${frame.buffer.width}×${frame.buffer.height}") }
@@ -459,6 +527,8 @@ class WebRtcManager(private val context: Context) {
         screenTrack!!.setEnabled(true)
         val sender = currentPeer.addTrack(screenTrack, listOf("DROIDLINK_STREAM"))
         check(sender != null) { "Failed to add screen video track to PeerConnection" }
+        videoSender = sender
+        adaptiveProfile = profile; baseCaptureWidth = width; baseCaptureHeight = height; baseCaptureFps = fps; adaptationLevel = 0; lastAdaptationMs = 0L
         configureVideoSender(sender)
         preferH264WithFallback()
         Log.d(TAG, "Host video sender created: senderId=${sender.id()} trackId=${sender.track()?.id()} enabled=${sender.track()?.enabled()}")
@@ -483,6 +553,8 @@ class WebRtcManager(private val context: Context) {
             }
             localAudioSource = currentFactory.createAudioSource(constraints)
             localAudioTrack = currentFactory.createAudioTrack("DROIDLINK_GAME_AUDIO", localAudioSource).apply { setEnabled(true) }
+            Log.d(TAG, "GAME_AUDIO_TRACK_CREATED: id=${localAudioTrack?.id()}")
+            Log.d(TAG, "GAME_AUDIO_TRACK_ENABLED: ${localAudioTrack?.enabled()}")
             val sender = currentPeer.addTrack(localAudioTrack, listOf("DROIDLINK_STREAM"))
             if (sender == null) {
                 val reason = "PeerConnection rejected local playback audio track"
@@ -490,7 +562,7 @@ class WebRtcManager(private val context: Context) {
             } else {
                 currentPeer.setAudioRecording(true)
                 Log.d(TAG, "LOCAL_AUDIO_TRACK_ADDED: id=${localAudioTrack?.id()} sender=${sender.id()}")
-                onAudioStatus?.invoke("Game audio capture active")
+                onAudioStatus?.invoke("GAME_AUDIO_CAPTURE_STARTING")
             }
         }.onFailure { onAudioStatus?.invoke(it.message ?: "Playback audio unavailable") }
     }
@@ -510,6 +582,36 @@ class WebRtcManager(private val context: Context) {
         Log.d(TAG, "Video sender low-latency tuning: parametersSet=$parametersSet bitrateSet=$bitrateSet degradation=MAINTAIN_FRAMERATE")
     }
 
+    private fun adaptVideoIfNeeded(now: Long, encodedFps: Double?, rttMs: Double?, jitterMs: Double?, recentLoss: Long, availableSendBps: Double?, sendBitrate: Long) {
+        if (adaptiveProfile != "Auto" && adaptiveProfile != "Low Latency") return
+        val since = now - lastAdaptationMs
+        val constrained = (rttMs ?: 0.0) >= 170.0 || (jitterMs ?: 0.0) >= 40.0 || recentLoss >= 8L ||
+            (availableSendBps != null && sendBitrate > 500_000L && availableSendBps < sendBitrate * 1.05) ||
+            (encodedFps != null && encodedFps in 1.0..22.0)
+        val healthy = (rttMs ?: 999.0) < 80.0 && (jitterMs ?: 999.0) < 20.0 && recentLoss <= 1L &&
+            (availableSendBps == null || availableSendBps > 3_000_000.0) && (encodedFps == null || encodedFps >= 28.0)
+        when {
+            constrained && adaptationLevel < 3 && since >= 15_000L -> applyVideoAdaptation(adaptationLevel + 1, now, "network/encoder pressure")
+            healthy && adaptationLevel > 0 && since >= 45_000L -> applyVideoAdaptation(adaptationLevel - 1, now, "sustained recovery")
+        }
+    }
+
+    private fun applyVideoAdaptation(level: Int, now: Long, reason: String) {
+        val sender = videoSender ?: return
+        adaptationLevel = level.coerceIn(0, 3); lastAdaptationMs = now
+        val scale = when (adaptationLevel) { 3 -> 0.5; 2 -> 0.75; else -> 1.0 }
+        val fps = when (adaptationLevel) { 0, 1 -> baseCaptureFps; else -> minOf(baseCaptureFps, 30) }
+        val maxBitrate = when (adaptationLevel) { 0 -> if (adaptiveProfile == "Low Latency") 3_500_000 else 5_000_000; 1 -> 2_500_000; 2 -> 1_500_000; else -> 800_000 }
+        val parameters = sender.parameters
+        parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+        parameters.encodings.forEach { it.maxBitrateBps = maxBitrate; it.maxFramerate = fps }
+        val set = sender.setParameters(parameters)
+        val width = ((baseCaptureWidth * scale).toInt() / 2 * 2).coerceAtLeast(320)
+        val height = ((baseCaptureHeight * scale).toInt() / 2 * 2).coerceAtLeast(240)
+        if (adaptationLevel >= 2 || level == 1) runCatching { screenCapturer?.changeCaptureFormat(width, height, fps) }
+        Log.w(TAG, "VIDEO_ADAPTATION: profile=$adaptiveProfile level=$adaptationLevel ${width}x$height@$fps maxBitrate=$maxBitrate reason=$reason parametersSet=$set")
+    }
+
     private fun preferH264WithFallback() {
         val codecs = factory?.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)?.codecs.orEmpty()
         val ordered = codecs.sortedBy { if (it.name.equals("H264", ignoreCase = true)) 0 else 1 }
@@ -524,6 +626,18 @@ class WebRtcManager(private val context: Context) {
         video.forEachIndexed { index, transceiver ->
             Log.d(TAG, "Video transceiver[$index]: mid=${transceiver.mid} direction=${transceiver.direction} currentDirection=${transceiver.currentDirection} senderTrack=${transceiver.sender.track()?.id()} receiverTrack=${transceiver.receiver.track()?.id()}")
         }
+    }
+
+    fun setGameAudioEnabled(enabled: Boolean) {
+        localAudioTrack?.setEnabled(enabled)
+        remoteGameAudioTrack?.setEnabled(enabled)
+        peer?.setAudioPlayout(enabled)
+        Log.d(TAG, "GAME_AUDIO_USER_ENABLED: $enabled")
+    }
+
+    fun setGameAudioVolume(volume: Float) {
+        remoteGameAudioTrack?.setVolume(volume.coerceIn(0f, 1f).toDouble())
+        Log.d(TAG, "GAME_AUDIO_VOLUME: ${(volume.coerceIn(0f, 1f) * 100).toInt()}")
     }
 
     fun close() {
@@ -554,12 +668,15 @@ class WebRtcManager(private val context: Context) {
         try { peer?.close(); peer?.dispose() } catch (_: Exception) {}
         try { factory?.dispose() } catch (_: Exception) {}
         try { audioDeviceModule?.release() } catch (_: Exception) {}
-        screenCapturer = null; textureHelper = null; screenTrack = null; screenSource = null
-        remoteVideoTrack = null; remoteFrameSink = null; localAudioTrack = null; localAudioSource = null
+        screenCapturer = null; textureHelper = null; screenTrack = null; screenSource = null; videoSender = null
+        remoteVideoTrack = null; remoteFrameSink = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
         audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null
         synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
         diagnostics = BetaDiagnostics()
         lastStatsTimestampMs = 0L; lastBytesSent = 0L; lastBytesReceived = 0L; lastFramesDecoded = 0L; lastFramesEncoded = 0L; stagnantDecodeIntervals = 0
+        lastAudioBytesSent = 0L; lastAudioBytesReceived = 0L; captureWindowStartMs = 0L; captureWindowFrames = 0
+        gameAudioSendConfirmed = false; gameAudioReceiveConfirmed = false
+        adaptationLevel = 0; lastAdaptationMs = 0L; lastPacketsLost = 0L
         axisSendLogCounter = 0; axisReceiveLogCounter = 0
         droppedAnalogPackets = 0L
         controlBufferedBytes = 0L; digitalQueueDepth = 0; analogQueueDepth = 0; lastBufferedAmountLogMs = 0L

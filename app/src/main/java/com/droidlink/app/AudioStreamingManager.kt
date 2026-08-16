@@ -12,11 +12,23 @@ class AudioStreamingManager(private val context: Context) {
     private var audioRecord: AudioRecord? = null
     @Volatile private var pcmLogged = false
     private var silentCallbacks = 0
+    private var lastLevelLogMs = 0L
+    var onStatus: ((String) -> Unit)? = null
+    var onLevel: ((Double) -> Unit)? = null
 
     fun createAudioDeviceModule(): JavaAudioDeviceModule = JavaAudioDeviceModule.builder(context.applicationContext)
         .setSampleRate(SAMPLE_RATE).setInputSampleRate(SAMPLE_RATE).setOutputSampleRate(SAMPLE_RATE)
         .setUseStereoInput(true).setUseStereoOutput(true).setUseLowLatency(true)
         .setUseHardwareAcousticEchoCanceler(false).setUseHardwareNoiseSuppressor(false)
+        .setAudioRecordStateCallback(object : JavaAudioDeviceModule.AudioRecordStateCallback {
+            override fun onWebRtcAudioRecordStart() { Log.d(TAG, "GAME_AUDIO_WEBRTC_INPUT_STARTED") }
+            override fun onWebRtcAudioRecordStop() { Log.d(TAG, "GAME_AUDIO_WEBRTC_INPUT_STOPPED") }
+        })
+        .setAudioRecordErrorCallback(object : JavaAudioDeviceModule.AudioRecordErrorCallback {
+            override fun onWebRtcAudioRecordInitError(errorMessage: String?) { Log.e(TAG, "GAME_AUDIO_WEBRTC_INPUT_INIT_ERROR: $errorMessage"); onStatus?.invoke("GAME_AUDIO_CAPTURE_ERROR") }
+            override fun onWebRtcAudioRecordStartError(errorCode: JavaAudioDeviceModule.AudioRecordStartErrorCode?, errorMessage: String?) { Log.e(TAG, "GAME_AUDIO_WEBRTC_INPUT_START_ERROR: $errorCode $errorMessage"); onStatus?.invoke("GAME_AUDIO_CAPTURE_ERROR") }
+            override fun onWebRtcAudioRecordError(errorMessage: String?) { Log.e(TAG, "GAME_AUDIO_WEBRTC_INPUT_ERROR: $errorMessage"); onStatus?.invoke("GAME_AUDIO_CAPTURE_ERROR") }
+        })
         .setAudioBufferCallback { buffer, _, _, _, _, captureTimeNs ->
             val wanted = buffer.capacity()
             buffer.clear()
@@ -28,11 +40,20 @@ class AudioStreamingManager(private val context: Context) {
             }
             if (copied < wanted) while (buffer.position() < wanted) buffer.put(0)
             buffer.rewind()
-            if (!pcmLogged && copied > 0) {
-                var active = false; var index = 0
-                while (index + 1 < copied && !active) { active = buffer.getShort(index).toInt() != 0; index += 32 }
-                if (active) { pcmLogged = true; Log.d(TAG, "AUDIO_PCM_ACTIVE: first non-silent playback PCM delivered to WebRTC bytes=$copied") }
-                else if (++silentCallbacks == 500) Log.w(TAG, "AUDIO_UNAVAILABLE_REASON: playback capture remained silent for 5 seconds; source may be silent or opted out")
+            if (copied > 0) {
+                var sumSquares = 0.0; var samples = 0; var index = 0
+                while (index + 1 < copied) { val sample = buffer.getShort(index).toDouble() / Short.MAX_VALUE; sumSquares += sample * sample; samples++; index += 32 }
+                val rms = if (samples > 0) kotlin.math.sqrt(sumSquares / samples) else 0.0
+                if (!pcmLogged && rms > 0.0005) {
+                    pcmLogged = true
+                    Log.d(TAG, "GAME_AUDIO_CAPTURE_ACTIVE: first non-silent PCM rms=$rms bytes=$copied")
+                    onStatus?.invoke("GAME_AUDIO_CAPTURE_ACTIVE")
+                } else if (!pcmLogged && ++silentCallbacks == 500) {
+                    Log.w(TAG, "GAME_AUDIO_CAPTURE_SILENT: playback capture remained silent for 5 seconds; source may be silent or opted out")
+                    onStatus?.invoke("GAME_AUDIO_CAPTURE_SILENT")
+                }
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastLevelLogMs >= 1_000L) { lastLevelLogMs = now; onLevel?.invoke(rms) }
             }
             buffer.rewind()
             captureTimeNs
@@ -48,6 +69,7 @@ class AudioStreamingManager(private val context: Context) {
     fun start(mediaProjection: MediaProjection): Result<Unit> = runCatching {
         check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { "AudioPlaybackCapture requires Android 10+" }
         stop()
+        onStatus?.invoke("GAME_AUDIO_CAPTURE_STARTING")
         Log.d(TAG, "AUDIO_CAPTURE_PERMISSION_READY")
         val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -68,9 +90,12 @@ class AudioStreamingManager(private val context: Context) {
         record.startRecording()
         check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "Playback AudioRecord did not enter RECORDING state" }
         pcmLogged = false; silentCallbacks = 0
-        Log.d(TAG, "AUDIO_CAPTURE_STARTED")
+        Log.d(TAG, "GAME_AUDIO_CAPTURE_STARTING: AudioRecord started; waiting for non-zero PCM")
         Unit
-    }.onFailure { Log.e(TAG, "AUDIO_UNAVAILABLE_REASON: ${it.message}", it); stop() }
+    }.onFailure {
+        val state = if (it is SecurityException) "GAME_AUDIO_CAPTURE_BLOCKED" else "GAME_AUDIO_CAPTURE_ERROR"
+        Log.e(TAG, "$state: ${it.message}", it); onStatus?.invoke(state); stop()
+    }
 
     fun stop() {
         try { audioRecord?.stop() } catch (_: Exception) {}

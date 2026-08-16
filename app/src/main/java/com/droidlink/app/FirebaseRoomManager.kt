@@ -42,6 +42,8 @@ class FirebaseRoomManager {
 
     fun saveOffer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "offer", sdp, onSuccess, onError)
     fun saveAnswer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "answer", sdp, onSuccess, onError)
+    fun saveVoiceOffer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "voiceOffer", sdp, onSuccess, onError)
+    fun saveVoiceAnswer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "voiceAnswer", sdp, onSuccess, onError)
     private fun saveSdp(code: String, name: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
         rooms.child(code).child(name).setValue(sdp).addOnSuccessListener { Log.d(TAG, "Firebase $name stored: $code"); onSuccess() }
             .addOnFailureListener { onError(it.message ?: "Failed to save $name") }
@@ -66,6 +68,40 @@ class FirebaseRoomManager {
         }
         query.addValueEventListener(listener); valueListeners += query to listener
         Log.d(TAG, "Answer listener registered: $code")
+    }
+
+    fun requestVoiceNegotiation(code: String, onError: (String) -> Unit) {
+        rooms.child(code).child("voiceRequest").setValue(ServerValue.TIMESTAMP)
+            .addOnFailureListener { onError(it.message ?: "Failed to request voice negotiation") }
+    }
+
+    fun listenForVoiceRequest(code: String, onRequest: () -> Unit, onError: (String) -> Unit) {
+        val query = rooms.child(code).child("voiceRequest")
+        var last: Long? = null
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val value = snapshot.getValue(Long::class.java) ?: return
+                if (value != last) { last = value; onRequest() }
+            }
+            override fun onCancelled(error: DatabaseError) = onError(error.message)
+        }
+        query.addValueEventListener(listener); valueListeners += query to listener
+    }
+
+    fun listenForVoiceOffer(code: String, onOffer: (String) -> Unit, onError: (String) -> Unit) = listenForChangingSdp(code, "voiceOffer", onOffer, onError)
+    fun listenForVoiceAnswer(code: String, onAnswer: (String) -> Unit, onError: (String) -> Unit) = listenForChangingSdp(code, "voiceAnswer", onAnswer, onError)
+
+    private fun listenForChangingSdp(code: String, name: String, onSdp: (String) -> Unit, onError: (String) -> Unit) {
+        val query = rooms.child(code).child(name)
+        var last: String? = null
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val sdp = snapshot.getValue(String::class.java) ?: return
+                if (sdp != last) { last = sdp; Log.d(TAG, "$name received: $code"); onSdp(sdp) }
+            }
+            override fun onCancelled(error: DatabaseError) = onError(error.message)
+        }
+        query.addValueEventListener(listener); valueListeners += query to listener
     }
 
     fun saveIceCandidate(code: String, side: String, candidate: String, sdpMid: String?, sdpMLineIndex: Int, onError: (String) -> Unit) {
