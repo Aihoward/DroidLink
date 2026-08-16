@@ -40,6 +40,41 @@ class FirebaseRoomManager {
         }.addOnFailureListener { onError(it.message ?: "Firebase lookup failed") }
     }
 
+    fun publishPlayer(code: String, role: String, name: String, slot: Int, connected: Boolean, voiceEnabled: Boolean, onError: (String) -> Unit = {}) {
+        val player = mapOf("name" to name, "slot" to slot, "role" to role, "connected" to connected, "voiceEnabled" to voiceEnabled)
+        rooms.child(code).child("players").child(role).setValue(player)
+            .addOnSuccessListener { Log.d(TAG, "PLAYER_METADATA_PUBLISHED: room=$code role=$role slot=$slot name=$name") }
+            .addOnFailureListener { onError(it.message ?: "Failed to publish player metadata") }
+    }
+
+    fun updatePlayerState(code: String, role: String, connected: Boolean? = null, voiceEnabled: Boolean? = null) {
+        val updates = mutableMapOf<String, Any>()
+        connected?.let { updates["connected"] = it }
+        voiceEnabled?.let { updates["voiceEnabled"] = it }
+        if (updates.isNotEmpty()) rooms.child(code).child("players").child(role).updateChildren(updates)
+    }
+
+    fun removePlayer(code: String, role: String) { rooms.child(code).child("players").child(role).removeValue() }
+
+    fun listenForPlayers(code: String, onPlayers: (List<SessionPlayer>) -> Unit, onError: (String) -> Unit) {
+        val query = rooms.child(code).child("players")
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val players = snapshot.children.mapNotNull { player ->
+                    val role = player.key ?: return@mapNotNull null
+                    val name = player.child("name").getValue(String::class.java) ?: return@mapNotNull null
+                    SessionPlayer(code, name, player.child("slot").getValue(Long::class.java)?.toInt() ?: 0, role,
+                        player.child("connected").getValue(Boolean::class.java) ?: false,
+                        player.child("voiceEnabled").getValue(Boolean::class.java) ?: false)
+                }
+                Log.d(TAG, "PLAYER_METADATA_RECEIVED: room=$code count=${players.size}")
+                onPlayers(players)
+            }
+            override fun onCancelled(error: DatabaseError) = onError(error.message)
+        }
+        query.addValueEventListener(listener); valueListeners += query to listener
+    }
+
     fun saveOffer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "offer", sdp, onSuccess, onError)
     fun saveAnswer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "answer", sdp, onSuccess, onError)
     fun saveVoiceOffer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "voiceOffer", sdp, onSuccess, onError)

@@ -29,6 +29,8 @@ class VoiceChatManager(private val context: Context) {
     var onIceCandidate: ((IceCandidate) -> Unit)? = null
     var onStatus: ((String) -> Unit)? = null
     var onDiagnostics: ((VoiceDiagnostics) -> Unit)? = null
+    var onLocalSpeakingChanged: ((Boolean) -> Unit)? = null
+    var onRemoteSpeakingChanged: ((Boolean) -> Unit)? = null
     var onRenegotiationNeeded: (() -> Unit)? = null
 
     private val lock = Any()
@@ -46,6 +48,13 @@ class VoiceChatManager(private val context: Context) {
     private var statsHandler: Handler? = null
     @Volatile private var closed = false
     @Volatile private var diagnostics = VoiceDiagnostics()
+    private var microphoneEnabled = false
+    private var remoteVoiceEnabled = true
+    private var localSpeaking = false
+    private var remoteSpeaking = false
+    private var localLastActiveMs = 0L
+    private var remoteLastActiveMs = 0L
+    private var lastDiagnosticsDispatchMs = 0L
 
     fun initialize(onReady: (Result<Unit>) -> Unit) {
         synchronized(lock) {
@@ -116,11 +125,13 @@ class VoiceChatManager(private val context: Context) {
         micTrack?.setEnabled(enabled)
         adm?.setMicrophoneMute(!enabled)
         currentPeer.setAudioRecording(enabled)
+        microphoneEnabled = enabled
+        if (!enabled) setLocalSpeaking(false)
         diagnostics = diagnostics.copy(state = if (enabled) "MIC_ACTIVE" else "MIC_MUTED")
         Log.d(TAG, "VOICE_MIC_ENABLED: $enabled")
     }
 
-    fun setRemoteVoiceEnabled(enabled: Boolean) { remoteTrack?.setEnabled(enabled); peer?.setAudioPlayout(enabled); Log.d(TAG, "VOICE_REMOTE_ENABLED: $enabled") }
+    fun setRemoteVoiceEnabled(enabled: Boolean) { remoteVoiceEnabled = enabled; remoteTrack?.setEnabled(enabled); peer?.setAudioPlayout(enabled); if (!enabled) setRemoteSpeaking(false); Log.d(TAG, "VOICE_REMOTE_ENABLED: $enabled") }
     fun setRemoteVolume(volume: Float) { remoteTrack?.setVolume(volume.coerceIn(0f, 1f).toDouble()) }
 
     fun createOffer(onReady: (String) -> Unit, onError: (String) -> Unit) = createDescription(true, onReady, onError)
@@ -190,7 +201,7 @@ class VoiceChatManager(private val context: Context) {
     private fun startStats() {
         if (statsThread != null) return
         statsThread = HandlerThread("DroidLinkVoiceStats").also { it.start() }
-        statsHandler = Handler(statsThread!!.looper).also { it.postDelayed(statsRunnable, 1_000L) }
+        statsHandler = Handler(statsThread!!.looper).also { it.postDelayed(statsRunnable, 200L) }
     }
     private val statsRunnable = object : Runnable {
         override fun run() {
@@ -203,16 +214,30 @@ class VoiceChatManager(private val context: Context) {
                     if (kind == "audio" && stat.type == "media-source") mic = (stat.members["audioLevel"] as? Number)?.toDouble() ?: mic
                 }
                 diagnostics = diagnostics.copy(micLevel = mic, remoteLevel = remote, bytesSent = sent, bytesReceived = received)
-                onDiagnostics?.invoke(diagnostics)
+                updateVoiceActivity(mic, remote)
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastDiagnosticsDispatchMs >= 1_000L) { lastDiagnosticsDispatchMs = now; onDiagnostics?.invoke(diagnostics) }
             }
-            statsHandler?.postDelayed(this, 1_000L)
+            statsHandler?.postDelayed(this, 200L)
         }
     }
+
+    private fun updateVoiceActivity(micLevel: Double, remoteLevel: Double) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (microphoneEnabled && micLevel >= 0.015) { localLastActiveMs = now; setLocalSpeaking(true) }
+        else if (!microphoneEnabled || now - localLastActiveMs >= 500L) setLocalSpeaking(false)
+        if (remoteVoiceEnabled && remoteLevel >= 0.015) { remoteLastActiveMs = now; setRemoteSpeaking(true) }
+        else if (!remoteVoiceEnabled || now - remoteLastActiveMs >= 500L) setRemoteSpeaking(false)
+    }
+
+    private fun setLocalSpeaking(value: Boolean) { if (localSpeaking != value) { localSpeaking = value; Log.d(TAG, "VOICE_LOCAL_SPEAKING: $value"); onLocalSpeakingChanged?.invoke(value) } }
+    private fun setRemoteSpeaking(value: Boolean) { if (remoteSpeaking != value) { remoteSpeaking = value; Log.d(TAG, "VOICE_REMOTE_SPEAKING: $value"); onRemoteSpeakingChanged?.invoke(value) } }
 
     fun close() {
         if (closed) return
         closed = true
-        onIceCandidate = null; onStatus = null; onDiagnostics = null; onRenegotiationNeeded = null
+        setLocalSpeaking(false); setRemoteSpeaking(false)
+        onIceCandidate = null; onStatus = null; onDiagnostics = null; onLocalSpeakingChanged = null; onRemoteSpeakingChanged = null; onRenegotiationNeeded = null
         statsHandler?.removeCallbacksAndMessages(null); statsThread?.quitSafely(); statsHandler = null; statsThread = null
         runCatching { peer?.setAudioRecording(false) }; runCatching { adm?.setMicrophoneMute(true) }
         runCatching { micTrack?.dispose() }; runCatching { micSource?.dispose() }; runCatching { peer?.close(); peer?.dispose() }
@@ -220,6 +245,7 @@ class VoiceChatManager(private val context: Context) {
         micTrack = null; micSource = null; remoteTrack = null; peer = null; factory = null; adm = null
         synchronized(lock) { pendingIce.clear(); remoteDescriptionSet = false; initializing = false; readyCallbacks.clear() }
         diagnostics = VoiceDiagnostics()
+        microphoneEnabled = false; remoteVoiceEnabled = true; localLastActiveMs = 0L; remoteLastActiveMs = 0L; lastDiagnosticsDispatchMs = 0L
         Log.d(TAG, "VOICE_CHAT_CLOSED")
     }
 

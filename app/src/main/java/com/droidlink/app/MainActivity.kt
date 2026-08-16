@@ -100,6 +100,11 @@ class MainActivity : ComponentActivity() {
     private var gameAudioEnabled by mutableStateOf(true)
     private var gameAudioVolume by mutableFloatStateOf(1f)
     private var voiceChatStartEnabled by mutableStateOf(false)
+    private var localDisplayName by mutableStateOf("")
+    private var hostPlayer by mutableStateOf(SessionPlayer("", "Player 1", 1, "host", false, false))
+    private var joinerPlayer by mutableStateOf(SessionPlayer("", "Player 2", 2, "joiner", false, false))
+    private var localSpeaking by mutableStateOf(false)
+    private var remoteSpeaking by mutableStateOf(false)
     private var voiceChatEnabled by mutableStateOf(false)
     private var voiceMuted by mutableStateOf(false)
     private var remoteVoiceEnabled by mutableStateOf(true)
@@ -249,6 +254,7 @@ class MainActivity : ComponentActivity() {
     private val voicePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) enableVoiceAfterPermission() else {
             voiceChatEnabled = false
+            updateLocalPlayerVoice(false)
             voiceStatus = "MICROPHONE PERMISSION DENIED"
             Log.w(TAG, "VOICE_PERMISSION_DENIED: game session continues")
         }
@@ -279,6 +285,7 @@ class MainActivity : ComponentActivity() {
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
             voiceChatStartEnabled = preferences.getBoolean("voice_chat_start_enabled", false)
+            localDisplayName = preferences.getString("display_name", "") ?: ""
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
             introVisible = showIntroAnimation
         }
@@ -411,7 +418,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.1 V2", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.2.0", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -433,10 +440,10 @@ class MainActivity : ComponentActivity() {
             Text(friendlyStatus(hostStatus.ifEmpty { "Ready to start" }), color = Color.White, textAlign = TextAlign.Center)
         }
         NeonButton(if (sessionStarting) "STARTING…" else "START HOST", enabled = !sessionStarting, onClick = onStart)
-        PlayerSlot("PLAYER 1 • HOST", "CONNECTED", true)
-        PlayerSlot("PLAYER 2", if (sessionActive) "CONNECTED" else "WAITING", sessionActive)
-        PlayerSlot("PLAYER 3", "COMING SOON", false)
-        PlayerSlot("PLAYER 4", "COMING SOON", false)
+        PlayerSlot("PLAYER 1", if (hostPlayer.sessionId.isEmpty()) effectiveDisplayName(true) else hostPlayer.displayName, "HOST • ${if (hostPlayer.connected) "CONNECTED" else "READY"}", true)
+        PlayerSlot("PLAYER 2", joinerPlayer.displayName, if (joinerPlayer.connected) "CONNECTED" else "WAITING", joinerPlayer.connected)
+        PlayerSlot("PLAYER 3", "", "COMING SOON", false)
+        PlayerSlot("PLAYER 4", "", "COMING SOON", false)
         Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         if (isFailureStatus(hostStatus)) ErrorActions("CONNECTION FAILED", friendlyStatus(hostStatus), onRetry = onStart, onBack = onBack)
@@ -453,6 +460,7 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth()
         )
         Text("Enter the 6-digit code shown on the host device.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+        if (hostPlayer.sessionId == code && hostPlayer.displayName.isNotBlank()) Text("Connecting to: ${hostPlayer.displayName}", color = neonGreen, fontWeight = FontWeight.Bold)
         NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN HOST", enabled = !sessionStarting, onClick = onConnect)
         StatusCard { Text(friendlyStatus(clientStatus), color = Color.White, textAlign = TextAlign.Center); Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center) }
         if (isFailureStatus(clientStatus)) ErrorActions(if (clientStatus.contains("room", true)) "ROOM NOT FOUND" else "CONNECTION FAILED", friendlyStatus(clientStatus), onRetry = onConnect, onBack = onBack)
@@ -478,6 +486,7 @@ class MainActivity : ComponentActivity() {
                 update = { view -> remoteTrack?.let { if (rendererTrack !== it) attachTrack(view, it) } }
             )
             if (remoteTrack == null) Text(clientStatus, modifier = Modifier.align(Alignment.Center))
+            SpeakingOverlay()
         }
     }
 
@@ -487,6 +496,7 @@ class MainActivity : ComponentActivity() {
             Text(hostRoomCode, color = Color.White, fontWeight = FontWeight.Black, fontSize = 42.sp, letterSpacing = 7.sp)
             Text(hostStatus, color = mutedText)
         }
+        SpeakingOverlay()
     }
 
     @Composable private fun PreGameReadiness() {
@@ -538,6 +548,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun SessionMenu() = Box(Modifier.fillMaxSize().background(Color(0xB8000000)), contentAlignment = Alignment.Center) {
         Column(Modifier.widthIn(max = 360.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 3.sp)
+            Text(if (mode == "host") "Player 2: ${joinerPlayer.displayName}" else "Host: ${hostPlayer.displayName}", color = neonGreen, fontWeight = FontWeight.Bold)
             NeonButton("RESUME") { sessionMenuOpen = false; menuButtonVisible = false }
             NeonButton("GAME AUDIO", filled = false) { sessionMenuOpen = false; sessionGameAudioOpen = true }
             NeonButton("VOICE CHAT", filled = false) { sessionMenuOpen = false; sessionVoiceOpen = true }
@@ -567,7 +578,11 @@ class MainActivity : ComponentActivity() {
             Text("VOICE CHAT", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
             Text("Microphone use is always opt-in. Headphones provide the best echo protection.", color = mutedText, fontSize = 12.sp)
             SettingSwitch("Voice Chat", voiceChatEnabled) { updateVoiceChatEnabled(it) }
-            SettingSwitch("Mute Myself", voiceMuted) { muted -> voiceMuted = muted; if (voiceChatEnabled) voiceRtc.enableMicrophone(!muted) }
+            SettingSwitch("Mute Myself", voiceMuted) { muted ->
+                voiceMuted = muted
+                if (voiceChatEnabled) voiceRtc.enableMicrophone(!muted)
+                updateLocalPlayerVoice(voiceChatEnabled && !muted)
+            }
             SettingSwitch("Remote Voice", remoteVoiceEnabled) { enabled -> remoteVoiceEnabled = enabled; voiceRtc.setRemoteVoiceEnabled(enabled) }
             Text("Voice Volume ${(voiceVolume * 100).toInt()}%", color = mutedText)
             Slider(value = voiceVolume, onValueChange = { voiceVolume = it; voiceRtc.setRemoteVolume(it) }, enabled = remoteVoiceEnabled, colors = SliderDefaults.colors(thumbColor = neonGreen, activeTrackColor = neonGreen))
@@ -589,6 +604,12 @@ class MainActivity : ComponentActivity() {
         val connectionQuality = connectionQuality()
         Column(Modifier.widthIn(max = 620.dp).fillMaxWidth().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("CONNECTION STATS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+            StatSection("SESSION") {
+                diagnosticLine("Host", hostPlayer.displayName)
+                diagnosticLine("Player 2", joinerPlayer.displayName)
+                diagnosticLine(hostPlayer.displayName, if (hostPlayer.voiceEnabled) "Voice active" else "Voice off / muted")
+                diagnosticLine(joinerPlayer.displayName, if (joinerPlayer.voiceEnabled) "Voice active" else "Voice off / muted")
+            }
             StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
             StatSection("VIDEO") {
                 diagnosticLine("Resolution", d.resolution); diagnosticLine("Capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "—")
@@ -707,6 +728,24 @@ class MainActivity : ComponentActivity() {
                 }
                 SettingInfo("Voice start", if (voiceChatStartEnabled) "Enabled for new sessions" else "Off (microphone inactive)")
             }
+            SettingSection("PROFILE") {
+                OutlinedTextField(
+                    value = localDisplayName,
+                    onValueChange = { raw ->
+                        if (!inSession) {
+                            localDisplayName = sanitizeDisplayName(raw)
+                            getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("display_name", localDisplayName).apply()
+                        }
+                    },
+                    enabled = !inSession,
+                    singleLine = true,
+                    label = { Text("Display Name") },
+                    placeholder = { Text("Player 1 / Player 2") },
+                    supportingText = { Text(if (inSession) "Disconnect to change display name." else "Up to 16 characters") },
+                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = neonGreen, unfocusedBorderColor = Color.DarkGray, focusedTextColor = Color.White, unfocusedTextColor = Color.White, disabledTextColor = mutedText),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             SettingSection("CONNECTION") {
                 SettingInfo("Connection mode", "Automatic (recommended)")
                 SettingInfo("Current route", betaDiagnostics.route)
@@ -731,7 +770,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.1 V2")
+                SettingInfo("Version", "Droid Link 1.2.0")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -761,7 +800,29 @@ class MainActivity : ComponentActivity() {
 
     @Composable private fun StatusCard(content: @Composable ColumnScope.() -> Unit) = Column(Modifier.widthIn(max = 460.dp).fillMaxWidth().background(panelBlack, RoundedCornerShape(14.dp)).border(1.dp, Color(0xFF244324), RoundedCornerShape(14.dp)).padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp), content = content)
 
-    @Composable private fun PlayerSlot(player: String, status: String, active: Boolean) = Row(Modifier.widthIn(max = 460.dp).fillMaxWidth().background(panelBlack, RoundedCornerShape(10.dp)).padding(13.dp), verticalAlignment = Alignment.CenterVertically) { Text(player, Modifier.weight(1f), color = Color.White, fontWeight = FontWeight.Bold); Text(status, color = if (active) neonGreen else mutedText, fontSize = 12.sp) }
+    @Composable private fun PlayerSlot(slot: String, name: String, status: String, active: Boolean) = Row(Modifier.widthIn(max = 460.dp).fillMaxWidth().background(panelBlack, RoundedCornerShape(10.dp)).border(1.dp, if (active) neonGreen.copy(alpha = .45f) else Color.Transparent, RoundedCornerShape(10.dp)).padding(13.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) { Text(slot, color = mutedText, fontSize = 10.sp, letterSpacing = 1.sp); if (name.isNotBlank()) Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp) }
+        Text(status, color = if (active) neonGreen else mutedText, fontSize = 11.sp, textAlign = TextAlign.End)
+    }
+
+    @Composable private fun SpeakingOverlay() {
+        val local = if (mode == "host") hostPlayer else joinerPlayer
+        val remote = if (mode == "host") joinerPlayer else hostPlayer
+        val speakers = buildList {
+            if (voiceChatEnabled && localSpeaking) add(local.displayName)
+            if (voiceChatEnabled && remoteSpeaking) add(remote.displayName)
+        }
+        if (speakers.isEmpty()) return
+        Column(Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            speakers.forEach { name ->
+                Row(Modifier.background(Color(0xDE080B08), RoundedCornerShape(18.dp)).border(1.dp, neonGreen.copy(alpha = .7f), RoundedCornerShape(18.dp)).padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("🔊", color = neonGreen, fontSize = 13.sp)
+                    Spacer(Modifier.width(7.dp))
+                    Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+            }
+        }
+    }
 
     @Composable private fun StatSection(title: String, content: @Composable ColumnScope.() -> Unit) = Column(Modifier.fillMaxWidth().background(panelBlack, RoundedCornerShape(12.dp)).border(1.dp, Color(0xFF244324), RoundedCornerShape(12.dp)).padding(13.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) { Text(title, color = neonGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp, letterSpacing = 2.sp); content() }
 
@@ -778,8 +839,27 @@ class MainActivity : ComponentActivity() {
     private fun resetUiSettings() {
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
         animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
-        voiceChatStartEnabled = false
+        voiceChatStartEnabled = false; localDisplayName = ""
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
+    }
+
+    private fun sanitizeDisplayName(value: String): String = DisplayNamePolicy.sanitize(value)
+
+    private fun effectiveDisplayName(host: Boolean): String = DisplayNamePolicy.effective(localDisplayName, host)
+
+    private fun listenForPlayerMetadata(code: String) {
+        firebase.listenForPlayers(code, { players -> runOnUiThread {
+            players.firstOrNull { it.role == "host" }?.let { hostPlayer = it.copy(speaking = hostPlayer.speaking) }
+            players.firstOrNull { it.role == "joiner" }?.let { joinerPlayer = it.copy(speaking = joinerPlayer.speaking) }
+            if (mode == "client" && !clientConnected && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
+        } }, { Log.e(TAG, "Player metadata listener failed: $it") })
+    }
+
+    private fun updateLocalPlayerVoice(enabled: Boolean) {
+        if (activeSessionId == "none") return
+        val role = if (mode == "host") "host" else "joiner"
+        firebase.updatePlayerState(activeSessionId, role, voiceEnabled = enabled)
+        if (mode == "host") hostPlayer = hostPlayer.copy(voiceEnabled = enabled) else joinerPlayer = joinerPlayer.copy(voiceEnabled = enabled)
     }
 
     private fun uiFeedback(view: android.view.View, success: Boolean = false) {
@@ -840,6 +920,14 @@ class MainActivity : ComponentActivity() {
         voiceSignalingReady = true; voiceHostRole = isHost
         voiceRtc.onStatus = { status -> runOnUiThread { voiceStatus = status.removePrefix("VOICE_").replace('_', ' ') } }
         voiceRtc.onDiagnostics = { value -> runOnUiThread { voiceDiagnostics = value } }
+        voiceRtc.onLocalSpeakingChanged = { speaking -> runOnUiThread {
+            localSpeaking = speaking
+            if (isHost) hostPlayer = hostPlayer.copy(speaking = speaking) else joinerPlayer = joinerPlayer.copy(speaking = speaking)
+        } }
+        voiceRtc.onRemoteSpeakingChanged = { speaking -> runOnUiThread {
+            remoteSpeaking = speaking
+            if (isHost) joinerPlayer = joinerPlayer.copy(speaking = speaking) else hostPlayer = hostPlayer.copy(speaking = speaking)
+        } }
         voiceRtc.onIceCandidate = { candidate ->
             val side = if (isHost) "voiceHost" else "voiceClient"
             firebase.saveIceCandidate(code, side, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { Log.e(TAG, "VOICE ICE save failed: $it") }
@@ -882,6 +970,8 @@ class MainActivity : ComponentActivity() {
     private fun updateVoiceChatEnabled(enabled: Boolean) {
         if (!enabled) {
             voiceChatEnabled = false; voiceStatus = "OFF"
+            localSpeaking = false; remoteSpeaking = false
+            updateLocalPlayerVoice(false)
             if (voiceRtcDelegate.isInitialized()) {
                 voiceRtc.enableMicrophone(false)
                 voiceRtc.setRemoteVoiceEnabled(false)
@@ -897,6 +987,7 @@ class MainActivity : ComponentActivity() {
         if (!sessionActive) { voiceStatus = "SESSION NOT READY"; return }
         if (!voiceSignalingReady) setupVoiceSignaling(activeSessionId, mode == "host")
         voiceChatEnabled = true; voiceStatus = "CONNECTING"
+        updateLocalPlayerVoice(true)
         ensureVoiceReady {
             voiceRtc.setRemoteVoiceEnabled(remoteVoiceEnabled)
             voiceRtc.setRemoteVolume(voiceVolume)
@@ -940,6 +1031,10 @@ class MainActivity : ComponentActivity() {
         firebase.createRoom({ code ->
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
+            hostPlayer = SessionPlayer(code, effectiveDisplayName(true), 1, "host", false, false)
+            joinerPlayer = SessionPlayer(code, "Player 2", 2, "joiner", false, false)
+            firebase.publishPlayer(code, "host", hostPlayer.displayName, 1, false, false) { Log.e(TAG, "Host player metadata failed: $it") }
+            listenForPlayerMetadata(code)
             controllerBackend.close()
             controllerBackend = ControllerBackendSelector.select()
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
@@ -958,6 +1053,7 @@ class MainActivity : ComponentActivity() {
                     PeerConnection.PeerConnectionState.CONNECTED -> {
                         mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
                         hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true)
+                        firebase.updatePlayerState(code, "host", connected = true)
                         if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
                         else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
                         uiFeedback(window.decorView, success = true)
@@ -1008,6 +1104,9 @@ class MainActivity : ComponentActivity() {
         sessionStarting = true; clientStatus = "Looking for room..."
         firebase.joinRoom(code, {
             clientStatus = "Loading WebRTC offer..."
+            joinerPlayer = SessionPlayer(code, effectiveDisplayName(false), 2, "joiner", false, false)
+            firebase.publishPlayer(code, "joiner", joinerPlayer.displayName, 2, false, false) { Log.e(TAG, "Joiner player metadata failed: $it") }
+            listenForPlayerMetadata(code)
             firebase.getOffer(code, { offer -> prepareJoinPeer(code, offer) }, { clientStatus = "Offer load failed: $it"; sessionStarting = false })
         }, { clientStatus = "Join failed: $it"; sessionStarting = false })
     }
@@ -1030,6 +1129,7 @@ class MainActivity : ComponentActivity() {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     clientControlActive = true; clientConnected = true; sessionStarting = false
                     updateSessionActive(true)
+                    firebase.updatePlayerState(code, "joiner", connected = true)
                     if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
                     else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
                     uiFeedback(window.decorView, success = true)
@@ -1408,6 +1508,7 @@ class MainActivity : ComponentActivity() {
     private fun cleanupSession(deleteHostRoom: Boolean) {
         sendNeutralReset("session cleanup")
         resetRemoteInput("session cleanup")
+        if (activeSessionId != "none" && mode == "client") firebase.removePlayer(activeSessionId, "joiner")
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         mainHandler.removeCallbacksAndMessages(null)
@@ -1421,6 +1522,9 @@ class MainActivity : ComponentActivity() {
         gameAudioEnabled = true; gameAudioVolume = 1f
         voiceChatEnabled = false; voiceMuted = false; remoteVoiceEnabled = true; voiceVolume = 1f
         voiceStatus = "OFF"; voiceDiagnostics = VoiceDiagnostics(); voiceSignalingReady = false; voiceHostRole = false
+        localSpeaking = false; remoteSpeaking = false
+        hostPlayer = SessionPlayer("", "Player 1", 1, "host", false, false)
+        joinerPlayer = SessionPlayer("", "Player 2", 2, "joiner", false, false)
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
         lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
