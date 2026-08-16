@@ -90,6 +90,9 @@ class MainActivity : ComponentActivity() {
     private var uiSoundEffects by mutableStateOf(true)
     private var onboardingVisible by mutableStateOf(false)
     private var onboardingPage by mutableIntStateOf(0)
+    private var readinessVisible by mutableStateOf(false)
+    private var readinessShownForSession = false
+    private var controlChannelOpen by mutableStateOf(false)
     private var controllerInputTestOpen by mutableStateOf(false)
     private var controllerTestDisplayState by mutableStateOf(ControllerInputState())
     private var logicalControllerState = ControllerInputState()
@@ -159,6 +162,7 @@ class MainActivity : ComponentActivity() {
     private var staleAnalogPacketsDropped = 0L
     private var player2Classification = "Unknown"
     private var clientPeerState = PeerConnection.PeerConnectionState.NEW
+    private var hostPeerState = PeerConnection.PeerConnectionState.NEW
     private val heldRemoteButtons = mutableSetOf<Int>()
     private val lastRemoteSequences = mutableMapOf<String, Long>()
     private lateinit var sessionBackCallback: OnBackPressedCallback
@@ -170,8 +174,17 @@ class MainActivity : ComponentActivity() {
     private val disconnectGraceRunnable = Runnable {
         if (clientPeerState == PeerConnection.PeerConnectionState.DISCONNECTED) {
             clientConnected = false; clientControlActive = false
-            clientStatus = "Disconnected - reconnect the session"
+            clientStatus = "Reconnection failed - retry the session"
+            updateSessionActive(false)
             Log.e(TAG, "RECONNECT GRACE EXPIRED: PeerConnection remained DISCONNECTED for 15 seconds")
+        }
+    }
+    private val hostDisconnectGraceRunnable = Runnable {
+        if (hostPeerState == PeerConnection.PeerConnectionState.DISCONNECTED) {
+            hostStatus = "Reconnection failed - retry the session"
+            sessionStarting = false
+            updateSessionActive(false)
+            Log.e(TAG, "HOST RECONNECT GRACE EXPIRED: PeerConnection remained DISCONNECTED for 15 seconds")
         }
     }
 
@@ -265,10 +278,11 @@ class MainActivity : ComponentActivity() {
                             "disconnecting" -> DisconnectedScreen()
                             else -> MainShell()
                         }
-                        if (sessionActive && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen) SessionMenuRevealLayer()
+                        if (sessionActive && !readinessVisible && !sessionMenuOpen && !sessionStatsOpen && !sessionSettingsOpen) SessionMenuRevealLayer()
                         if (sessionMenuOpen) SessionMenu()
                         if (sessionStatsOpen) SessionStats()
                         if (sessionSettingsOpen) SettingsScreen(inSession = true)
+                        if (sessionActive && readinessVisible) PreGameReadiness()
                     }
                 }
                 LaunchedEffect(sessionStatsOpen) { setPerformanceDiagnosticsActive(sessionStatsOpen) }
@@ -370,7 +384,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("0.9.9-beta", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.0.0", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -446,6 +460,33 @@ class MainActivity : ComponentActivity() {
             Text(hostRoomCode, color = Color.White, fontWeight = FontWeight.Black, fontSize = 42.sp, letterSpacing = 7.sp)
             Text(hostStatus, color = mutedText)
         }
+    }
+
+    @Composable private fun PreGameReadiness() {
+        val host = mode == "host"
+        val videoReady = if (host) captureStatus.contains("started", true) else remoteTrack != null
+        val audioReady = audioStatus.contains("active", true) || audioStatus.contains("streaming", true)
+        val controllerReady = if (host) controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE else controlChannelOpen && lastControllerDeviceId != -1
+        Box(Modifier.fillMaxSize().background(Color(0xD9000000)), contentAlignment = Alignment.Center) {
+            Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("PLAYER 2 READY", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+                ReadinessLine("VIDEO", if (videoReady) "READY" else "CHECKING", videoReady)
+                ReadinessLine("AUDIO", if (audioReady) "READY" else if (audioStatus.contains("unavailable", true) || audioStatus.contains("denied", true)) "UNAVAILABLE" else "CHECKING", audioReady)
+                ReadinessLine("CONTROLLER", if (controllerReady) "READY" else if (host && controllerBackend.status != ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) "UNAVAILABLE" else "CHECKING", controllerReady)
+                ReadinessLine("CONNECTION", connectionQuality(), betaDiagnostics.connectionState.contains("CONNECTED", true))
+                ReadinessLine("PING", betaDiagnostics.rttMs?.let { "${it.toInt()} ms" } ?: "CHECKING", betaDiagnostics.rttMs != null)
+                ReadinessLine("PACKET LOSS", betaDiagnostics.packetLoss.toString(), betaDiagnostics.packetLoss < 10)
+                if (!controllerReady) Text(if (host) friendlyControllerStatus() else "Connect or move the Player 2 controller to verify input.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+                if (!audioReady && !audioStatus.contains("waiting", true)) Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+                NeonButton("START PLAYING") { readinessVisible = false }
+                NeonTextButton("CONNECTION STATS") { readinessVisible = false; sessionStatsOpen = true }
+            }
+        }
+    }
+
+    @Composable private fun ReadinessLine(label: String, value: String, ready: Boolean) = Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Text(label, Modifier.weight(1f), color = mutedText, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("${if (ready) "✓" else "•"} $value", color = if (ready) neonGreen else Color(0xFFFFC857), fontWeight = FontWeight.Bold, fontSize = 12.sp)
     }
 
     @Composable private fun SessionMenuRevealLayer() {
@@ -606,7 +647,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "0.9.9-beta")
+                SettingInfo("Version", "1.0.0")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -749,11 +790,28 @@ class MainActivity : ComponentActivity() {
             hostRtc.onControlMessageReceived = ::handleControlMessage
             hostRtc.onAudioStatus = { status -> runOnUiThread { audioStatus = status } }
             hostRtc.onDiagnostics = { update -> runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) } }
-            hostRtc.onDataChannelStateChanged = { _, state -> if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) runOnUiThread { resetRemoteInput("DataChannel $state") } }
+            hostRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
+                if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
+                if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) resetRemoteInput("DataChannel $state")
+            } }
             hostRtc.onConnectionStateChanged = { state -> runOnUiThread {
-                hostStatus = connectionText(state)
-                if (state == PeerConnection.PeerConnectionState.CONNECTED) { sessionStarting = false; updateSessionActive(true); uiFeedback(window.decorView, success = true) }
-                if (state == PeerConnection.PeerConnectionState.DISCONNECTED || state == PeerConnection.PeerConnectionState.FAILED || state == PeerConnection.PeerConnectionState.CLOSED) resetRemoteInput("PeerConnection $state")
+                hostPeerState = state
+                when (state) {
+                    PeerConnection.PeerConnectionState.CONNECTED -> {
+                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
+                        hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true); uiFeedback(window.decorView, success = true)
+                    }
+                    PeerConnection.PeerConnectionState.DISCONNECTED -> {
+                        hostStatus = "Reconnecting…"; resetRemoteInput("PeerConnection $state")
+                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
+                        mainHandler.postDelayed(hostDisconnectGraceRunnable, 15_000L)
+                    }
+                    PeerConnection.PeerConnectionState.FAILED, PeerConnection.PeerConnectionState.CLOSED -> {
+                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
+                        hostStatus = "Connection failed"; sessionStarting = false; resetRemoteInput("PeerConnection $state"); updateSessionActive(false)
+                    }
+                    else -> hostStatus = connectionText(state)
+                }
             } }
             hostRtc.onIceCandidateReady = { candidate ->
                 firebase.saveIceCandidate(code, "host", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { hostStatus = "ICE save error: $it" }
@@ -798,7 +856,10 @@ class MainActivity : ComponentActivity() {
         clientRtc.initialize()
         clientRtc.onAudioStatus = { status -> runOnUiThread { audioStatus = status } }
         clientRtc.onControlMessageReceived = ::handleControlMessage
-        clientRtc.onDataChannelStateChanged = { label, state -> if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) Log.w(TAG, "Client DataChannel closed: $label") }
+        clientRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
+            if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
+            if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) Log.w(TAG, "Client DataChannel closed: $label")
+        } }
         clientRtc.onDiagnostics = { update -> runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) } }
         clientRtc.onRemoteVideoTrack = { track -> Log.d(TAG, "Remote video track stored for renderer"); runOnUiThread { remoteTrack = track; clientStatus = "Connected - video track received" } }
         clientRtc.onConnectionStateChanged = { state -> runOnUiThread {
@@ -829,8 +890,9 @@ class MainActivity : ComponentActivity() {
                 PeerConnection.PeerConnectionState.CLOSED -> {
                     sendNeutralReset("PeerConnection $state")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
-                    clientControlActive = false; clientConnected = false
-                    clientStatus = connectionText(state)
+                    clientControlActive = false; clientConnected = false; sessionStarting = false
+                    clientStatus = "Connection failed"
+                    updateSessionActive(false)
                 }
                 else -> clientStatus = connectionText(state)
             }
@@ -1173,7 +1235,11 @@ class MainActivity : ComponentActivity() {
     private fun updateSessionActive(active: Boolean) {
         sessionActive = active
         sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen
-        if (!active) { sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
+        if (active && !readinessShownForSession) {
+            readinessShownForSession = true
+            readinessVisible = true
+        }
+        if (!active) { readinessVisible = false; sessionMenuOpen = false; sessionStatsOpen = false; sessionSettingsOpen = false; menuButtonVisible = false; controllerInputTestOpen = false }
     }
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
@@ -1184,7 +1250,9 @@ class MainActivity : ComponentActivity() {
         mainHandler.removeCallbacksAndMessages(null)
         hostRtc.close(); clientRtc.close(); stopService(Intent(this, ScreenCaptureService::class.java))
         controllerBackend.close(); controllerBackend = TransportOnlyBackend()
-        detachRenderer(); remoteTrack = null; clientControlActive = false; clientConnected = false; clientPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
+        detachRenderer(); remoteTrack = null; clientControlActive = false; clientConnected = false; controlChannelOpen = false
+        clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
+        readinessVisible = false; readinessShownForSession = false
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
         lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L

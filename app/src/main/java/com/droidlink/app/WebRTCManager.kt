@@ -155,6 +155,7 @@ class WebRtcManager(private val context: Context) {
             peer?.setAudioPlayout(true)
             Log.d(TAG, "REMOTE AUDIO TRACK RECEIVED: callback=$callback id=${mediaTrack.id()}")
             Log.d(TAG, "AUDIO PLAYBACK STARTED: enabled=${mediaTrack.enabled()}")
+            onAudioStatus?.invoke("Game audio streaming")
             return
         }
         val track = mediaTrack as? VideoTrack ?: return
@@ -528,6 +529,14 @@ class WebRtcManager(private val context: Context) {
     fun close() {
         if (closed) return
         closed = true; Log.d(TAG, "Closing WebRTC session")
+        // Break Activity callback references before native close/dispose can emit late events.
+        onControlMessageReceived = null
+        onConnectionStateChanged = null
+        onRemoteVideoTrack = null
+        onIceCandidateReady = null
+        onDiagnostics = null
+        onAudioStatus = null
+        onDataChannelStateChanged = null
         statsHandler?.removeCallbacksAndMessages(null)
         statsThread?.quitSafely()
         statsHandler = null; statsThread = null
