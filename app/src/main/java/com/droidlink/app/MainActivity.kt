@@ -64,7 +64,8 @@ class MainActivity : ComponentActivity() {
     private val firebase = FirebaseRoomManager()
     private val hostRtc by lazy { WebRtcManager(this) }
     private val clientRtc by lazy { WebRtcManager(this) }
-    private val voiceRtc by lazy { VoiceChatManager(this) }
+    private val voiceRtcDelegate = lazy { VoiceChatManager(this) }
+    private val voiceRtc by voiceRtcDelegate
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -98,6 +99,7 @@ class MainActivity : ComponentActivity() {
     private var controlChannelOpen by mutableStateOf(false)
     private var gameAudioEnabled by mutableStateOf(true)
     private var gameAudioVolume by mutableFloatStateOf(1f)
+    private var voiceChatStartEnabled by mutableStateOf(false)
     private var voiceChatEnabled by mutableStateOf(false)
     private var voiceMuted by mutableStateOf(false)
     private var remoteVoiceEnabled by mutableStateOf(true)
@@ -276,6 +278,7 @@ class MainActivity : ComponentActivity() {
             animatedBackground = preferences.getBoolean("animated_background", true)
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
+            voiceChatStartEnabled = preferences.getBoolean("voice_chat_start_enabled", false)
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
             introVisible = showIntroAnimation
         }
@@ -408,7 +411,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.1.0", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.1 V2", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -696,6 +699,13 @@ class MainActivity : ComponentActivity() {
             SettingSection("AUDIO") {
                 SettingInfo("Game audio", friendlyAudioStatus())
                 SettingInfo("Volume", "Controlled by device")
+                SettingSwitch("Voice Chat", voiceChatStartEnabled) { enabled ->
+                    voiceChatStartEnabled = enabled
+                    getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putBoolean("voice_chat_start_enabled", enabled).apply()
+                    Log.d(TAG, "VOICE_PRESESSION_SETTING: ${if (enabled) "ON" else "OFF"}")
+                    if (sessionActive) updateVoiceChatEnabled(enabled)
+                }
+                SettingInfo("Voice start", if (voiceChatStartEnabled) "Enabled for new sessions" else "Off (microphone inactive)")
             }
             SettingSection("CONNECTION") {
                 SettingInfo("Connection mode", "Automatic (recommended)")
@@ -721,7 +731,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "1.1.0")
+                SettingInfo("Version", "Droid Link 1.1 V2")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -768,6 +778,7 @@ class MainActivity : ComponentActivity() {
     private fun resetUiSettings() {
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
         animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
+        voiceChatStartEnabled = false
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
     }
 
@@ -871,7 +882,10 @@ class MainActivity : ComponentActivity() {
     private fun updateVoiceChatEnabled(enabled: Boolean) {
         if (!enabled) {
             voiceChatEnabled = false; voiceStatus = "OFF"
-            voiceRtc.enableMicrophone(false); voiceRtc.setRemoteVoiceEnabled(false)
+            if (voiceRtcDelegate.isInitialized()) {
+                voiceRtc.enableMicrophone(false)
+                voiceRtc.setRemoteVoiceEnabled(false)
+            }
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -880,7 +894,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enableVoiceAfterPermission() {
-        if (!sessionActive || !voiceSignalingReady) { voiceStatus = "SESSION NOT READY"; return }
+        if (!sessionActive) { voiceStatus = "SESSION NOT READY"; return }
+        if (!voiceSignalingReady) setupVoiceSignaling(activeSessionId, mode == "host")
         voiceChatEnabled = true; voiceStatus = "CONNECTING"
         ensureVoiceReady {
             voiceRtc.setRemoteVoiceEnabled(remoteVoiceEnabled)
@@ -942,7 +957,10 @@ class MainActivity : ComponentActivity() {
                 when (state) {
                     PeerConnection.PeerConnectionState.CONNECTED -> {
                         mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
-                        hostStatus = "Connected"; sessionStarting = false; setupVoiceSignaling(code, true); updateSessionActive(true); uiFeedback(window.decorView, success = true)
+                        hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true)
+                        if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
+                        else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
+                        uiFeedback(window.decorView, success = true)
                     }
                     PeerConnection.PeerConnectionState.DISCONNECTED -> {
                         hostStatus = "Reconnecting…"; resetRemoteInput("PeerConnection $state")
@@ -1011,8 +1029,9 @@ class MainActivity : ComponentActivity() {
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     clientControlActive = true; clientConnected = true; sessionStarting = false
-                    setupVoiceSignaling(code, false)
                     updateSessionActive(true)
+                    if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
+                    else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
                     uiFeedback(window.decorView, success = true)
                     clientStatus = if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing"
                     mainHandler.postDelayed({
@@ -1392,7 +1411,9 @@ class MainActivity : ComponentActivity() {
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         mainHandler.removeCallbacksAndMessages(null)
-        hostRtc.close(); clientRtc.close(); voiceRtc.close(); stopService(Intent(this, ScreenCaptureService::class.java))
+        hostRtc.close(); clientRtc.close()
+        if (voiceRtcDelegate.isInitialized()) voiceRtc.close()
+        stopService(Intent(this, ScreenCaptureService::class.java))
         controllerBackend.close(); controllerBackend = TransportOnlyBackend()
         detachRenderer(); remoteTrack = null; clientControlActive = false; clientConnected = false; controlChannelOpen = false
         clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
@@ -1560,7 +1581,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)
-        hostRtc.release(); clientRtc.release(); voiceRtc.close()
+        hostRtc.release(); clientRtc.release()
+        if (voiceRtcDelegate.isInitialized()) voiceRtc.close()
         if (receiverRegistered) { try { unregisterReceiver(projectionReadyReceiver) } catch (_: Exception) {}; receiverRegistered = false }
         try { (getSystemService(Context.INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener) } catch (_: Exception) {}
         super.onDestroy()
