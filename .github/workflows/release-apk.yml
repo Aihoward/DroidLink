@@ -1,0 +1,55 @@
+name: Build and release DroidLink APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Find APK
+        id: apk
+        shell: bash
+        run: |
+          APK=$(find app/build/outputs/apk -type f -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo 'No APK was produced.'
+            exit 1
+          fi
+          cp "$APK" DroidLink-${GITHUB_REF_NAME}.apk
+          echo "path=DroidLink-${GITHUB_REF_NAME}.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidLink-${{ github.ref_name }}
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.apk.outputs.path }}
+          generate_release_notes: true
