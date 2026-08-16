@@ -19,6 +19,7 @@ data class BetaDiagnostics(
     val averageControllerLatencyMs: Long? = null,
     val maxControllerLatencyMs: Long? = null,
     val controllerP95LatencyMs: Long? = null,
+    val controllerP50LatencyMs: Long? = null,
     val controllerPacketAgeMs: Long? = null,
     val digitalQueueDepth: Int = 0,
     val analogQueueDepth: Int = 0,
@@ -31,7 +32,7 @@ data class BetaDiagnostics(
 )
 
 object ControllerTransportPolicy {
-    const val ANALOG_SEND_INTERVAL_MS = 12L
+    const val ANALOG_SEND_INTERVAL_MS = 10L
     const val ANALOG_HEARTBEAT_MS = 250L
     const val MAX_ANALOG_BUFFERED_BYTES = 1L * 1024L
     const val STALE_ANALOG_RTT_THRESHOLD_MS = 300L

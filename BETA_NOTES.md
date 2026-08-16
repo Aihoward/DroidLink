@@ -1,14 +1,13 @@
-# DroidLink 0.9.6 Beta
+# DroidLink 0.9.7 Beta
 
 This build preserves the physically verified 0.9.2/0.9.3 Firebase, TURN/ICE,
 WebRTC H.264 video, playback audio, controller transport, and Player 2 uinput
 baseline.
 
-0.9.6 preserves the physically verified 0.9.5 Winlator, media, signaling, and
-session baseline. It restores Android's canonical X/Y evdev mapping for PS2
-emulators, adds a logical Player 2 input-test screen, tightens latest-state
-analog pacing/backpressure, and removes controller-driven Compose updates from
-the gameplay hot path.
+0.9.7 preserves the physically verified 0.9.6 Winlator, PS2 mapping, media,
+signaling, and session baseline. It consolidates D-pad KeyEvents and HAT events
+into one reliable logical state stream, injects only ABS_HAT state changes, and
+prevents duplicate or stale D-pad representations from oscillating in games.
 
 `DroidLink Player 2` retains its visible name, generic evdev capabilities, and
 Xbox 360 wired identity (VID/PID 045e:028e). The descriptor now uses Xbox-style

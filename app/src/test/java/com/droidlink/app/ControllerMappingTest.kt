@@ -29,4 +29,19 @@ class ControllerMappingTest {
         assertFalse(neutral.isDown(LogicalControl.A))
         assertEquals("NEUTRAL", neutral.dpadText())
     }
+
+    @Test fun dpadStateMachineEmitsOnlyEdges() {
+        val machine = DpadStateMachine()
+        assertTrue(machine.update(DpadState(1, 0)))
+        assertFalse(machine.update(DpadState(1, 0)))
+        assertTrue(machine.update(DpadState()))
+        assertFalse(machine.update(DpadState()))
+    }
+
+    @Test fun dpadStateSupportsDiagonalsAndPolarity() {
+        assertEquals("UP", DpadState(0, -1).label)
+        assertEquals("DOWN", DpadState(0, 1).label)
+        assertEquals("UP_LEFT", DpadState(-1, -1).label)
+        assertEquals("DOWN_RIGHT", DpadState(1, 1).label)
+    }
 }

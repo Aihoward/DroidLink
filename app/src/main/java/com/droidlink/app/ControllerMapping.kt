@@ -68,6 +68,39 @@ object ControllerMapping {
 
 data class AxisMapping(val androidAxis: Int, val logicalName: String, val trigger: Boolean)
 
+enum class DpadSource { UNSELECTED, KEY, HAT }
+
+data class DpadState(val x: Int = 0, val y: Int = 0) {
+    init {
+        require(x in -1..1 && y in -1..1) { "D-pad axes must be -1, 0, or 1" }
+    }
+
+    val label: String get() = when {
+        x == 0 && y == 0 -> "NEUTRAL"
+        x == 0 && y < 0 -> "UP"
+        x == 0 && y > 0 -> "DOWN"
+        x < 0 && y == 0 -> "LEFT"
+        x > 0 && y == 0 -> "RIGHT"
+        x < 0 && y < 0 -> "UP_LEFT"
+        x > 0 && y < 0 -> "UP_RIGHT"
+        x < 0 -> "DOWN_LEFT"
+        else -> "DOWN_RIGHT"
+    }
+}
+
+class DpadStateMachine {
+    var state: DpadState = DpadState()
+        private set
+
+    fun update(next: DpadState): Boolean {
+        if (next == state) return false
+        state = next
+        return true
+    }
+
+    fun reset(): Boolean = update(DpadState())
+}
+
 data class ControllerInputState(
     val pressed: Set<LogicalControl> = emptySet(),
     val leftX: Float = 0f,

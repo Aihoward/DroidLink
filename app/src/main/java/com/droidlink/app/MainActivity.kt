@@ -98,6 +98,11 @@ class MainActivity : ComponentActivity() {
     private var digitalSequence = 0L
     private var analogSequence = 0L
     private var lastControllerDeviceId = -1
+    private val dpadSources = mutableMapOf<Int, DpadSource>()
+    private val joinerDpadKeys = mutableSetOf<LogicalControl>()
+    private val joinerDpadState = DpadStateMachine()
+    private val hostDpadState = DpadStateMachine()
+    private var dpadDuplicateDrops = 0L
     private var activeSessionId = "none"
     private val mainHandler = Handler(Looper.getMainLooper())
     private var backendUnavailableLogged = false
@@ -122,7 +127,7 @@ class MainActivity : ComponentActivity() {
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) { inspectPlayer2Device(deviceId) }
         override fun onInputDeviceChanged(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceRemoved(deviceId: Int) { if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected") } }
+        override fun onInputDeviceRemoved(deviceId: Int) { if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
     }
     private val disconnectGraceRunnable = Runnable {
         if (clientPeerState == PeerConnection.PeerConnectionState.DISCONNECTED) {
@@ -296,6 +301,7 @@ class MainActivity : ComponentActivity() {
             diagnosticLine("Control latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—")
             diagnosticLine("Average / recent max", "${d.averageControllerLatencyMs ?: "—"} / ${d.maxControllerLatencyMs ?: "—"} ms")
             diagnosticLine("Control p95", d.controllerP95LatencyMs?.let { "$it ms" } ?: "—")
+            diagnosticLine("Control p50", d.controllerP50LatencyMs?.let { "$it ms" } ?: "—")
             diagnosticLine("Packet age", d.controllerPacketAgeMs?.let { "$it ms" } ?: "—")
             diagnosticLine("Digital / analog queue", "${d.digitalQueueDepth} / ${d.analogQueueDepth}")
             diagnosticLine("DataChannel buffered", "${d.controlBufferedBytes} bytes")
@@ -318,6 +324,7 @@ class MainActivity : ComponentActivity() {
             diagnosticLine("L3 / R3", "${upDown(state, LogicalControl.L3)} / ${upDown(state, LogicalControl.R3)}")
             diagnosticLine("Start / Select", "${upDown(state, LogicalControl.START)} / ${upDown(state, LogicalControl.SELECT)}")
             diagnosticLine("D-pad", state.dpadText())
+            DpadVisualization(state)
             diagnosticLine("Left X / Y", "${axisText(state.leftX)} / ${axisText(state.leftY)}")
             diagnosticLine("Right X / Y", "${axisText(state.rightX)} / ${axisText(state.rightY)}")
             Button(onClick = { controllerInputTestOpen = false }) { Text("Back to Stats") }
@@ -326,6 +333,17 @@ class MainActivity : ComponentActivity() {
 
     private fun upDown(state: ControllerInputState, control: LogicalControl) = if (state.isDown(control)) "DOWN" else "UP"
     private fun axisText(value: Float) = String.format(java.util.Locale.US, "%.2f", value)
+
+    @Composable private fun DpadVisualization(state: ControllerInputState) {
+        val active = state.dpadText()
+        dpadCell("UP", active.contains("UP"))
+        Row { dpadCell("LEFT", active.contains("LEFT")); dpadCell("CENTER", active == "NEUTRAL"); dpadCell("RIGHT", active.contains("RIGHT")) }
+        dpadCell("DOWN", active.contains("DOWN"))
+    }
+
+    @Composable private fun dpadCell(label: String, active: Boolean) {
+        Text(label, color = if (active) Color.Green else Color.Gray, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
+    }
 
     private fun setPerformanceDiagnosticsActive(active: Boolean) {
         if (diagnosticsPerfActive == active) return
@@ -503,6 +521,7 @@ class MainActivity : ComponentActivity() {
                 while (recentControllerLatencies.size > 128) recentControllerLatencies.removeFirst()
                 Log.d(TAG, "CONTROL_NETWORK_MS: ${roundTrip / 2L}")
                 Log.d(TAG, "CONTROL_TOTAL_LATENCY_MS: $estimatedEndToEnd")
+                Log.d(TAG, "CONTROL_PACKET_AGE_MS: ${captureMs + roundTrip / 2L}")
                 Log.d(TAG, "CONTROL LATENCY_MS: estimatedEndToEnd=$estimatedEndToEnd capture=$captureMs network=${roundTrip / 2L} inject=$injectMs roundTrip=$roundTrip")
             }
             "KEY" -> {
@@ -525,6 +544,20 @@ class MainActivity : ComponentActivity() {
                 if (action == "UP" && !heldRemoteButtons.remove(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
                 val started = android.os.SystemClock.elapsedRealtime()
                 val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
+                if (logical != null && isDpadControl(logical)) {
+                    val legacyDpad = DpadState(
+                        x = (if (KeyEvent.KEYCODE_DPAD_RIGHT in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_LEFT in heldRemoteButtons) 1 else 0),
+                        y = (if (KeyEvent.KEYCODE_DPAD_DOWN in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_UP in heldRemoteButtons) 1 else 0)
+                    )
+                    val changed = hostDpadState.update(legacyDpad)
+                    val injected = !changed || controllerBackend.updateDpad(context, legacyDpad.x, legacyDpad.y)
+                    updateLogicalDpad(legacyDpad)
+                    val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+                    hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                    Log.d(TAG, "DPAD_LOGICAL_STATE: side=host state=${legacyDpad.label} source=LEGACY_KEY sequence=$sequence changed=$changed")
+                    if (!injected) logBackendUnavailableOnce()
+                    return
+                }
                 val injected = if (action == "DOWN") controllerBackend.keyDown(context, key) else if (action == "UP") controllerBackend.keyUp(context, key) else false
                 val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                 hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
@@ -564,6 +597,32 @@ class MainActivity : ComponentActivity() {
                     } else if (!injected) logBackendUnavailableOnce()
                 }
             }
+            "DPAD" -> {
+                if (parts.size < 11) return
+                val session = parts[1]
+                val sequence = parts[4].toLongOrNull() ?: return
+                val sentAt = parts[5].toLongOrNull() ?: return
+                val captureMs = parts[6].toLongOrNull() ?: 0L
+                val x = parts[8].toIntOrNull()?.coerceIn(-1, 1) ?: return
+                val y = parts[9].toIntOrNull()?.coerceIn(-1, 1) ?: return
+                val source = parts[10]
+                if (!acceptRemoteSequence("digital", session, sequence)) return
+                val next = DpadState(x, y)
+                if (!hostDpadState.update(next)) {
+                    dpadDuplicateDrops++
+                    Log.d(TAG, "DPAD_DUPLICATE_DROPPED: side=host state=${next.label} sequence=$sequence total=$dpadDuplicateDrops")
+                    return
+                }
+                val context = ControllerEventContext(session, parts[2], parts[3].toIntOrNull() ?: 2, sequence, sentAt)
+                val started = android.os.SystemClock.elapsedRealtimeNanos()
+                val injected = controllerBackend.updateDpad(context, x, y)
+                val injectMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L
+                updateLogicalDpad(next)
+                hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                Log.d(TAG, "DPAD_LOGICAL_STATE: side=host state=${next.label} source=$source sequence=$sequence")
+                if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=host sequence=$sequence")
+                if (!injected) logBackendUnavailableOnce()
+            }
             "RESET" -> if (parts.getOrNull(1) == activeSessionId) resetRemoteInput(parts.getOrNull(6) ?: "remote reset")
         }
     }
@@ -585,6 +644,7 @@ class MainActivity : ComponentActivity() {
     private fun resetRemoteInput(reason: String) {
         if (heldRemoteButtons.isNotEmpty()) Log.w(TAG, "CONTROL_STUCK_INPUT_RECOVERY: reason=$reason held=${heldRemoteButtons.joinToString()}")
         heldRemoteButtons.clear(); lastRemoteSequences.clear(); axisAckCounter = 0
+        hostDpadState.reset()
         logicalControllerState = ControllerInputState()
         if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
         controllerBackend.resetNeutral(reason)
@@ -623,6 +683,7 @@ class MainActivity : ComponentActivity() {
             averageControllerLatencyMs = current.averageControllerLatencyMs,
             maxControllerLatencyMs = current.maxControllerLatencyMs,
             controllerP95LatencyMs = current.controllerP95LatencyMs,
+            controllerP50LatencyMs = current.controllerP50LatencyMs,
             controllerPacketAgeMs = current.controllerPacketAgeMs,
             duplicateControlPacketsDropped = current.duplicateControlPacketsDropped,
             outOfOrderControlPacketsDropped = current.outOfOrderControlPacketsDropped,
@@ -674,6 +735,8 @@ class MainActivity : ComponentActivity() {
             val rate = controllerWindowPackets * 1_000.0 / elapsed
             val sortedLatencies = recentControllerLatencies.sorted()
             val p95 = if (sortedLatencies.isEmpty()) null else sortedLatencies[((sortedLatencies.size - 1) * 0.95).toInt()]
+            val p50 = if (sortedLatencies.isEmpty()) null else sortedLatencies[(sortedLatencies.size - 1) / 2]
+            Log.d(TAG, "CONTROL_P50_LATENCY_MS: ${p50 ?: "n/a"}")
             Log.d(TAG, "CONTROL_P95_LATENCY_MS: ${p95 ?: "n/a"}")
             Log.d(TAG, "CONTROL_MAX_LATENCY_MS: ${if (controllerLatencySamples > 0L) controllerLatencyMaxMs else "n/a"}")
             updateControllerDiagnostics {
@@ -683,6 +746,7 @@ class MainActivity : ComponentActivity() {
                     averageControllerLatencyMs = if (controllerLatencySamples == 0L) null else controllerLatencyTotalMs / controllerLatencySamples,
                     maxControllerLatencyMs = controllerLatencyMaxMs.takeIf { controllerLatencySamples > 0L },
                     controllerP95LatencyMs = p95,
+                    controllerP50LatencyMs = p50,
                     controllerPacketAgeMs = latestControllerLatencyMs
                 )
             }
@@ -698,13 +762,18 @@ class MainActivity : ComponentActivity() {
     private fun updateLogicalAxes(axes: FloatArray) {
         logicalControllerState = logicalControllerState.copy(
             leftX = axes[0], leftY = axes[1], rightX = axes[2], rightY = axes[3],
-            leftTrigger = axes[4], rightTrigger = axes[5], dpadX = axes[6], dpadY = axes[7]
+            leftTrigger = axes[4], rightTrigger = axes[5]
         )
         val now = android.os.SystemClock.elapsedRealtime()
         if (controllerInputTestOpen && now - lastControllerTestUiMs >= 50L) {
             lastControllerTestUiMs = now
             runOnUiThread { controllerTestDisplayState = logicalControllerState }
         }
+    }
+
+    private fun updateLogicalDpad(state: DpadState) {
+        logicalControllerState = logicalControllerState.copy(dpadX = state.x.toFloat(), dpadY = state.y.toFloat())
+        if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
     }
 
     private fun requestScreenCapture() {
@@ -750,6 +819,7 @@ class MainActivity : ComponentActivity() {
         latestControllerLatencyMs = null; recentControllerLatencies.clear(); controlThreadLogCounter = 0
         duplicateControlPacketsDropped = 0L; outOfOrderControlPacketsDropped = 0L; staleAnalogPacketsDropped = 0L; player2Classification = "Unknown"
         logicalControllerState = ControllerInputState(); controllerTestDisplayState = ControllerInputState(); lastControllerTestUiMs = 0L
+        resetLocalDpadState("session cleanup"); hostDpadState.reset(); dpadDuplicateDrops = 0L
         controllerWindowPackets = 0; controllerWindowStart = android.os.SystemClock.elapsedRealtime(); betaDiagnostics = BetaDiagnostics()
         updateSessionActive(false)
         Log.d(TAG, "Session cleanup complete")
@@ -763,18 +833,28 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) { noteController(event.deviceId, event.device?.name); if (event.repeatCount == 0) sendKey(keyCode, "DOWN", event); return true }
+        if (clientControlActive && isController(event.source)) {
+            noteController(event.deviceId, event.device?.name)
+            if (handleDpadKey(keyCode, down = true, event)) return true
+            if (event.repeatCount == 0) sendKey(keyCode, "DOWN", event)
+            return true
+        }
         return super.onKeyDown(keyCode, event)
     }
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) { noteController(event.deviceId, event.device?.name); sendKey(keyCode, "UP", event); return true }
+        if (clientControlActive && isController(event.source)) {
+            noteController(event.deviceId, event.device?.name)
+            if (handleDpadKey(keyCode, down = false, event)) return true
+            sendKey(keyCode, "UP", event)
+            return true
+        }
         return super.onKeyUp(keyCode, event)
     }
     private fun isController(source: Int) = source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD || source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD || source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
 
     private fun noteController(deviceId: Int, name: String?) {
         if (lastControllerDeviceId == deviceId) return
-        if (lastControllerDeviceId != -1) sendNeutralReset("controller changed")
+        if (lastControllerDeviceId != -1) { sendNeutralReset("controller changed"); resetLocalDpadState("controller changed") }
         lastControllerDeviceId = deviceId
         Log.d(TAG, "CONTROLLER DETECTED: id=$deviceId name=${name ?: "unknown"}")
     }
@@ -790,20 +870,90 @@ class MainActivity : ComponentActivity() {
         clientRtc.sendControlMessage(message)
     }
 
+    private fun handleDpadKey(keyCode: Int, down: Boolean, event: KeyEvent): Boolean {
+        val logical = ControllerMapping.logicalForAndroidKey(keyCode) ?: return false
+        if (!isDpadControl(logical)) return false
+        Log.d(TAG, "DPAD_RAW_KEY: device=${event.deviceId} control=${logical.displayName} state=${if (down) "DOWN" else "UP"} repeat=${event.repeatCount}")
+        val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED
+        if (selected == DpadSource.HAT) {
+            dpadDuplicateDrops++
+            Log.d(TAG, "DPAD_DUPLICATE_DROPPED: side=joiner source=KEY preferred=HAT total=$dpadDuplicateDrops")
+            return true
+        }
+        if (selected == DpadSource.UNSELECTED) {
+            dpadSources[event.deviceId] = DpadSource.KEY
+            Log.d(TAG, "DPAD_SOURCE_SELECTED: device=${event.deviceId} source=KEY")
+        }
+        if (down) joinerDpadKeys.add(logical) else joinerDpadKeys.remove(logical)
+        val next = DpadState(
+            x = (if (LogicalControl.DPAD_RIGHT in joinerDpadKeys) 1 else 0) - (if (LogicalControl.DPAD_LEFT in joinerDpadKeys) 1 else 0),
+            y = (if (LogicalControl.DPAD_DOWN in joinerDpadKeys) 1 else 0) - (if (LogicalControl.DPAD_UP in joinerDpadKeys) 1 else 0)
+        )
+        sendDpadIfChanged(next, event, DpadSource.KEY)
+        return true
+    }
+
+    private fun isDpadControl(control: LogicalControl) = when (control) {
+        LogicalControl.DPAD_UP, LogicalControl.DPAD_DOWN, LogicalControl.DPAD_LEFT, LogicalControl.DPAD_RIGHT -> true
+        else -> false
+    }
+
+    private fun resetLocalDpadState(reason: String) {
+        dpadSources.clear()
+        joinerDpadKeys.clear()
+        joinerDpadState.reset()
+        Log.d(TAG, "DPAD_LOGICAL_STATE: side=joiner state=NEUTRAL reason=$reason")
+    }
+
+    private fun sendDpadIfChanged(next: DpadState, event: MotionEvent, source: DpadSource) {
+        sendDpadIfChanged(next, event.eventTime, event.deviceId, source)
+    }
+
+    private fun sendDpadIfChanged(next: DpadState, event: KeyEvent, source: DpadSource) {
+        sendDpadIfChanged(next, event.eventTime, event.deviceId, source)
+    }
+
+    private fun sendDpadIfChanged(next: DpadState, eventTime: Long, deviceId: Int, source: DpadSource) {
+        if (!joinerDpadState.update(next)) {
+            dpadDuplicateDrops++
+            if (dpadDuplicateDrops % 120L == 1L) Log.d(TAG, "DPAD_DUPLICATE_DROPPED: side=joiner source=$source state=${next.label} total=$dpadDuplicateDrops")
+            return
+        }
+        val captureMs = (android.os.SystemClock.uptimeMillis() - eventTime).coerceAtLeast(0L)
+        val sentAt = android.os.SystemClock.elapsedRealtime()
+        val message = "DPAD|$activeSessionId|device-$deviceId|2|${++digitalSequence}|$sentAt|$captureMs|${lastControlRoundTripMs ?: 0L}|${next.x}|${next.y}|$source"
+        recordControllerPacket()
+        clientRtc.sendControlMessage(message)
+        Log.d(TAG, "DPAD_LOGICAL_STATE: side=joiner state=${next.label} source=$source sequence=$digitalSequence")
+        if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=joiner sequence=$digitalSequence")
+    }
+
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (clientControlActive && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
             noteController(event.deviceId, event.device?.name)
-            val now = android.os.SystemClock.uptimeMillis(); if (now - lastAxisSendTime < ControllerTransportPolicy.ANALOG_SEND_INTERVAL_MS) return true; lastAxisSendTime = now
             val values = FloatArray(ControllerMapping.axisMap.size) { index ->
                 val mapping = ControllerMapping.axisMap[index]
                 normalizeAxis(event, mapping.androidAxis, mapping.trigger)
             }
+            val rawDpad = DpadState(values[6].toInt().coerceIn(-1, 1), values[7].toInt().coerceIn(-1, 1))
+            if (rawDpad != joinerDpadState.state || controllerInputTestOpen) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
+            val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED
+            if (rawDpad != DpadState() || selected == DpadSource.HAT) {
+                if (selected != DpadSource.HAT) {
+                    dpadSources[event.deviceId] = DpadSource.HAT
+                    joinerDpadKeys.clear()
+                    Log.d(TAG, "DPAD_SOURCE_SELECTED: device=${event.deviceId} source=HAT previous=$selected")
+                }
+                sendDpadIfChanged(rawDpad, event, DpadSource.HAT)
+            }
+            values[6] = 0f; values[7] = 0f
+            val now = android.os.SystemClock.uptimeMillis(); if (now - lastAxisSendTime < ControllerTransportPolicy.ANALOG_SEND_INTERVAL_MS) return true; lastAxisSendTime = now
             val meaningful = values.indices.any { lastAxes[it].isNaN() || kotlin.math.abs(values[it] - lastAxes[it]) >= 0.01f }
             if (!meaningful && now - lastAxisHeartbeatTime < ControllerTransportPolicy.ANALOG_HEARTBEAT_MS) return true
             values.copyInto(lastAxes); lastAxisHeartbeatTime = now
             val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
             if (analogSequence % 120L == 0L) {
-                Log.d(TAG, "RAW_AXIS_EVENT: device=${event.deviceId} x=${values[0]} y=${values[1]} z=${values[2]} rz=${values[3]} lt=${values[4]} rt=${values[5]} hat=${values[6]},${values[7]}")
+                Log.d(TAG, "RAW_AXIS_EVENT: device=${event.deviceId} x=${values[0]} y=${values[1]} z=${values[2]} rz=${values[3]} lt=${values[4]} rt=${values[5]} hat=${rawDpad.x},${rawDpad.y}")
                 Log.d(TAG, "CONTROL_CAPTURE_MS: $captureDelayMs type=AXIS")
             }
             val message = "AXIS|$activeSessionId|device-$lastControllerDeviceId|2|${++analogSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|${values.joinToString("|")}"
