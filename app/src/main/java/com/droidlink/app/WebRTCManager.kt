@@ -264,10 +264,21 @@ class WebRtcManager(private val context: Context) {
         override fun run() {
             val current = peer ?: return
             val started = android.os.SystemClock.elapsedRealtimeNanos()
-            current.getStats { report ->
-                val collectionMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0
-                Log.d(TAG, "WEBRTC_STATS_COLLECTION_MS: $collectionMs")
-                logStats(report)
+            try {
+                current.getStats { report ->
+                    try {
+                        val collectionMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0
+                        Log.d(TAG, "WEBRTC_STATS_COLLECTION_MS: $collectionMs")
+                        logStats(report)
+                    } catch (error: Exception) {
+                        Log.e(TAG, "OPTIONAL_STATS_DISABLED: WebRTC stats processing failed; media session continues", error)
+                        statsHandler?.removeCallbacksAndMessages(null)
+                    }
+                }
+            } catch (error: Exception) {
+                Log.e(TAG, "OPTIONAL_STATS_DISABLED: WebRTC getStats failed; media session continues", error)
+                statsHandler?.removeCallbacksAndMessages(null)
+                return
             }
             statsHandler?.postDelayed(this, 5_000L)
         }

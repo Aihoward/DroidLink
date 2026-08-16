@@ -205,18 +205,29 @@ class VoiceChatManager(private val context: Context) {
     }
     private val statsRunnable = object : Runnable {
         override fun run() {
-            peer?.getStats { report ->
-                var sent = 0L; var received = 0L; var mic = 0.0; var remote = 0.0
-                report.statsMap.values.forEach { stat ->
-                    val kind = (stat.members["kind"] ?: stat.members["mediaType"])?.toString()
-                    if (kind == "audio" && stat.type == "outbound-rtp") { sent += (stat.members["bytesSent"] as? Number)?.toLong() ?: 0L; mic = (stat.members["audioLevel"] as? Number)?.toDouble() ?: mic }
-                    if (kind == "audio" && stat.type == "inbound-rtp") { received += (stat.members["bytesReceived"] as? Number)?.toLong() ?: 0L; remote = (stat.members["audioLevel"] as? Number)?.toDouble() ?: remote }
-                    if (kind == "audio" && stat.type == "media-source") mic = (stat.members["audioLevel"] as? Number)?.toDouble() ?: mic
+            try {
+                peer?.getStats { report ->
+                    try {
+                        var sent = 0L; var received = 0L; var mic = 0.0; var remote = 0.0
+                        report.statsMap.values.forEach { stat ->
+                            val kind = (stat.members["kind"] ?: stat.members["mediaType"])?.toString()
+                            if (kind == "audio" && stat.type == "outbound-rtp") { sent += (stat.members["bytesSent"] as? Number)?.toLong() ?: 0L; mic = (stat.members["audioLevel"] as? Number)?.toDouble() ?: mic }
+                            if (kind == "audio" && stat.type == "inbound-rtp") { received += (stat.members["bytesReceived"] as? Number)?.toLong() ?: 0L; remote = (stat.members["audioLevel"] as? Number)?.toDouble() ?: remote }
+                            if (kind == "audio" && stat.type == "media-source") mic = (stat.members["audioLevel"] as? Number)?.toDouble() ?: mic
+                        }
+                        diagnostics = diagnostics.copy(micLevel = mic, remoteLevel = remote, bytesSent = sent, bytesReceived = received)
+                        updateVoiceActivity(mic, remote)
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (now - lastDiagnosticsDispatchMs >= 1_000L) { lastDiagnosticsDispatchMs = now; onDiagnostics?.invoke(diagnostics) }
+                    } catch (error: Exception) {
+                        Log.e(TAG, "OPTIONAL_VOICE_STATS_DISABLED: VAD/stats failed; voice audio continues", error)
+                        statsHandler?.removeCallbacksAndMessages(null)
+                    }
                 }
-                diagnostics = diagnostics.copy(micLevel = mic, remoteLevel = remote, bytesSent = sent, bytesReceived = received)
-                updateVoiceActivity(mic, remote)
-                val now = android.os.SystemClock.elapsedRealtime()
-                if (now - lastDiagnosticsDispatchMs >= 1_000L) { lastDiagnosticsDispatchMs = now; onDiagnostics?.invoke(diagnostics) }
+            } catch (error: Exception) {
+                Log.e(TAG, "OPTIONAL_VOICE_STATS_DISABLED: getStats failed; voice audio continues", error)
+                statsHandler?.removeCallbacksAndMessages(null)
+                return
             }
             statsHandler?.postDelayed(this, 200L)
         }

@@ -166,6 +166,8 @@ class MainActivity : ComponentActivity() {
     private val hostDpadState = DpadStateMachine()
     private var dpadDuplicateDrops = 0L
     private var activeSessionId = "none"
+    private var sessionGeneration = 0L
+    private var activeJoinGeneration = -1L
     private val mainHandler = Handler(Looper.getMainLooper())
     private var backendUnavailableLogged = false
     private var controllerWindowStart = android.os.SystemClock.elapsedRealtime()
@@ -418,7 +420,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.2.1", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.2.2", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -489,7 +491,6 @@ class MainActivity : ComponentActivity() {
                 onRelease = { view -> releaseRenderer(view, "AndroidView onRelease") }
             )
             if (remoteTrack == null) Text(clientStatus, modifier = Modifier.align(Alignment.Center))
-            SpeakingOverlay()
         }
     }
 
@@ -499,7 +500,6 @@ class MainActivity : ComponentActivity() {
             Text(hostRoomCode, color = Color.White, fontWeight = FontWeight.Black, fontSize = 42.sp, letterSpacing = 7.sp)
             Text(hostStatus, color = mutedText)
         }
-        SpeakingOverlay()
     }
 
     @Composable private fun PreGameReadiness() {
@@ -773,7 +773,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.2.1")
+                SettingInfo("Version", "Droid Link 1.2.2")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -808,25 +808,6 @@ class MainActivity : ComponentActivity() {
         Text(status, color = if (active) neonGreen else mutedText, fontSize = 11.sp, textAlign = TextAlign.End)
     }
 
-    @Composable private fun SpeakingOverlay() {
-        val local = if (mode == "host") hostPlayer else joinerPlayer
-        val remote = if (mode == "host") joinerPlayer else hostPlayer
-        val speakers = buildList {
-            if (voiceChatEnabled && localSpeaking) add(local.displayName)
-            if (voiceChatEnabled && remoteSpeaking) add(remote.displayName)
-        }
-        if (speakers.isEmpty()) return
-        Column(Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            speakers.forEach { name ->
-                Row(Modifier.background(Color(0xDE080B08), RoundedCornerShape(18.dp)).border(1.dp, neonGreen.copy(alpha = .7f), RoundedCornerShape(18.dp)).padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("🔊", color = neonGreen, fontSize = 13.sp)
-                    Spacer(Modifier.width(7.dp))
-                    Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                }
-            }
-        }
-    }
-
     @Composable private fun StatSection(title: String, content: @Composable ColumnScope.() -> Unit) = Column(Modifier.fillMaxWidth().background(panelBlack, RoundedCornerShape(12.dp)).border(1.dp, Color(0xFF244324), RoundedCornerShape(12.dp)).padding(13.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) { Text(title, color = neonGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp, letterSpacing = 2.sp); content() }
 
     @Composable private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) = StatSection(title, content)
@@ -850,12 +831,27 @@ class MainActivity : ComponentActivity() {
 
     private fun effectiveDisplayName(host: Boolean): String = DisplayNamePolicy.effective(localDisplayName, host)
 
-    private fun listenForPlayerMetadata(code: String) {
+    private fun listenForPlayerMetadata(code: String, generation: Long = sessionGeneration) {
         firebase.listenForPlayers(code, { players -> runOnUiThread {
-            players.firstOrNull { it.role == "host" }?.let { hostPlayer = it.copy(speaking = hostPlayer.speaking) }
-            players.firstOrNull { it.role == "joiner" }?.let { joinerPlayer = it.copy(speaking = joinerPlayer.speaking) }
-            if (mode == "client" && !joinSessionState.showsActiveSession && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
-        } }, { Log.e(TAG, "Player metadata listener failed: $it") })
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("player metadata", generation); return@runOnUiThread }
+            runCatching {
+                players.firstOrNull { it.role == "host" }?.let { hostPlayer = it.copy(speaking = hostPlayer.speaking) }
+                players.firstOrNull { it.role == "joiner" }?.let { joinerPlayer = it.copy(speaking = joinerPlayer.speaking) }
+                if (hostPlayer.displayName.isBlank()) hostPlayer = hostPlayer.copy(displayName = "Player 1")
+                if (joinerPlayer.displayName.isBlank()) joinerPlayer = joinerPlayer.copy(displayName = "Player 2")
+                if (mode == "client" && !joinSessionState.showsActiveSession && hostPlayer.sessionId == code) clientStatus = "Connecting to ${hostPlayer.displayName}"
+                Log.d(TAG, "USERNAME_READY: host=${hostPlayer.displayName} joiner=${joinerPlayer.displayName}")
+            }.onFailure { error ->
+                hostPlayer = hostPlayer.copy(displayName = hostPlayer.displayName.ifBlank { "Player 1" })
+                joinerPlayer = joinerPlayer.copy(displayName = joinerPlayer.displayName.ifBlank { "Player 2" })
+                Log.e(TAG, "USERNAME_FALLBACK: optional metadata processing failed; continuing session", error)
+            }
+        } }, { error -> runOnUiThread {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("player metadata failure", generation); return@runOnUiThread }
+            hostPlayer = hostPlayer.copy(displayName = hostPlayer.displayName.ifBlank { "Player 1" })
+            joinerPlayer = joinerPlayer.copy(displayName = joinerPlayer.displayName.ifBlank { "Player 2" })
+            Log.e(TAG, "USERNAME_FALLBACK: $error; continuing core session")
+        } })
     }
 
     private fun updateLocalPlayerVoice(enabled: Boolean) {
@@ -863,6 +859,19 @@ class MainActivity : ComponentActivity() {
         val role = if (mode == "host") "host" else "joiner"
         firebase.updatePlayerState(activeSessionId, role, voiceEnabled = enabled)
         if (mode == "host") hostPlayer = hostPlayer.copy(voiceEnabled = enabled) else joinerPlayer = joinerPlayer.copy(voiceEnabled = enabled)
+    }
+
+    private fun beginSessionGeneration(role: String): Long {
+        sessionGeneration++
+        activeJoinGeneration = -1L
+        Log.d(TAG, "SESSION_${role.uppercase()}_STARTED: generation=$sessionGeneration")
+        return sessionGeneration
+    }
+
+    private fun isCurrentSession(generation: Long, code: String): Boolean = generation == sessionGeneration && activeSessionId == code
+
+    private fun staleSessionCallback(source: String, generation: Long) {
+        Log.w(TAG, "STALE_SESSION_CALLBACK_DROPPED: source=$source callbackGeneration=$generation activeGeneration=$sessionGeneration")
     }
 
     private fun uiFeedback(view: android.view.View, success: Boolean = false) {
@@ -920,14 +929,17 @@ class MainActivity : ComponentActivity() {
 
     private fun setupVoiceSignaling(code: String, isHost: Boolean) {
         if (voiceSignalingReady || activeSessionId != code) return
+        val generation = sessionGeneration
         voiceSignalingReady = true; voiceHostRole = isHost
-        voiceRtc.onStatus = { status -> runOnUiThread { voiceStatus = status.removePrefix("VOICE_").replace('_', ' ') } }
-        voiceRtc.onDiagnostics = { value -> runOnUiThread { voiceDiagnostics = value } }
+        voiceRtc.onStatus = { status -> runOnUiThread { if (isCurrentSession(generation, code)) voiceStatus = status.removePrefix("VOICE_").replace('_', ' ') else staleSessionCallback("voice status", generation) } }
+        voiceRtc.onDiagnostics = { value -> runOnUiThread { if (isCurrentSession(generation, code)) voiceDiagnostics = value else staleSessionCallback("voice diagnostics", generation) } }
         voiceRtc.onLocalSpeakingChanged = { speaking -> runOnUiThread {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("local speaking", generation); return@runOnUiThread }
             localSpeaking = speaking
             if (isHost) hostPlayer = hostPlayer.copy(speaking = speaking) else joinerPlayer = joinerPlayer.copy(speaking = speaking)
         } }
         voiceRtc.onRemoteSpeakingChanged = { speaking -> runOnUiThread {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("remote speaking", generation); return@runOnUiThread }
             remoteSpeaking = speaking
             if (isHost) joinerPlayer = joinerPlayer.copy(speaking = speaking) else hostPlayer = hostPlayer.copy(speaking = speaking)
         } }
@@ -955,9 +967,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun ensureVoiceReady(onReady: () -> Unit) {
+        val generation = sessionGeneration
+        val code = activeSessionId
         voiceRtc.initialize { result ->
-            result.onSuccess { runOnUiThread { voiceRtc.setRemoteVoiceEnabled(voiceChatEnabled && remoteVoiceEnabled); voiceRtc.setRemoteVolume(voiceVolume); onReady() } }
-                .onFailure { error -> runOnUiThread { voiceStatus = "ERROR: ${error.message}"; Log.e(TAG, "VOICE initialization failed", error) } }
+            result.onSuccess { runOnUiThread {
+                if (!isCurrentSession(generation, code) || !sessionActive) { staleSessionCallback("voice ready", generation); return@runOnUiThread }
+                voiceRtc.setRemoteVoiceEnabled(voiceChatEnabled && remoteVoiceEnabled); voiceRtc.setRemoteVolume(voiceVolume)
+                Log.d(TAG, "VOICE_READY")
+                onReady()
+            } }
+                .onFailure { error -> runOnUiThread { if (isCurrentSession(generation, code)) { voiceStatus = "ERROR: ${error.message}"; Log.e(TAG, "Voice optional initialization failed; core session continues", error) } else staleSessionCallback("voice failure", generation) } }
         }
     }
 
@@ -1047,15 +1066,17 @@ class MainActivity : ComponentActivity() {
             return
         }
         cleanupSession(deleteHostRoom = true)
+        val generation = beginSessionGeneration("host")
         sessionStarting = true; hostStatus = "Creating room..."
         audioStatus = "Preparing playback audio capture..."
         firebase.createRoom({ code ->
+            if (generation != sessionGeneration) { staleSessionCallback("create room", generation); return@createRoom }
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
             hostPlayer = SessionPlayer(code, effectiveDisplayName(true), 1, "host", false, false)
             joinerPlayer = SessionPlayer(code, "Player 2", 2, "joiner", false, false)
             firebase.publishPlayer(code, "host", hostPlayer.displayName, 1, false, false) { Log.e(TAG, "Host player metadata failed: $it") }
-            listenForPlayerMetadata(code)
+            listenForPlayerMetadata(code, generation)
             controllerBackend.close()
             controllerBackend = ControllerBackendSelector.select()
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
@@ -1121,45 +1142,55 @@ class MainActivity : ComponentActivity() {
         if (code.length != 6) { clientStatus = "Enter a 6-digit room code"; return }
         if (sessionStarting) return
         cleanupSession(deleteHostRoom = true)
+        val generation = beginSessionGeneration("join")
         activeSessionId = code
         sessionStarting = true
         transitionJoinState(JoinSessionState.LookingForRoom, "join button pressed", "Looking for room...")
         firebase.joinRoom(code, {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("join room success", generation); return@joinRoom }
             transitionJoinState(JoinSessionState.Negotiating, "room found", "Loading WebRTC offer...")
             joinerPlayer = SessionPlayer(code, effectiveDisplayName(false), 2, "joiner", false, false)
             firebase.publishPlayer(code, "joiner", joinerPlayer.displayName, 2, false, false) { Log.e(TAG, "Joiner player metadata failed: $it") }
-            listenForPlayerMetadata(code)
-            firebase.getOffer(code, { offer -> prepareJoinPeer(code, offer) }, { transitionJoinFailure("Offer load failed: $it") })
-        }, { transitionJoinFailure("Join failed: $it") })
+            listenForPlayerMetadata(code, generation)
+            firebase.getOffer(code, { offer -> if (isCurrentSession(generation, code)) prepareJoinPeer(code, offer, generation) else staleSessionCallback("offer loaded", generation) }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Offer load failed: $it") else staleSessionCallback("offer failure", generation) })
+        }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Join failed: $it") else staleSessionCallback("join failure", generation) })
     }
 
-    private fun prepareJoinPeer(code: String, offer: String) {
+    private fun prepareJoinPeer(code: String, offer: String, generation: Long) {
         audioStatus = "Waiting for remote game audio..."
         clientRtc.initialize()
-        clientRtc.onAudioStatus = { status -> runOnUiThread { audioStatus = status } }
+        clientRtc.onAudioStatus = { status -> runOnUiThread { if (isCurrentSession(generation, code)) audioStatus = status else staleSessionCallback("game audio", generation) } }
         clientRtc.onControlMessageReceived = ::handleControlMessage
         clientRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("data channel", generation); return@runOnUiThread }
             if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
             if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) Log.w(TAG, "Client DataChannel closed: $label")
         } }
-        clientRtc.onDiagnostics = { update -> runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) } }
+        clientRtc.onDiagnostics = { update -> runOnUiThread { if (isCurrentSession(generation, code)) betaDiagnostics = mergeControllerDiagnostics(update) else staleSessionCallback("stats diagnostics", generation) } }
         clientRtc.onRemoteVideoTrack = { track -> Log.d(TAG, "Remote video track stored for renderer"); runOnUiThread {
-            if (activeSessionId != code || mode != "client") { Log.w(TAG, "JOIN_CRASH_GUARD: ignored remote track for disposed/stale session room=$code active=$activeSessionId mode=$mode"); return@runOnUiThread }
+            if (!isCurrentSession(generation, code) || mode != "client") { staleSessionCallback("remote video track", generation); return@runOnUiThread }
             remoteTrack = track
             if (joinSessionState.showsActiveSession) clientStatus = "Connected - video track received"
         } }
         clientRtc.onConnectionStateChanged = { state -> runOnUiThread {
-            if (activeSessionId != code || mode != "client") { Log.w(TAG, "JOIN_CRASH_GUARD: ignored PeerConnection callback state=$state room=$code active=$activeSessionId mode=$mode"); return@runOnUiThread }
+            if (!isCurrentSession(generation, code) || mode != "client") { staleSessionCallback("PeerConnection $state", generation); return@runOnUiThread }
             clientPeerState = state
             when (state) {
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
-                    val entered = transitionJoinState(JoinSessionState.Connected, "PeerConnection CONNECTED", if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing")
-                    if (!entered) return@runOnUiThread
                     clientControlActive = true; sessionStarting = false
+                    transitionJoinState(JoinSessionState.Connected, "PeerConnection CONNECTED", if (remoteTrack == null) "Connected - waiting for video..." else "Connected - video playing")
+                    if (activeJoinGeneration == generation) {
+                        Log.d(TAG, "JOIN_CONNECTED_INIT_ALREADY_DONE: generation=$generation")
+                        return@runOnUiThread
+                    }
+                    Log.d(TAG, "JOIN_CONNECTED_INIT_START: generation=$generation")
+                    activeJoinGeneration = generation
                     firebase.updatePlayerState(code, "joiner", connected = true)
                     if (voiceChatStartEnabled) updateVoiceChatEnabled(true)
                     else Log.d(TAG, "VOICE_START_SKIPPED: pre-session setting OFF; microphone and voice WebRTC remain inactive")
+                    Log.d(TAG, "SPEAKING_UI_DISABLED_FOR_STABILITY")
+                    Log.d(TAG, "JOIN_SESSION_STABLE: generation=$generation")
                     uiFeedback(window.decorView, success = true)
                     mainHandler.postDelayed({
                         if (joinSessionState.showsActiveSession && remoteTrack == null) {
@@ -1187,18 +1218,20 @@ class MainActivity : ComponentActivity() {
                 else -> if (!joinSessionState.showsActiveSession) clientStatus = connectionText(state)
             }
         } }
-        clientRtc.onIceCandidateReady = { candidate -> firebase.saveIceCandidate(code, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE save error: $error" else Log.w(TAG, "Late ICE save error ignored after connection: $error") } } }
+        clientRtc.onIceCandidateReady = { candidate -> if (isCurrentSession(generation, code)) firebase.saveIceCandidate(code, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE save error: $error" else Log.w(TAG, "Late ICE save error ignored after connection: $error") } } else staleSessionCallback("local ICE", generation) }
         transitionJoinState(JoinSessionState.Negotiating, "preparing PeerConnection", "Loading TURN credentials...")
         clientRtc.createPeerConnection(false, onSuccess = {
+            if (!isCurrentSession(generation, code)) { staleSessionCallback("PeerConnection created", generation); return@createPeerConnection }
             firebase.listenForIceCandidates(code, "host", { c, mid, line -> clientRtc.addIceCandidate(c, mid, line) }, { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE listen error: $error" else Log.w(TAG, "Late ICE listener error ignored after connection: $error") } })
             clientRtc.setRemoteOffer(offer, {
+                if (!isCurrentSession(generation, code)) { staleSessionCallback("remote description", generation); return@setRemoteOffer }
                 transitionJoinState(JoinSessionState.Negotiating, "remote offer set", "Offer found; creating answer...")
                 clientRtc.createAnswer({ answer ->
                     Log.d(TAG, "Answer created")
                     firebase.saveAnswer(code, answer, { transitionJoinState(JoinSessionState.Connecting, "local answer stored", "WebRTC answer sent - connecting...") }, { transitionJoinFailure("Answer save failed: $it") })
                 }, { transitionJoinFailure("Answer error: $it") })
             }, { transitionJoinFailure("Offer error: $it") })
-        }, onError = { transitionJoinFailure("PeerConnection error: $it") })
+        }, onError = { if (isCurrentSession(generation, code)) transitionJoinFailure("PeerConnection error: $it") else staleSessionCallback("PeerConnection error", generation) })
     }
 
     private fun transitionJoinState(next: JoinSessionState, reason: String, status: String): Boolean {
@@ -1569,6 +1602,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
+        sessionGeneration++
+        activeJoinGeneration = -1L
         sendNeutralReset("session cleanup")
         resetRemoteInput("session cleanup")
         if (activeSessionId != "none" && mode == "client") firebase.removePlayer(activeSessionId, "joiner")
