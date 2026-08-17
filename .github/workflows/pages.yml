@@ -1,12 +1,14 @@
-name: Deploy DroidLink download page
+name: Deploy DroidLink website
 
 on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
-      - '.github/workflows/pages.yml'
+      - "docs/**"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
+  release:
+    types: [published, edited, released]
 
 permissions:
   contents: read
@@ -24,12 +26,13 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/checkout@v4
+      - name: Refresh public GitHub release data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/sync-releases.mjs
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: docs
       - name: Deploy to GitHub Pages

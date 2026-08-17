@@ -1,67 +1,107 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DroidLink Downloads</title>
-  <meta name="description" content="Download the latest DroidLink APK and view previous releases." />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top, #17305c 0, #0b1220 38%, #070b12 100%); color: #f7f9fc; }
-    main { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 72px 0; }
-    .card { background: rgba(14, 22, 38, .84); border: 1px solid rgba(255,255,255,.10); border-radius: 26px; padding: 32px; box-shadow: 0 24px 80px rgba(0,0,0,.35); backdrop-filter: blur(14px); }
-    .badge { display: inline-block; padding: 7px 11px; border-radius: 999px; background: rgba(93, 156, 255, .14); border: 1px solid rgba(123, 176, 255, .28); color: #b9d5ff; font-size: 13px; font-weight: 700; }
-    h1 { font-size: clamp(42px, 9vw, 72px); line-height: .95; margin: 18px 0 14px; letter-spacing: -3px; }
-    .lead { color: #aebbd0; line-height: 1.7; font-size: 17px; margin-bottom: 28px; }
-    .version { margin: 22px 0 10px; font-size: 14px; color: #8da0bc; }
-    .version strong { color: #fff; font-size: 18px; }
-    .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
-    a.button { text-decoration: none; display: inline-flex; align-items: center; justify-content: center; min-height: 50px; padding: 0 20px; border-radius: 14px; font-weight: 800; }
-    .primary { background: #f7f9fc; color: #0a1020; }
-    .secondary { border: 1px solid rgba(255,255,255,.15); color: #f7f9fc; background: rgba(255,255,255,.04); }
-    .status { margin-top: 16px; font-size: 14px; color: #91a1b9; }
-    footer { text-align: center; color: #67758a; margin-top: 20px; font-size: 13px; }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050705">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://api.github.com; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests">
+  <meta name="description" content="DroidLink is low-latency Android-to-Android screen streaming, game audio, and controller sharing.">
+  <link rel="canonical" href="https://aihoward.github.io/DroidLink/">
+  <meta property="og:title" content="DroidLink — Android remote gaming">
+  <meta property="og:description" content="Low-latency Android-to-Android screen streaming and controller sharing.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://aihoward.github.io/DroidLink/">
+  <meta property="og:image" content="assets/droidlink-hero.jpg">
+  <meta property="og:image:alt" content="Two Android gaming handhelds connected through DroidLink">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="DroidLink — Android remote gaming">
+  <meta name="twitter:description" content="Low-latency Android-to-Android screen streaming and controller sharing.">
+  <meta name="twitter:image" content="assets/droidlink-hero.jpg">
+  <title>DroidLink — Android remote gaming</title>
+  <link rel="icon" href="assets/droidlink-logo.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
 </head>
 <body>
-  <main>
-    <section class="card">
-      <span class="badge">Android • Beta</span>
-      <h1>DroidLink</h1>
-      <p class="lead">Android-to-Android remote screen streaming built for low-latency connections. Download the newest APK or jump to the full release history.</p>
-      <div class="version">Latest release: <strong id="version">Checking…</strong></div>
-      <div class="actions">
-        <a id="download" class="button primary" href="https://github.com/Aihoward/DroidLink/releases" aria-disabled="true">Download latest APK</a>
-        <a class="button secondary" href="https://github.com/Aihoward/DroidLink/releases">All versions</a>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#home" aria-label="DroidLink home">
+      <img src="assets/droidlink-logo.png" width="42" height="42" alt="">
+      <span>DROIDLINK</span>
+    </a>
+    <button class="menu-toggle" aria-expanded="false" aria-controls="site-nav">Menu</button>
+    <nav id="site-nav" aria-label="Main navigation">
+      <a href="#home">Home</a><a href="#download">Download</a><a href="#releases">Releases</a><a href="#about">About</a>
+      <a href="https://github.com/Aihoward/DroidLink" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="home">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="status-dot"></span> Android remote gaming</div>
+        <h1>Play together.<br><span>Anywhere.</span></h1>
+        <p class="hero-lede">Low-latency Android-to-Android screen streaming, game audio, and controller sharing—built for real gameplay.</p>
+        <div class="hero-actions">
+          <a class="button button-primary latest-download disabled" href="https://github.com/Aihoward/DroidLink/releases" aria-disabled="true">Checking latest APK…</a>
+          <a class="button button-secondary" href="#releases">View releases</a>
+        </div>
+        <div class="release-summary" aria-live="polite">
+          <span><small>VERSION</small><strong id="hero-version">Checking…</strong></span>
+          <span><small>STATUS</small><strong id="hero-status">—</strong></span>
+          <span><small>RELEASED</small><strong id="hero-date">—</strong></span>
+          <span><small>APK SIZE</small><strong id="hero-size">—</strong></span>
+        </div>
       </div>
-      <div id="status" class="status">Looking for the newest GitHub release…</div>
+      <div class="hero-art">
+        <img src="assets/droidlink-hero.jpg" width="1800" height="1012" alt="Two generic Android gaming handhelds linked by a green DroidLink streaming connection">
+        <div class="signal-chip"><span class="status-dot"></span> STREAM &amp; CONTROL</div>
+      </div>
     </section>
-    <footer>Official DroidLink downloads</footer>
+
+    <section class="section" id="download">
+      <div class="section-heading"><span>01 / DOWNLOAD</span><h2>Get DroidLink</h2><p>GitHub Releases remains the source of truth. This page always links directly to the APK hosted by GitHub.</p></div>
+      <div id="latest-release" class="featured-release skeleton-card" aria-live="polite">
+        <div><span class="badge">CHECKING GITHUB</span><h3>Finding the latest stable release…</h3><p>Release details will appear here.</p></div>
+      </div>
+      <div id="beta-release" class="beta-callout" hidden></div>
+    </section>
+
+    <section class="section" id="features">
+      <div class="section-heading"><span>02 / BUILT FOR PLAY</span><h2>The link between your Android devices</h2></div>
+      <div class="feature-grid">
+        <article><b>01</b><h3>Android-to-Android</h3><p>Stream a host Android screen to a second Android phone, tablet, or handheld.</p></article>
+        <article><b>02</b><h3>Low-latency controls</h3><p>Forward physical controller input to the host over a WebRTC DataChannel.</p></article>
+        <article><b>03</b><h3>Game audio</h3><p>Carry compatible game and device audio alongside the video stream.</p></article>
+        <article><b>04</b><h3>Direct sessions</h3><p>Host or join with a room code, using direct P2P when possible and TURN fallback when needed.</p></article>
+        <article><b>05</b><h3>Adaptive streaming</h3><p>WebRTC adjusts quality to changing device and network conditions.</p></article>
+        <article><b>06</b><h3>Live diagnostics</h3><p>Inspect route, latency, video, audio, and controller performance inside the app.</p></article>
+      </div>
+    </section>
+
+    <section class="section" id="releases">
+      <div class="section-heading"><span>03 / RELEASES</span><h2>Release history</h2><p>Stable and experimental builds are labeled from their GitHub release status.</p></div>
+      <div id="release-list" class="release-list" aria-live="polite"><p class="loading">Loading public GitHub releases…</p></div>
+      <div class="center"><button id="show-more" class="button button-secondary" hidden>Show older releases</button></div>
+    </section>
+
+    <section class="section install-section" id="install">
+      <div class="section-heading"><span>04 / INSTALL</span><h2>Install on Android</h2></div>
+      <ol class="install-steps">
+        <li><span>1</span><div><h3>Download</h3><p>Download the DroidLink APK from this site or GitHub Releases.</p></div></li>
+        <li><span>2</span><div><h3>Open the APK</h3><p>Open it from your browser download or Android file manager.</p></div></li>
+        <li><span>3</span><div><h3>Allow this source</h3><p>If Android asks, allow installation from that browser or file manager only.</p></div></li>
+        <li><span>4</span><div><h3>Install and launch</h3><p>Complete installation, then open DroidLink on both devices.</p></div></li>
+      </ol>
+      <p class="safety-note">DroidLink never asks you to disable Android security globally or bypass Play Protect.</p>
+    </section>
+
+    <section class="section about-grid" id="about">
+      <div><div class="section-heading"><span>05 / ABOUT</span><h2>Independent. Open source. Tested on real devices.</h2></div><p>DroidLink is an independently created Android project built through AI-assisted development and iterative physical-device testing. It is not an official product of OpenAI, Google, Android, or any device manufacturer.</p></div>
+      <div class="github-card"><img src="assets/droidlink-logo.png" width="88" height="88" alt="DroidLink controller-link logo"><h3>Explore the project</h3><p>View the MIT-licensed source, report reproducible bugs, or browse every release on GitHub.</p><div class="card-actions"><a href="https://github.com/Aihoward/DroidLink" target="_blank" rel="noopener noreferrer">Repository</a><a href="https://github.com/Aihoward/DroidLink/releases" target="_blank" rel="noopener noreferrer">Releases</a><a href="https://github.com/Aihoward/DroidLink/issues" target="_blank" rel="noopener noreferrer">Issues</a></div></div>
+    </section>
   </main>
 
-  <script>
-    const api = 'https://api.github.com/repos/Aihoward/DroidLink/releases/latest';
-    fetch(api, { headers: { 'Accept': 'application/vnd.github+json' } })
-      .then(r => { if (!r.ok) throw new Error('No release yet'); return r.json(); })
-      .then(release => {
-        document.getElementById('version').textContent = release.tag_name || release.name || 'Latest';
-        const apk = (release.assets || []).find(a => a.name.toLowerCase().endsWith('.apk'));
-        const button = document.getElementById('download');
-        const status = document.getElementById('status');
-        if (apk) {
-          button.href = apk.browser_download_url;
-          button.removeAttribute('aria-disabled');
-          status.textContent = apk.name;
-        } else {
-          button.href = release.html_url;
-          status.textContent = 'Release found, but no APK asset is attached yet.';
-        }
-      })
-      .catch(() => {
-        document.getElementById('version').textContent = 'No release yet';
-        document.getElementById('status').textContent = 'Your first APK release will appear here automatically.';
-      });
-  </script>
+  <footer><a class="brand" href="#home"><img src="assets/droidlink-logo.png" width="36" height="36" alt=""><span>DROIDLINK</span></a><p>No ads. No analytics. No tracking cookies.</p><p>© 2026 DroidLink · <a href="https://github.com/Aihoward/DroidLink/blob/main/LICENSE">MIT License</a></p></footer>
 </body>
 </html>
