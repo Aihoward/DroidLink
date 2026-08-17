@@ -42,7 +42,6 @@ class WebRtcManager(private val context: Context) {
     private var lastPacketsLost = 0L
     private var remoteVideoTrack: VideoTrack? = null
     private var remoteGameAudioTrack: AudioTrack? = null
-    private var remoteFrameSink: VideoSink? = null
     private var localAudioSource: AudioSource? = null
     private var localAudioTrack: AudioTrack? = null
     private var statsThread: HandlerThread? = null
@@ -198,32 +197,13 @@ class WebRtcManager(private val context: Context) {
             Log.d(TAG, "Duplicate remote video callback ignored: callback=$callback id=${track.id()}")
             return
         }
-        remoteVideoTrack?.let { old -> remoteFrameSink?.let { sink -> try { old.removeSink(sink) } catch (_: Exception) {} } }
         remoteVideoTrack = track
         track.setEnabled(true)
         track.setShouldReceive(true)
         Log.d(TAG, "REMOTE VIDEO TRACK RECEIVED: callback=$callback id=${track.id()} kind=${track.kind()} state=${track.state()}")
         Log.d(TAG, "REMOTE VIDEO TRACK ENABLED: enabled=${track.enabled()} shouldReceive=${track.shouldReceive()}")
-        var firstFrame = true
-        var frameWindowStart = android.os.SystemClock.elapsedRealtime()
-        var frameWindowCount = 0
-        val sink = VideoSink { frame ->
-            frameWindowCount++
-            if (firstFrame) {
-                firstFrame = false
-                Log.d(TAG, "FIRST REMOTE FRAME RECEIVED: ${frame.buffer.width}x${frame.buffer.height} rotation=${frame.rotation} timestampNs=${frame.timestampNs}")
-            }
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - frameWindowStart >= 5_000L) {
-                val fps = frameWindowCount * 1_000.0 / (now - frameWindowStart)
-                Log.d(TAG, "REMOTE VIDEO FPS: ${format(fps)}")
-                updateDiagnostics { copy(fps = fps, resolution = "${frame.buffer.width}×${frame.buffer.height}") }
-                frameWindowStart = now; frameWindowCount = 0
-            }
-        }
-        remoteFrameSink = sink
-        track.addSink(sink)
-        Log.d(TAG, "Remote diagnostic video sink attached: id=${track.id()}")
+        // Keep decoded frames on the direct VideoTrack -> SurfaceViewRenderer path. Runtime
+        // decode FPS/resolution/drop metrics come from RTCStats instead of a second per-frame sink.
         onRemoteVideoTrack?.invoke(track)
     }
 
@@ -239,7 +219,7 @@ class WebRtcManager(private val context: Context) {
                 buffer ?: return
                 val bytes = ByteArray(buffer.data.remaining()); buffer.data.get(bytes)
                 String(bytes, Charsets.UTF_8).let {
-                    if (!it.startsWith("AXIS|") || ++axisReceiveLogCounter % 120 == 1) Log.d(TAG, "CONTROL RECEIVED: $it")
+                    if (++axisReceiveLogCounter % 120 == 1) Log.d(TAG, "CONTROL_RECEIVE_SUMMARY: packets=$axisReceiveLogCounter channel=${channel.label()} type=${it.substringBefore('|')}")
                     onControlMessageReceived?.invoke(it)
                 }
             }
@@ -562,8 +542,7 @@ class WebRtcManager(private val context: Context) {
         controlBufferedBytes = channel.bufferedAmount()
         if (realtimeAnalog) analogQueueDepth = if (controlBufferedBytes > 0L) 1 else 0
         else digitalQueueDepth = if (controlBufferedBytes > 0L) 1 else 0
-        if (!realtimeAnalog || axisSendLogCounter % 120 == 0) Log.d(TAG, "CONTROL_SEND_MS: ${sendMicros / 1000.0} channel=${channel.label()} bufferedBytes=${channel.bufferedAmount()}")
-        if (!message.startsWith("AXIS|") || ++axisSendLogCounter % 120 == 1) Log.d(TAG, "CONTROL SENT: $message | success=$sent")
+        if (++axisSendLogCounter % 120 == 1) Log.d(TAG, "CONTROL_SEND_SUMMARY: packets=$axisSendLogCounter channel=${channel.label()} type=${message.substringBefore('|')} success=$sent sendMs=${sendMicros / 1000.0} bufferedBytes=${channel.bufferedAmount()}")
         return sent
     }
 
@@ -582,10 +561,12 @@ class WebRtcManager(private val context: Context) {
             override fun onCapturerStopped() { Log.d(TAG, "Screen capturer stopped"); real.onCapturerStopped() }
             override fun onFrameCaptured(frame: VideoFrame) {
                 frames++
-                val now = android.os.SystemClock.elapsedRealtime()
-                if (captureWindowStartMs == 0L) captureWindowStartMs = now
                 captureWindowFrames++
-                if (now - captureWindowStartMs >= 5_000L) {
+                // Sampling the clock is sufficient for this five-second diagnostic window and
+                // avoids a system-clock call on every captured frame.
+                val now = if (frames == 1 || frames % 30 == 0) android.os.SystemClock.elapsedRealtime() else 0L
+                if (captureWindowStartMs == 0L && now != 0L) captureWindowStartMs = now
+                if (now != 0L && now - captureWindowStartMs >= 5_000L) {
                     val captureFps = captureWindowFrames * 1_000.0 / (now - captureWindowStartMs)
                     updateDiagnostics { copy(captureFps = captureFps) }
                     Log.d(TAG, "VIDEO_CAPTURE_FPS: ${format(captureFps)}")
@@ -746,14 +727,13 @@ class WebRtcManager(private val context: Context) {
         audioStreaming.stop()
         try { localAudioTrack?.dispose() } catch (_: Exception) {}
         try { localAudioSource?.dispose() } catch (_: Exception) {}
-        remoteVideoTrack?.let { track -> remoteFrameSink?.let { sink -> try { track.removeSink(sink) } catch (_: Exception) {} } }
         try { dataChannel?.unregisterObserver(); dataChannel?.close(); dataChannel?.dispose() } catch (_: Exception) {}
         try { axisDataChannel?.unregisterObserver(); axisDataChannel?.close(); axisDataChannel?.dispose() } catch (_: Exception) {}
         try { peer?.close(); peer?.dispose() } catch (_: Exception) {}
         try { factory?.dispose() } catch (_: Exception) {}
         try { audioDeviceModule?.release() } catch (_: Exception) {}
         screenCapturer = null; textureHelper = null; screenTrack = null; screenSource = null; videoSender = null
-        remoteVideoTrack = null; remoteFrameSink = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
+        remoteVideoTrack = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
         audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null
         synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
         diagnostics = BetaDiagnostics()

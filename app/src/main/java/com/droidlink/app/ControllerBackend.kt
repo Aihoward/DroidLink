@@ -64,6 +64,7 @@ class UinputVirtualGamepadBackend : ControllerBackend {
     override val status = ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE
     override val capabilityDescription = DEVICE_NAME
     private val handle: Long = nativeCreate(DEVICE_NAME).also { check(it >= 0) { "native uinput create failed errno=${-it}" } }
+    private var digitalWriteCounter = 0
 
     init {
         Log.d(TAG, "UINPUT_PERMISSION: granted")
@@ -93,8 +94,7 @@ class UinputVirtualGamepadBackend : ControllerBackend {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
         check(nativeKey(handle, linux, value != 0))
         val writeMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
-        Log.d(TAG, "UINPUT_EVENT_WRITTEN: logical=${logical.displayName} evKey=$linux value=$value")
-        Log.d(TAG, "UINPUT_WRITE_MS: ${writeMicros / 1000.0} type=digital")
+        if (++digitalWriteCounter % 64 == 1) Log.d(TAG, "UINPUT_DIGITAL_SUMMARY: writes=$digitalWriteCounter logical=${logical.displayName} value=$value writeMs=${writeMicros / 1000.0}")
         true
     } catch (error: Throwable) { Log.e(TAG, "CONTROL_INJECTION_FAILED: ${error.message}", error); false }
 

@@ -156,11 +156,15 @@ class MainActivity : ComponentActivity() {
     private var controllerWindowPackets = 0
     private var axisAckCounter = 0
     private var controlThreadLogCounter = 0
+    private var controllerAckLogCounter = 0
     private var lastControlRoundTripMs: Long? = null
     private var controllerLatencyTotalMs = 0L
     private var controllerLatencySamples = 0L
     private var controllerLatencyMaxMs = 0L
     private var latestControllerLatencyMs: Long? = null
+    private var latestControllerPacketAgeMs: Long? = null
+    private var controllerPacketAgeTotalMs = 0L
+    private var controllerPacketAgeSamples = 0L
     private val recentControllerLatencies = ArrayDeque<Long>()
     private var duplicateControlPacketsDropped = 0L
     private var outOfOrderControlPacketsDropped = 0L
@@ -389,7 +393,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.0.2", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.0.3", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -567,7 +571,7 @@ class MainActivity : ComponentActivity() {
                 diagnosticLine("Bottleneck", d.videoBottleneck)
             }
             StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
-            StatSection("CONTROLLER") { diagnosticLine("Player 2", d.player2Status); diagnosticLine("Latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—"); diagnosticLine("Packets/sec", "%.1f".format(d.controllerPacketsPerSecond)) }
+            StatSection("CONTROLLER") { diagnosticLine("Player 2", d.player2Status); diagnosticLine("Latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—"); diagnosticLine("Packet age", d.controllerPacketAgeMs?.let { "$it ms (avg ${d.averageControllerPacketAgeMs ?: it} ms)" } ?: "—"); diagnosticLine("Packets/sec", "%.1f".format(d.controllerPacketsPerSecond)) }
             StatSection("GAME AUDIO") {
                 diagnosticLine("Capture", friendlyAudioStatus()); diagnosticLine("RTP sent", "${d.gameAudioPacketsSent} packets / ${d.gameAudioBytesSent} bytes")
                 diagnosticLine("RTP received", "${d.gameAudioPacketsReceived} packets / ${d.gameAudioBytesReceived} bytes"); diagnosticLine("Playing", if (gameAudioEnabled) "Enabled" else "Disabled")
@@ -688,7 +692,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.0.2 Low Latency")
+                SettingInfo("Version", "Droid Link 1.0.3 Low Latency")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1044,7 +1048,7 @@ class MainActivity : ComponentActivity() {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
         handleControlMessageInternal(message)
         val elapsedMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
-        if (!message.startsWith("AXIS|") || ++controlThreadLogCounter % 120 == 1) Log.d(TAG, "CONTROL_THREAD_MS: ${elapsedMicros / 1000.0}")
+        if (++controlThreadLogCounter % 120 == 1) Log.d(TAG, "CONTROL_THREAD_SUMMARY: packets=$controlThreadLogCounter handlerMs=${elapsedMicros / 1000.0}")
     }
 
     private fun handleControlMessageInternal(message: String) {
@@ -1057,6 +1061,7 @@ class MainActivity : ComponentActivity() {
                 val injectMs = parts.getOrNull(3)?.toLongOrNull() ?: 0L
                 val captureMs = parts.getOrNull(4)?.toLongOrNull() ?: 0L
                 val estimatedEndToEnd = captureMs + roundTrip / 2L + injectMs
+                val packetAge = captureMs + roundTrip / 2L
                 lastControlRoundTripMs = roundTrip
                 latestControllerLatencyMs = estimatedEndToEnd
                 controllerLatencyTotalMs += estimatedEndToEnd
@@ -1064,10 +1069,8 @@ class MainActivity : ComponentActivity() {
                 controllerLatencyMaxMs = maxOf(controllerLatencyMaxMs, estimatedEndToEnd)
                 recentControllerLatencies.addLast(estimatedEndToEnd)
                 while (recentControllerLatencies.size > 128) recentControllerLatencies.removeFirst()
-                Log.d(TAG, "CONTROL_NETWORK_MS: ${roundTrip / 2L}")
-                Log.d(TAG, "CONTROL_TOTAL_LATENCY_MS: $estimatedEndToEnd")
-                Log.d(TAG, "CONTROL_PACKET_AGE_MS: ${captureMs + roundTrip / 2L}")
-                Log.d(TAG, "CONTROL LATENCY_MS: estimatedEndToEnd=$estimatedEndToEnd capture=$captureMs network=${roundTrip / 2L} inject=$injectMs roundTrip=$roundTrip")
+                recordControllerPacketAge(packetAge)
+                if (++controllerAckLogCounter % 20 == 1) Log.d(TAG, "CONTROL_LATENCY_SUMMARY: e2eMs=$estimatedEndToEnd packetAgeMs=$packetAge captureMs=$captureMs networkMs=${roundTrip / 2L} injectMs=$injectMs")
             }
             "KEY" -> {
                 val v3 = parts.size >= 10
@@ -1075,14 +1078,15 @@ class MainActivity : ComponentActivity() {
                 val sequence = parts.getOrNull(if (v2) 4 else 1)?.toLongOrNull() ?: return
                 val sentAt = parts.getOrNull(if (v2) 5 else 2)?.toLongOrNull() ?: return
                 val captureMs = if (v2) parts[6].toLongOrNull() ?: 0L else 0L
+                val senderRttMs = if (v3) parts[7].toLongOrNull() else null
                 val key = parts.getOrNull(if (v3) 8 else if (v2) 7 else 3)?.toIntOrNull() ?: return
                 val action = parts.getOrNull(if (v3) 9 else if (v2) 8 else 4) ?: return
                 val session = if (v2) parts[1] else activeSessionId
                 if (!acceptRemoteSequence("digital", session, sequence)) return
+                recordControllerPacketAge(ControllerTransportPolicy.estimatedPacketAgeMs(captureMs, senderRttMs))
                 val logical = ControllerMapping.logicalForAndroidKey(key)
                 if (logical != null) {
                     updateLogicalButton(logical, action == "DOWN")
-                    Log.d(TAG, "LOGICAL_CONTROL_EVENT: control=${logical.displayName} state=$action androidKey=$key linuxKey=${logical.linuxCode}")
                 }
                 val token = key
                 if (action == "DOWN" && !heldRemoteButtons.add(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
@@ -1106,9 +1110,7 @@ class MainActivity : ComponentActivity() {
                 val injected = if (action == "DOWN") controllerBackend.keyDown(context, key) else if (action == "UP") controllerBackend.keyUp(context, key) else false
                 val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                 hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
-                Log.d(TAG, "CONTROL_BUTTON_STATE: key=$key state=$action sequence=$sequence")
-                Log.d(TAG, "CONTROL_RECEIVE_TO_INJECT_MS: $injectMs")
-                if (injected) Log.d(TAG, "CONTROL INJECTED: key=$key action=$action injectMs=$injectMs") else logBackendUnavailableOnce()
+                if (!injected) logBackendUnavailableOnce()
             }
             "AXIS" -> {
                 val v3 = parts.size >= 16
@@ -1120,6 +1122,7 @@ class MainActivity : ComponentActivity() {
                 if (!acceptRemoteSequence("analog", session, sequence)) return
                 val senderRttMs = if (v3) parts[7].toLongOrNull() else null
                 val estimatedAgeMs = ControllerTransportPolicy.estimatedPacketAgeMs(captureMs, senderRttMs)
+                recordControllerPacketAge(estimatedAgeMs)
                 if (estimatedAgeMs > ControllerTransportPolicy.STALE_ANALOG_RTT_THRESHOLD_MS) {
                     staleAnalogPacketsDropped++
                     updateControllerDiagnostics { copy(controllerPacketAgeMs = estimatedAgeMs, droppedStaleAnalogPackets = staleAnalogPacketsDropped) }
@@ -1230,6 +1233,7 @@ class MainActivity : ComponentActivity() {
             controllerP95LatencyMs = current.controllerP95LatencyMs,
             controllerP50LatencyMs = current.controllerP50LatencyMs,
             controllerPacketAgeMs = current.controllerPacketAgeMs,
+            averageControllerPacketAgeMs = current.averageControllerPacketAgeMs,
             duplicateControlPacketsDropped = current.duplicateControlPacketsDropped,
             outOfOrderControlPacketsDropped = current.outOfOrderControlPacketsDropped,
             player2Status = current.player2Status,
@@ -1292,11 +1296,18 @@ class MainActivity : ComponentActivity() {
                     maxControllerLatencyMs = controllerLatencyMaxMs.takeIf { controllerLatencySamples > 0L },
                     controllerP95LatencyMs = p95,
                     controllerP50LatencyMs = p50,
-                    controllerPacketAgeMs = latestControllerLatencyMs
+                    controllerPacketAgeMs = latestControllerPacketAgeMs,
+                    averageControllerPacketAgeMs = if (controllerPacketAgeSamples == 0L) null else controllerPacketAgeTotalMs / controllerPacketAgeSamples
                 )
             }
             controllerWindowPackets = 0; controllerWindowStart = now
         }
+    }
+
+    private fun recordControllerPacketAge(ageMs: Long) {
+        latestControllerPacketAgeMs = ageMs
+        controllerPacketAgeTotalMs += ageMs
+        controllerPacketAgeSamples++
     }
 
     private fun updateLogicalButton(control: LogicalControl, down: Boolean) {
@@ -1388,7 +1399,8 @@ class MainActivity : ComponentActivity() {
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
         lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
-        latestControllerLatencyMs = null; recentControllerLatencies.clear(); controlThreadLogCounter = 0
+        latestControllerLatencyMs = null; latestControllerPacketAgeMs = null; controllerPacketAgeTotalMs = 0L; controllerPacketAgeSamples = 0L
+        recentControllerLatencies.clear(); controlThreadLogCounter = 0; controllerAckLogCounter = 0
         duplicateControlPacketsDropped = 0L; outOfOrderControlPacketsDropped = 0L; staleAnalogPacketsDropped = 0L; player2Classification = "Unknown"
         logicalControllerState = ControllerInputState(); controllerTestDisplayState = ControllerInputState(); lastControllerTestUiMs = 0L
         resetLocalDpadState("session cleanup"); hostDpadState.reset(); dpadDuplicateDrops = 0L
@@ -1430,10 +1442,6 @@ class MainActivity : ComponentActivity() {
 
     private fun sendKey(keyCode: Int, action: String, event: KeyEvent) {
         val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
-        val logical = ControllerMapping.logicalForAndroidKey(keyCode)
-        Log.d(TAG, "RAW_KEY_EVENT: device=${event.deviceId} androidKey=$keyCode action=$action eventTime=${event.eventTime}")
-        Log.d(TAG, "LOGICAL_CONTROL_EVENT: control=${logical?.displayName ?: "UNMAPPED"} state=$action")
-        Log.d(TAG, "CONTROL_CAPTURE_MS: $captureDelayMs type=KEY")
         val message = "KEY|$activeSessionId|device-$lastControllerDeviceId|2|${++digitalSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|$keyCode|$action"
         recordControllerPacket()
         clientRtc.sendControlMessage(message)

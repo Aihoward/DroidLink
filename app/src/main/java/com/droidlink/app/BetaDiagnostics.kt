@@ -42,6 +42,7 @@ data class BetaDiagnostics(
     val controllerP95LatencyMs: Long? = null,
     val controllerP50LatencyMs: Long? = null,
     val controllerPacketAgeMs: Long? = null,
+    val averageControllerPacketAgeMs: Long? = null,
     val digitalQueueDepth: Int = 0,
     val analogQueueDepth: Int = 0,
     val controlBufferedBytes: Long = 0L,
