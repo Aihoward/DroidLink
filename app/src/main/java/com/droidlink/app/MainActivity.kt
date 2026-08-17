@@ -389,7 +389,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.0.1", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.0.2", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -449,9 +449,9 @@ class MainActivity : ComponentActivity() {
                             override fun onFirstFrameRendered() { Log.d(TAG, "FIRST REMOTE FRAME RENDERED"); runOnUiThread { clientStatus = "Connected - video playing" } }
                             override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) { Log.d(TAG, "Remote video frame size: ${width}x$height rotation=$rotation") }
                         })
-                        setEnableHardwareScaler(true); setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT); setMirror(false)
+                        setEnableHardwareScaler(true); disableFpsReduction(); setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT); setMirror(false)
                         renderer = this
-                        Log.d(TAG, "JOIN_RENDERER_CREATED: renderer=${System.identityHashCode(this)}")
+                        Log.d(TAG, "JOIN_RENDERER_CREATED: renderer=${System.identityHashCode(this)} hardwareScaler=true fpsReduction=disabled directVideoSink=true")
                         remoteTrack?.let { attachTrack(this, it) }
                     }
                 },
@@ -559,6 +559,11 @@ class MainActivity : ComponentActivity() {
                 diagnosticLine("Encode FPS", d.encodeFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Decode FPS", d.decodeFps?.let { "%.1f".format(it) } ?: "—")
                 diagnosticLine("Render FPS", d.renderFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Bitrate", "${d.videoBitrateBps / 1_000} kbps")
                 diagnosticLine("Available outbound", "${d.availableOutgoingBitrateBps / 1_000} kbps"); diagnosticLine("Dropped frames", d.framesDropped.toString())
+                diagnosticLine("Frame age at render", d.frameAgeAtRenderMs?.let { "~%.1f ms".format(it) } ?: "—")
+                diagnosticLine("Capture / encode", "${d.captureLatencyMs?.let { "%.1f ms".format(it) } ?: "—"} / ${d.averageEncodeTimeMs?.let { "%.1f ms".format(it) } ?: "—"}")
+                diagnosticLine("Jitter buffer / decode", "${d.videoJitterBufferMs?.let { "%.1f ms".format(it) } ?: "—"} / ${d.averageDecodeTimeMs?.let { "%.1f ms".format(it) } ?: "—"}")
+                diagnosticLine("Encoder / decoder", "${d.encoderImplementation} / ${d.decoderImplementation}")
+                diagnosticLine("Video queues E / D / R", "${d.encoderQueueDepth} / ${d.decoderQueueDepth} / ${d.renderQueueDepth}")
                 diagnosticLine("Bottleneck", d.videoBottleneck)
             }
             StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
@@ -683,7 +688,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.0.1 Stable")
+                SettingInfo("Version", "Droid Link 1.0.2 Low Latency")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1325,7 +1330,7 @@ class MainActivity : ComponentActivity() {
         val metrics = resources.displayMetrics
         val sourceWidth = metrics.widthPixels.coerceAtLeast(2)
         val sourceHeight = metrics.heightPixels.coerceAtLeast(2)
-        val targetLongEdge = when (qualityPreset) { "Low Latency" -> 960.0; "High Quality" -> 1920.0; else -> 1280.0 }
+        val targetLongEdge = when (qualityPreset) { "Low Latency" -> 1280.0; "High Quality" -> 1920.0; else -> 1280.0 }
         val scale = minOf(1.0, targetLongEdge / maxOf(sourceWidth, sourceHeight))
         val width = ((sourceWidth * scale).toInt() / 2 * 2).coerceAtLeast(2)
         val height = ((sourceHeight * scale).toInt() / 2 * 2).coerceAtLeast(2)

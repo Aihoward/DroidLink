@@ -52,6 +52,14 @@ class WebRtcManager(private val context: Context) {
     private var lastBytesReceived = 0L
     private var lastFramesDecoded = 0L
     private var lastFramesEncoded = 0L
+    private var lastFramesCaptured = 0L
+    private var lastFramesReceived = 0L
+    private var lastFramesRendered = 0L
+    private var lastTotalCaptureDelaySeconds = 0.0
+    private var lastTotalEncodeTimeSeconds = 0.0
+    private var lastTotalDecodeTimeSeconds = 0.0
+    private var lastJitterBufferDelaySeconds = 0.0
+    private var lastJitterBufferEmittedCount = 0L
     private var lastAudioBytesSent = 0L
     private var lastAudioBytesReceived = 0L
     private var captureWindowStartMs = 0L
@@ -114,6 +122,10 @@ class WebRtcManager(private val context: Context) {
                 bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
                 rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
                 tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
+                enableDscp = true
+                enableCpuOveruseDetection = true
+                suspendBelowMinBitrate = false
+                screencastMinBitrate = 100_000
             }
             val created = currentFactory.createPeerConnection(config, observer())
             if (created == null) { onError("WebRTC failed to create PeerConnection"); return@fetchIceServers }
@@ -287,10 +299,12 @@ class WebRtcManager(private val context: Context) {
     private fun logStats(report: RTCStatsReport) {
         var bytesSent = 0L; var bytesReceived = 0L
         var framesEncoded = 0L; var framesDecoded = 0L; var framesDropped = 0L
+        var framesCaptured = 0L; var framesReceived = 0L; var framesRendered = 0L
         var packetsLost = 0L; var rttMs: Double? = null; var jitterMs: Double? = null; var availableSendBps: Double? = null
-        var totalEncodeTimeSeconds = 0.0; var totalDecodeTimeSeconds = 0.0
+        var totalEncodeTimeSeconds = 0.0; var totalDecodeTimeSeconds = 0.0; var totalCaptureDelaySeconds = 0.0
+        var jitterBufferDelaySeconds = 0.0; var jitterBufferEmittedCount = 0L
         var audioBytesSent = 0L; var audioPacketsSent = 0L; var audioBytesReceived = 0L; var audioPacketsReceived = 0L
-        var codecId: String? = null; var codecImplementation: String? = null
+        var codecId: String? = null; var encoderImplementation: String? = null; var decoderImplementation: String? = null
         var selectedPair: RTCStats? = null
         val selectedPairId = report.statsMap.values.firstOrNull { it.type == "transport" }?.members?.get("selectedCandidatePairId")?.toString()
         report.statsMap.values.forEach { stat ->
@@ -302,18 +316,26 @@ class WebRtcManager(private val context: Context) {
                     framesEncoded += number(m["framesEncoded"])
                     totalEncodeTimeSeconds += (m["totalEncodeTime"] as? Number)?.toDouble() ?: 0.0
                     codecId = m["codecId"]?.toString() ?: codecId
-                    codecImplementation = m["encoderImplementation"]?.toString() ?: codecImplementation
+                    encoderImplementation = m["encoderImplementation"]?.toString() ?: encoderImplementation
                 } else if (kind == "audio") { audioBytesSent += number(m["bytesSent"]); audioPacketsSent += number(m["packetsSent"]) }
                 "inbound-rtp" -> if (kind == "video") {
                     bytesReceived += number(m["bytesReceived"])
+                    framesReceived += number(m["framesReceived"])
                     framesDecoded += number(m["framesDecoded"])
+                    framesRendered += number(m["framesRendered"])
                     framesDropped += number(m["framesDropped"])
                     packetsLost += number(m["packetsLost"])
                     jitterMs = (m["jitter"] as? Number)?.toDouble()?.times(1_000.0)
                     codecId = m["codecId"]?.toString() ?: codecId
-                    codecImplementation = m["decoderImplementation"]?.toString() ?: codecImplementation
+                    decoderImplementation = m["decoderImplementation"]?.toString() ?: decoderImplementation
                     totalDecodeTimeSeconds += (m["totalDecodeTime"] as? Number)?.toDouble() ?: 0.0
+                    jitterBufferDelaySeconds += (m["jitterBufferDelay"] as? Number)?.toDouble() ?: 0.0
+                    jitterBufferEmittedCount += number(m["jitterBufferEmittedCount"])
                 } else if (kind == "audio") { audioBytesReceived += number(m["bytesReceived"]); audioPacketsReceived += number(m["packetsReceived"]) }
+                "media-source" -> if (kind == "video") {
+                    framesCaptured += number(m["frames"] ?: m["framesCaptured"])
+                    totalCaptureDelaySeconds += (m["totalCaptureDelay"] as? Number)?.toDouble() ?: 0.0
+                }
                 "remote-inbound-rtp" -> if (kind == "video") {
                     packetsLost += number(m["packetsLost"])
                     rttMs = (m["roundTripTime"] as? Number)?.toDouble()?.times(1_000.0)
@@ -332,6 +354,20 @@ class WebRtcManager(private val context: Context) {
         val receiveBitrate = if (lastStatsTimestampMs == 0L) 0L else ((bytesReceived - lastBytesReceived).coerceAtLeast(0L) * 8_000L / elapsed)
         val encodedFps = if (lastStatsTimestampMs == 0L) null else (framesEncoded - lastFramesEncoded).coerceAtLeast(0L) * 1_000.0 / elapsed
         val decodedFps = if (lastStatsTimestampMs == 0L) null else (framesDecoded - lastFramesDecoded).coerceAtLeast(0L) * 1_000.0 / elapsed
+        val captureDelta = (framesCaptured - lastFramesCaptured).coerceAtLeast(0L)
+        val encodeDelta = (framesEncoded - lastFramesEncoded).coerceAtLeast(0L)
+        val receiveDelta = (framesReceived - lastFramesReceived).coerceAtLeast(0L)
+        val decodeDelta = (framesDecoded - lastFramesDecoded).coerceAtLeast(0L)
+        val renderDelta = (framesRendered - lastFramesRendered).coerceAtLeast(0L)
+        val encoderQueueDepth = (captureDelta - encodeDelta).coerceAtLeast(0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val decoderQueueDepth = (receiveDelta - decodeDelta).coerceAtLeast(0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val renderQueueDepth = if (framesRendered > 0L) (decodeDelta - renderDelta).coerceAtLeast(0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else 0
+        val jitterEmittedDelta = (jitterBufferEmittedCount - lastJitterBufferEmittedCount).coerceAtLeast(0L)
+        val captureLatencyMs = if (captureDelta > 0L) (totalCaptureDelaySeconds - lastTotalCaptureDelaySeconds).coerceAtLeast(0.0) * 1_000.0 / captureDelta else null
+        val encodeTimeMs = if (encodeDelta > 0L) (totalEncodeTimeSeconds - lastTotalEncodeTimeSeconds).coerceAtLeast(0.0) * 1_000.0 / encodeDelta else null
+        val decodeTimeMs = if (decodeDelta > 0L) (totalDecodeTimeSeconds - lastTotalDecodeTimeSeconds).coerceAtLeast(0.0) * 1_000.0 / decodeDelta else null
+        val processingLatencyMs = decodeTimeMs
+        val jitterBufferMs = if (jitterEmittedDelta > 0L) (jitterBufferDelaySeconds - lastJitterBufferDelaySeconds).coerceAtLeast(0.0) * 1_000.0 / jitterEmittedDelta else null
         val recentPacketsLost = (packetsLost - lastPacketsLost).coerceAtLeast(0L)
         lastStatsTimestampMs = now; lastBytesSent = bytesSent; lastBytesReceived = bytesReceived
         if (framesDecoded > 0L && framesDecoded == lastFramesDecoded && diagnostics.connectionState == PeerConnection.PeerConnectionState.CONNECTED.name) {
@@ -341,6 +377,10 @@ class WebRtcManager(private val context: Context) {
             stagnantDecodeIntervals = 0
         }
         lastFramesDecoded = framesDecoded; lastFramesEncoded = framesEncoded; lastPacketsLost = packetsLost
+        lastFramesCaptured = framesCaptured; lastFramesReceived = framesReceived; lastFramesRendered = framesRendered
+        lastTotalCaptureDelaySeconds = totalCaptureDelaySeconds; lastTotalEncodeTimeSeconds = totalEncodeTimeSeconds
+        lastTotalDecodeTimeSeconds = totalDecodeTimeSeconds
+        lastJitterBufferDelaySeconds = jitterBufferDelaySeconds; lastJitterBufferEmittedCount = jitterBufferEmittedCount
         val pair = selectedPair ?: selectedPairId?.let(report.statsMap::get)
         val local = pair?.members?.get("localCandidateId")?.toString()?.let(report.statsMap::get)
         val remote = pair?.members?.get("remoteCandidateId")?.toString()?.let(report.statsMap::get)
@@ -350,9 +390,13 @@ class WebRtcManager(private val context: Context) {
         val route = if (localType == "relay" || remoteType == "relay") "TURN relay" else if (pair != null) "Direct P2P" else "Unknown"
         val pairText = "$localType ↔ $remoteType ($protocol)"
         val codec = codecId?.let(report.statsMap::get)?.members?.get("mimeType")?.toString() ?: "unknown"
-        val encodeTimeMs = if (framesEncoded > 0L) totalEncodeTimeSeconds * 1_000.0 / framesEncoded else null
-        val decodeTimeMs = if (framesDecoded > 0L) totalDecodeTimeSeconds * 1_000.0 / framesDecoded else null
+        val renderLatencyMs = if (renderQueueDepth > 0 && decodedFps != null && decodedFps > 0.0) renderQueueDepth * 1_000.0 / decodedFps else 0.0
+        val frameAgeAtRenderMs = listOfNotNull(captureLatencyMs, encodeTimeMs, rttMs?.div(2.0), jitterBufferMs, processingLatencyMs, renderLatencyMs).sum().takeIf { it > 0.0 }
         val bottleneck = when {
+            encoderQueueDepth >= 3 -> "ENCODER QUEUE LIMITED"
+            jitterBufferMs != null && jitterBufferMs >= 120.0 -> "RECEIVE BUFFER LIMITED"
+            decoderQueueDepth >= 3 -> "DECODER QUEUE LIMITED"
+            renderQueueDepth >= 2 -> "RENDER QUEUE LIMITED"
             diagnostics.captureFps != null && diagnostics.captureFps!! < 24.0 -> "HOST PERFORMANCE LIMITED"
             encodedFps != null && diagnostics.captureFps != null && encodedFps < diagnostics.captureFps!! * 0.72 -> "ENCODER LIMITED"
             availableSendBps != null && sendBitrate > 0L && availableSendBps!! < sendBitrate * 1.15 -> "NETWORK LIMITED"
@@ -362,8 +406,10 @@ class WebRtcManager(private val context: Context) {
             else -> "UNKNOWN"
         }
         if (pair != null) Log.d(TAG, "SELECTED ICE CANDIDATE PAIR: route=$route pair=$pairText local=${candidateAddress(local)} remote=${candidateAddress(remote)}")
-        if (codec != "unknown") Log.d(TAG, "SELECTED VIDEO CODEC: $codec implementation=${codecImplementation ?: "unknown"}")
-        adaptVideoIfNeeded(now, encodedFps, rttMs, jitterMs, recentPacketsLost, availableSendBps, sendBitrate)
+        if (codec != "unknown") Log.d(TAG, "SELECTED VIDEO CODEC: $codec encoder=${encoderImplementation ?: "unknown"} decoder=${decoderImplementation ?: "unknown"}")
+        Log.d(TAG, "VIDEO_ENCODER_IMPLEMENTATION: ${encoderImplementation ?: "unknown"} type=${codecImplementationType(encoderImplementation)}")
+        Log.d(TAG, "VIDEO_DECODER_IMPLEMENTATION: ${decoderImplementation ?: "unknown"} type=${codecImplementationType(decoderImplementation)}")
+        adaptVideoIfNeeded(now, encodedFps, rttMs, jitterMs, recentPacketsLost, availableSendBps, sendBitrate, encoderQueueDepth)
         updateDiagnostics {
             copy(
                 route = route,
@@ -382,6 +428,15 @@ class WebRtcManager(private val context: Context) {
                 availableOutgoingBitrateBps = availableSendBps?.toLong() ?: 0L,
                 averageEncodeTimeMs = encodeTimeMs,
                 averageDecodeTimeMs = decodeTimeMs,
+                captureLatencyMs = captureLatencyMs,
+                videoJitterBufferMs = jitterBufferMs,
+                renderLatencyMs = renderLatencyMs,
+                frameAgeAtRenderMs = frameAgeAtRenderMs,
+                encoderQueueDepth = encoderQueueDepth,
+                decoderQueueDepth = decoderQueueDepth,
+                renderQueueDepth = renderQueueDepth,
+                encoderImplementation = encoderImplementation ?: "Unknown",
+                decoderImplementation = decoderImplementation ?: "Unknown",
                 videoBottleneck = bottleneck,
                 gameAudioPacketsSent = audioPacketsSent,
                 gameAudioBytesSent = audioBytesSent,
@@ -395,7 +450,10 @@ class WebRtcManager(private val context: Context) {
         }
         Log.d(TAG, "WEBRTC STATS: VIDEO BITRATE send=$sendBitrate receive=$receiveBitrate FRAMES ENCODED=$framesEncoded FRAMES DECODED=$framesDecoded FRAMES DROPPED=$framesDropped RTT_MS=${format(rttMs)} PACKET LOSS=$packetsLost JITTER_MS=${format(jitterMs)} AVAILABLE SEND BITRATE=${format(availableSendBps)}")
         Log.d(TAG, "VIDEO_ENCODE_FPS: ${format(encodedFps)}")
-        Log.d(TAG, "VIDEO_ENCODE_TIME: avgMs=${if (framesEncoded > 0L) format(totalEncodeTimeSeconds * 1_000.0 / framesEncoded) else "n/a"}")
+        Log.d(TAG, "VIDEO_ENCODE_TIME: intervalAvgMs=${format(encodeTimeMs)}")
+        Log.d(TAG, "VIDEO_PIPELINE_LATENCY: captureMs=${format(captureLatencyMs)} encodeMs=${format(encodeTimeMs)} jitterBufferMs=${format(jitterBufferMs)} decodeMs=${format(processingLatencyMs)} renderMs=${format(renderLatencyMs)}")
+        Log.d(TAG, "VIDEO_QUEUE_DEPTH: encoder=$encoderQueueDepth decoder=$decoderQueueDepth renderer=$renderQueueDepth")
+        Log.d(TAG, "VIDEO_FRAME_AGE_AT_RENDER: estimatedMs=${format(frameAgeAtRenderMs)} method=capture+encode+rtt/2+jitterBuffer+decode+renderQueue")
         Log.d(TAG, "VIDEO_DROPPED_FRAMES: $framesDropped")
         if (audioPacketsSent > 0L || audioBytesSent > lastAudioBytesSent) {
             Log.d(TAG, "GAME_AUDIO_RTP_PACKETS_SENT: $audioPacketsSent GAME_AUDIO_RTP_BYTES_SENT: $audioBytesSent")
@@ -424,6 +482,12 @@ class WebRtcManager(private val context: Context) {
 
     private fun number(value: Any?) = (value as? Number)?.toLong() ?: 0L
     private fun format(value: Double?) = value?.let { String.format(java.util.Locale.US, "%.1f", it) } ?: "n/a"
+    private fun codecImplementationType(value: String?): String = when {
+        value == null -> "unknown"
+        value.contains("MediaCodec", true) || value.contains("OMX.", true) || value.contains("c2.", true) -> "hardware-or-platform"
+        value.contains("libvpx", true) || value.contains("openh264", true) || value.contains("software", true) -> "software"
+        else -> "unknown"
+    }
 
     fun createOffer(onReady: (String) -> Unit, onError: (String) -> Unit) = createDescription(true, onReady, onError)
     fun createAnswer(onReady: (String) -> Unit, onError: (String) -> Unit) = createDescription(false, onReady, onError)
@@ -510,6 +574,7 @@ class WebRtcManager(private val context: Context) {
         screenCapturer = ScreenCapturerAndroid(permissionData, object : MediaProjection.Callback() { override fun onStop() { Log.d(TAG, "Screen capture projection stopped") } })
         textureHelper = SurfaceTextureHelper.create("DroidLinkScreenCapture", eglBase.eglBaseContext)
         screenSource = currentFactory.createVideoSource(true)
+        screenSource!!.adaptOutputFormat(width, height, fps)
         val real = screenSource!!.capturerObserver
         var frames = 0
         val debug = object : CapturerObserver {
@@ -540,7 +605,7 @@ class WebRtcManager(private val context: Context) {
         check(sender != null) { "Failed to add screen video track to PeerConnection" }
         videoSender = sender
         adaptiveProfile = profile; baseCaptureWidth = width; baseCaptureHeight = height; baseCaptureFps = fps; adaptationLevel = 0; lastAdaptationMs = 0L
-        configureVideoSender(sender)
+        configureVideoSender(sender, profile, fps)
         preferH264WithFallback()
         Log.d(TAG, "Host video sender created: senderId=${sender.id()} trackId=${sender.track()?.id()} enabled=${sender.track()?.enabled()}")
         logVideoTransceivers("screen track attached before offer")
@@ -578,31 +643,36 @@ class WebRtcManager(private val context: Context) {
         }.onFailure { onAudioStatus?.invoke(it.message ?: "Playback audio unavailable") }
     }
 
-    private fun configureVideoSender(sender: RtpSender) {
+    private fun configureVideoSender(sender: RtpSender, profile: String, fps: Int) {
+        val lowLatency = profile == "Low Latency"
+        val startBitrate = if (lowLatency) 2_500_000 else 4_000_000
+        val maxBitrate = if (lowLatency) 3_500_000 else 8_000_000
         val parameters = sender.parameters
         parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
         parameters.encodings.forEach { encoding ->
             encoding.active = true
-            encoding.minBitrateBps = 200_000
-            encoding.maxBitrateBps = 8_000_000
-            encoding.maxFramerate = 60
+            encoding.minBitrateBps = 150_000
+            encoding.maxBitrateBps = maxBitrate
+            encoding.maxFramerate = fps
             encoding.bitratePriority = 2.0
         }
         val parametersSet = sender.setParameters(parameters)
-        val bitrateSet = peer?.setBitrate(300_000, 4_000_000, 8_000_000) == true
-        Log.d(TAG, "Video sender low-latency tuning: parametersSet=$parametersSet bitrateSet=$bitrateSet degradation=MAINTAIN_FRAMERATE")
+        val bitrateSet = peer?.setBitrate(150_000, startBitrate, maxBitrate) == true
+        Log.d(TAG, "VIDEO_LOW_LATENCY_SENDER: profile=$profile parametersSet=$parametersSet bitrateSet=$bitrateSet startBitrate=$startBitrate maxBitrate=$maxBitrate fps=$fps degradation=MAINTAIN_FRAMERATE")
     }
 
-    private fun adaptVideoIfNeeded(now: Long, encodedFps: Double?, rttMs: Double?, jitterMs: Double?, recentLoss: Long, availableSendBps: Double?, sendBitrate: Long) {
+    private fun adaptVideoIfNeeded(now: Long, encodedFps: Double?, rttMs: Double?, jitterMs: Double?, recentLoss: Long, availableSendBps: Double?, sendBitrate: Long, encoderQueueDepth: Int) {
         if (adaptiveProfile != "Auto" && adaptiveProfile != "Low Latency") return
         val since = now - lastAdaptationMs
-        val constrained = (rttMs ?: 0.0) >= 170.0 || (jitterMs ?: 0.0) >= 40.0 || recentLoss >= 8L ||
+        val lowLatency = adaptiveProfile == "Low Latency"
+        val constrained = (rttMs ?: 0.0) >= (if (lowLatency) 120.0 else 170.0) || (jitterMs ?: 0.0) >= (if (lowLatency) 25.0 else 40.0) || recentLoss >= (if (lowLatency) 3L else 8L) ||
             (availableSendBps != null && sendBitrate > 500_000L && availableSendBps < sendBitrate * 1.05) ||
-            (encodedFps != null && encodedFps in 1.0..22.0)
+            (encodedFps != null && encodedFps in 1.0..(if (lowLatency) 42.0 else 22.0)) || encoderQueueDepth >= (if (lowLatency) 3 else 8)
         val healthy = (rttMs ?: 999.0) < 80.0 && (jitterMs ?: 999.0) < 20.0 && recentLoss <= 1L &&
-            (availableSendBps == null || availableSendBps > 3_000_000.0) && (encodedFps == null || encodedFps >= 28.0)
+            (availableSendBps == null || availableSendBps > 3_000_000.0) && (encodedFps == null || encodedFps >= (if (lowLatency) 50.0 else 28.0)) && encoderQueueDepth == 0
+        val degradeDelay = if (lowLatency) 5_000L else 15_000L
         when {
-            constrained && adaptationLevel < 3 && since >= 15_000L -> applyVideoAdaptation(adaptationLevel + 1, now, "network/encoder pressure")
+            constrained && adaptationLevel < 3 && since >= degradeDelay -> applyVideoAdaptation(adaptationLevel + 1, now, "freshness pressure queue=$encoderQueueDepth")
             healthy && adaptationLevel > 0 && since >= 45_000L -> applyVideoAdaptation(adaptationLevel - 1, now, "sustained recovery")
         }
     }
@@ -611,7 +681,7 @@ class WebRtcManager(private val context: Context) {
         val sender = videoSender ?: return
         adaptationLevel = level.coerceIn(0, 3); lastAdaptationMs = now
         val scale = when (adaptationLevel) { 3 -> 0.5; 2 -> 0.75; else -> 1.0 }
-        val fps = when (adaptationLevel) { 0, 1 -> baseCaptureFps; else -> minOf(baseCaptureFps, 30) }
+        val fps = when (adaptationLevel) { 0, 1 -> baseCaptureFps; 2 -> minOf(baseCaptureFps, 45); else -> minOf(baseCaptureFps, 30) }
         val maxBitrate = when (adaptationLevel) { 0 -> if (adaptiveProfile == "Low Latency") 3_500_000 else 5_000_000; 1 -> 2_500_000; 2 -> 1_500_000; else -> 800_000 }
         val parameters = sender.parameters
         parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
@@ -619,7 +689,10 @@ class WebRtcManager(private val context: Context) {
         val set = sender.setParameters(parameters)
         val width = ((baseCaptureWidth * scale).toInt() / 2 * 2).coerceAtLeast(320)
         val height = ((baseCaptureHeight * scale).toInt() / 2 * 2).coerceAtLeast(240)
-        if (adaptationLevel >= 2 || level == 1) runCatching { screenCapturer?.changeCaptureFormat(width, height, fps) }
+        if (adaptationLevel >= 2) runCatching {
+            screenSource?.adaptOutputFormat(width, height, fps)
+            screenCapturer?.changeCaptureFormat(width, height, fps)
+        }
         Log.w(TAG, "VIDEO_ADAPTATION: profile=$adaptiveProfile level=$adaptationLevel ${width}x$height@$fps maxBitrate=$maxBitrate reason=$reason parametersSet=$set")
     }
 
@@ -684,7 +757,10 @@ class WebRtcManager(private val context: Context) {
         audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null
         synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
         diagnostics = BetaDiagnostics()
-        lastStatsTimestampMs = 0L; lastBytesSent = 0L; lastBytesReceived = 0L; lastFramesDecoded = 0L; lastFramesEncoded = 0L; stagnantDecodeIntervals = 0
+        lastStatsTimestampMs = 0L; lastBytesSent = 0L; lastBytesReceived = 0L; lastFramesDecoded = 0L; lastFramesEncoded = 0L
+        lastFramesCaptured = 0L; lastFramesReceived = 0L; lastFramesRendered = 0L; stagnantDecodeIntervals = 0
+        lastTotalCaptureDelaySeconds = 0.0; lastTotalEncodeTimeSeconds = 0.0; lastTotalDecodeTimeSeconds = 0.0
+        lastJitterBufferDelaySeconds = 0.0; lastJitterBufferEmittedCount = 0L
         lastAudioBytesSent = 0L; lastAudioBytesReceived = 0L; captureWindowStartMs = 0L; captureWindowFrames = 0
         gameAudioSendConfirmed = false; gameAudioReceiveConfirmed = false
         adaptationLevel = 0; lastAdaptationMs = 0L; lastPacketsLost = 0L
