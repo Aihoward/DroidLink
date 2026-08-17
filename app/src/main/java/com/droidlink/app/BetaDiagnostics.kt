@@ -8,28 +8,37 @@ data class BetaDiagnostics(
     val rttMs: Double? = null,
     val resolution: String = "—",
     val fps: Double? = null,
-    val videoBitrateBps: Long = 0L,
+    val videoBitrateBps: Long? = null,
     val packetLoss: Long = 0L,
     val jitterMs: Double? = null,
     val framesEncoded: Long = 0L,
+    val framesReceived: Long = 0L,
     val framesDecoded: Long = 0L,
+    val framesRendered: Long? = null,
+    val packetsReceived: Long = 0L,
     val framesDropped: Long = 0L,
     val captureFps: Double? = null,
     val encodeFps: Double? = null,
+    val receiveFps: Double? = null,
     val decodeFps: Double? = null,
     val renderFps: Double? = null,
-    val availableOutgoingBitrateBps: Long = 0L,
+    val availableOutgoingBitrateBps: Long? = null,
     val averageEncodeTimeMs: Double? = null,
     val averageDecodeTimeMs: Double? = null,
     val captureLatencyMs: Double? = null,
     val videoJitterBufferMs: Double? = null,
+    val videoJitterBufferTargetMs: Double? = null,
+    val videoJitterBufferMinimumMs: Double? = null,
+    val videoJitterBufferObservedMinMs: Double? = null,
+    val videoJitterBufferObservedMaxMs: Double? = null,
+    val videoJitterBufferTrend: String = "Unavailable",
     val renderLatencyMs: Double? = null,
     val frameAgeAtRenderMs: Double? = null,
-    val encoderQueueDepth: Int = 0,
-    val decoderQueueDepth: Int = 0,
-    val renderQueueDepth: Int = 0,
-    val encoderImplementation: String = "Unknown",
-    val decoderImplementation: String = "Unknown",
+    val encoderQueueDepth: Int? = null,
+    val decoderQueueDepth: Int? = null,
+    val renderQueueDepth: Int? = null,
+    val encoderImplementation: String = "Unavailable",
+    val decoderImplementation: String = "Unavailable",
     val videoBottleneck: String = "UNKNOWN",
     val gameAudioPacketsSent: Long = 0L,
     val gameAudioBytesSent: Long = 0L,
@@ -52,6 +61,27 @@ data class BetaDiagnostics(
     val player2Status: String = "Not active",
     val player2Classification: String = "Unknown"
 )
+
+object VideoStatsPolicy {
+    fun ratePerSecond(current: Long, previous: Long, elapsedMs: Long): Double? =
+        if (elapsedMs <= 0L || current < previous) null else (current - previous) * 1_000.0 / elapsedMs
+
+    fun bitrateBps(currentBytes: Long, previousBytes: Long, elapsedMs: Long): Long? =
+        ratePerSecond(currentBytes, previousBytes, elapsedMs)?.times(8.0)?.toLong()
+
+    fun intervalAverageMs(currentSeconds: Double, previousSeconds: Double, currentCount: Long, previousCount: Long): Double? {
+        val countDelta = currentCount - previousCount
+        val delayDelta = currentSeconds - previousSeconds
+        return if (countDelta <= 0L || delayDelta < 0.0) null else delayDelta * 1_000.0 / countDelta
+    }
+
+    fun trend(currentMs: Double?, previousMs: Double?, thresholdMs: Double = 10.0): String = when {
+        currentMs == null || previousMs == null -> "WARMING UP"
+        currentMs > previousMs + thresholdMs -> "RISING"
+        currentMs < previousMs - thresholdMs -> "FALLING"
+        else -> "STABLE"
+    }
+}
 
 object ControllerTransportPolicy {
     const val ANALOG_SEND_INTERVAL_MS = 10L

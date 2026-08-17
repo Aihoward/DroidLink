@@ -393,7 +393,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("1.0.3", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("1.0.4", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -559,15 +559,17 @@ class MainActivity : ComponentActivity() {
             StatSection("SESSION") { diagnosticLine("Player 1", "Host"); diagnosticLine("Player 2", "Joiner") }
             StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
             StatSection("VIDEO") {
-                diagnosticLine("Resolution", d.resolution); diagnosticLine("Capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "—")
-                diagnosticLine("Encode FPS", d.encodeFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Decode FPS", d.decodeFps?.let { "%.1f".format(it) } ?: "—")
-                diagnosticLine("Render FPS", d.renderFps?.let { "%.1f".format(it) } ?: "—"); diagnosticLine("Bitrate", "${d.videoBitrateBps / 1_000} kbps")
-                diagnosticLine("Available outbound", "${d.availableOutgoingBitrateBps / 1_000} kbps"); diagnosticLine("Dropped frames", d.framesDropped.toString())
-                diagnosticLine("Frame age at render", d.frameAgeAtRenderMs?.let { "~%.1f ms".format(it) } ?: "—")
+                diagnosticLine("Resolution", d.resolution); diagnosticLine("Host capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "Unavailable on this peer")
+                diagnosticLine("Host encode FPS", d.encodeFps?.let { "%.1f".format(it) } ?: "Unavailable on this peer"); diagnosticLine("Receive / decode FPS", "${d.receiveFps?.let { "%.1f".format(it) } ?: "Unavailable"} / ${d.decodeFps?.let { "%.1f".format(it) } ?: "Unavailable"}")
+                diagnosticLine("Render FPS", d.renderFps?.let { "%.1f".format(it) } ?: "Unavailable from WebRTC stats"); diagnosticLine("Video bitrate", d.videoBitrateBps?.let { "${it / 1_000} kbps" } ?: "Unavailable")
+                diagnosticLine("Available outbound (host only)", d.availableOutgoingBitrateBps?.let { "${it / 1_000} kbps" } ?: "Unavailable on this peer"); diagnosticLine("Packets received", d.packetsReceived.toString()); diagnosticLine("Dropped frames", d.framesDropped.toString())
+                diagnosticLine("Estimated pipeline delay", d.frameAgeAtRenderMs?.let { "~%.1f ms".format(it) } ?: "Unavailable")
                 diagnosticLine("Capture / encode", "${d.captureLatencyMs?.let { "%.1f ms".format(it) } ?: "—"} / ${d.averageEncodeTimeMs?.let { "%.1f ms".format(it) } ?: "—"}")
-                diagnosticLine("Jitter buffer / decode", "${d.videoJitterBufferMs?.let { "%.1f ms".format(it) } ?: "—"} / ${d.averageDecodeTimeMs?.let { "%.1f ms".format(it) } ?: "—"}")
+                diagnosticLine("Jitter actual / target", "${d.videoJitterBufferMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.videoJitterBufferTargetMs?.let { "%.1f ms".format(it) } ?: "Unavailable"}")
+                diagnosticLine("Jitter min / observed range", "${d.videoJitterBufferMinimumMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.videoJitterBufferObservedMinMs?.let { "%.1f".format(it) } ?: "—"}–${d.videoJitterBufferObservedMaxMs?.let { "%.1f ms".format(it) } ?: "—"}")
+                diagnosticLine("Jitter trend / decode", "${d.videoJitterBufferTrend} / ${d.averageDecodeTimeMs?.let { "%.1f ms".format(it) } ?: "Unavailable"}")
                 diagnosticLine("Encoder / decoder", "${d.encoderImplementation} / ${d.decoderImplementation}")
-                diagnosticLine("Video queues E / D / R", "${d.encoderQueueDepth} / ${d.decoderQueueDepth} / ${d.renderQueueDepth}")
+                diagnosticLine("Video queues E / D / R", "${d.encoderQueueDepth ?: "Unavailable"} / ${d.decoderQueueDepth ?: "Unavailable"} / ${d.renderQueueDepth ?: "Unavailable"}")
                 diagnosticLine("Bottleneck", d.videoBottleneck)
             }
             StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
@@ -579,7 +581,7 @@ class MainActivity : ComponentActivity() {
             var advanced by remember { mutableStateOf(false) }
             NeonTextButton(if (advanced) "HIDE ADVANCED DIAGNOSTICS" else "ADVANCED DIAGNOSTICS") { advanced = !advanced }
             if (advanced) {
-                diagnosticLine("Candidate pair", d.candidatePair); diagnosticLine("Frames encoded / decoded", "${d.framesEncoded} / ${d.framesDecoded}")
+                diagnosticLine("Candidate pair", d.candidatePair); diagnosticLine("Frames encoded / received / decoded / rendered", "${d.framesEncoded} / ${d.framesReceived} / ${d.framesDecoded} / ${d.framesRendered ?: "Unavailable"}")
                 diagnosticLine("Encode / decode time", "${d.averageEncodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"} / ${d.averageDecodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"}")
                 diagnosticLine("Queue digital / analog", "${d.digitalQueueDepth} / ${d.analogQueueDepth}"); diagnosticLine("DataChannel buffer", "${d.controlBufferedBytes} bytes")
                 diagnosticLine("Duplicate / out-of-order", "${d.duplicateControlPacketsDropped} / ${d.outOfOrderControlPacketsDropped}")
@@ -692,7 +694,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "Droid Link 1.0.3 Low Latency")
+                SettingInfo("Version", "Droid Link 1.0.4 Receive Latency")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
