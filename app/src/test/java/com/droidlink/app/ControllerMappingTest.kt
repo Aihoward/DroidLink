@@ -19,6 +19,15 @@ class ControllerMappingTest {
         assertEquals(LogicalControl.R1, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_R1))
         assertEquals(LogicalControl.START, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_START))
         assertEquals(LogicalControl.SELECT, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_SELECT))
+        assertEquals(LogicalControl.START, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_MENU))
+        assertEquals(LogicalControl.SELECT, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_ESCAPE))
+    }
+
+    @Test fun broadAxisFallbacksCoverCommonAndroidGamepads() {
+        assertTrue(ControllerMapping.rightXAxisCandidates.contains(android.view.MotionEvent.AXIS_RX))
+        assertTrue(ControllerMapping.rightYAxisCandidates.contains(android.view.MotionEvent.AXIS_RY))
+        assertTrue(ControllerMapping.leftTriggerCandidates.contains(android.view.MotionEvent.AXIS_BRAKE))
+        assertTrue(ControllerMapping.rightTriggerCandidates.contains(android.view.MotionEvent.AXIS_GAS))
     }
 
     @Test fun logicalStateReturnsButtonsAndDpadToNeutral() {

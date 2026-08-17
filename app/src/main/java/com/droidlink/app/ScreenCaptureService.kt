@@ -63,9 +63,7 @@ class ScreenCaptureService : Service() {
             "MediaProjection foreground service READY"
         )
 
-        sendBroadcast(
-            Intent(ACTION_READY)
-        )
+        sendBroadcast(Intent(ACTION_READY).setPackage(packageName))
 
         return START_STICKY
     }

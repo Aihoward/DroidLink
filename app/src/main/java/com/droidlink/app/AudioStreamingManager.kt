@@ -13,10 +13,47 @@ class AudioStreamingManager(private val context: Context) {
     @Volatile private var pcmLogged = false
     private var silentCallbacks = 0
     var onStatus: ((String) -> Unit)? = null
+    @Volatile var outputState: String = "Not started"
+        private set
+
+    private val gameAudioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_GAME)
+        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+        .apply { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setFlags(AudioAttributes.FLAG_LOW_LATENCY) }
+        .build()
 
     fun createAudioDeviceModule(): JavaAudioDeviceModule = JavaAudioDeviceModule.builder(context.applicationContext)
         .setSampleRate(SAMPLE_RATE).setInputSampleRate(SAMPLE_RATE).setOutputSampleRate(SAMPLE_RATE)
         .setUseStereoInput(true).setUseStereoOutput(true).setUseLowLatency(true)
+        .setAudioAttributes(gameAudioAttributes)
+        .setAudioTrackStateCallback(object : JavaAudioDeviceModule.AudioTrackStateCallback {
+            override fun onWebRtcAudioTrackStart() {
+                outputState = "Playing"
+                Log.d(TAG, "GAME_AUDIO_OUTPUT_STARTED: usage=GAME content=MUSIC lowLatency=true")
+                onStatus?.invoke("GAME_AUDIO_OUTPUT_STARTED")
+            }
+            override fun onWebRtcAudioTrackStop() {
+                outputState = "Stopped"
+                Log.d(TAG, "GAME_AUDIO_OUTPUT_STOPPED")
+            }
+        })
+        .setAudioTrackErrorCallback(object : JavaAudioDeviceModule.AudioTrackErrorCallback {
+            override fun onWebRtcAudioTrackInitError(errorMessage: String?) {
+                outputState = "Initialization error"
+                Log.e(TAG, "GAME_AUDIO_OUTPUT_INIT_ERROR: $errorMessage")
+                onStatus?.invoke("GAME_AUDIO_OUTPUT_ERROR")
+            }
+            override fun onWebRtcAudioTrackStartError(errorCode: JavaAudioDeviceModule.AudioTrackStartErrorCode?, errorMessage: String?) {
+                outputState = "Start error"
+                Log.e(TAG, "GAME_AUDIO_OUTPUT_START_ERROR: $errorCode $errorMessage")
+                onStatus?.invoke("GAME_AUDIO_OUTPUT_ERROR")
+            }
+            override fun onWebRtcAudioTrackError(errorMessage: String?) {
+                outputState = "Playback error"
+                Log.e(TAG, "GAME_AUDIO_OUTPUT_ERROR: $errorMessage")
+                onStatus?.invoke("GAME_AUDIO_OUTPUT_ERROR")
+            }
+        })
         .setUseHardwareAcousticEchoCanceler(false).setUseHardwareNoiseSuppressor(false)
         .setAudioRecordStateCallback(object : JavaAudioDeviceModule.AudioRecordStateCallback {
             override fun onWebRtcAudioRecordStart() { Log.d(TAG, "GAME_AUDIO_WEBRTC_INPUT_STARTED") }
@@ -59,7 +96,7 @@ class AudioStreamingManager(private val context: Context) {
             audioInput.javaClass.getDeclaredMethod("setUseAudioRecord", Boolean::class.javaPrimitiveType).apply { isAccessible = true }.invoke(audioInput, false)
             it.setMicrophoneMute(false)
             it.setNoiseSuppressorEnabled(false)
-            Log.d(TAG, "AudioDeviceModule configured for external playback PCM: sampleRate=$SAMPLE_RATE channels=$CHANNELS")
+            Log.d(TAG, "AudioDeviceModule configured for external playback PCM: sampleRate=$SAMPLE_RATE channels=$CHANNELS outputUsage=GAME outputContent=MUSIC lowLatency=true")
         }
 
     fun start(mediaProjection: MediaProjection): Result<Unit> = runCatching {

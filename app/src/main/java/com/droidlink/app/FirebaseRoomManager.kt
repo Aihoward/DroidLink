@@ -2,10 +2,11 @@ package com.droidlink.app
 
 import android.util.Log
 import com.google.firebase.database.*
-import kotlin.random.Random
+import java.security.SecureRandom
 
 class FirebaseRoomManager {
     companion object { private const val TAG = "DroidLink" }
+    private val secureRandom = SecureRandom()
     private val rooms = FirebaseDatabase.getInstance().getReference("rooms")
     private val valueListeners = mutableListOf<Pair<Query, ValueEventListener>>()
     private val childListeners = mutableListOf<Pair<Query, ChildEventListener>>()
@@ -13,7 +14,7 @@ class FirebaseRoomManager {
     fun createRoom(onSuccess: (String) -> Unit, onError: (String) -> Unit) = createRoomAttempt(0, onSuccess, onError)
 
     private fun createRoomAttempt(attempt: Int, onSuccess: (String) -> Unit, onError: (String) -> Unit) {
-        val code = Random.nextInt(100000, 1_000_000).toString()
+        val code = secureRandom.nextInt(900_000).plus(100_000).toString()
         rooms.child(code).runTransaction(object : Transaction.Handler {
             override fun doTransaction(data: MutableData): Transaction.Result {
                 if (data.value != null) return Transaction.abort()
@@ -32,8 +33,13 @@ class FirebaseRoomManager {
     }
 
     fun joinRoom(code: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code)) return onError("Invalid room code")
         rooms.child(code).get().addOnSuccessListener { snapshot ->
             if (!snapshot.exists()) return@addOnSuccessListener onError("Room not found")
+            val createdAt = snapshot.child("createdAt").getValue(Long::class.java) ?: 0L
+            if (!SessionSecurityPolicy.fresh(createdAt)) return@addOnSuccessListener onError("Room expired")
+            val status = snapshot.child("status").getValue(String::class.java)
+            if (status !in setOf("waiting", "connected")) return@addOnSuccessListener onError("Room is unavailable")
             Log.d(TAG, "Room found: $code")
             rooms.child(code).child("status").setValue("connected")
                 .addOnSuccessListener { onSuccess() }.addOnFailureListener { onError(it.message ?: "Failed to join room") }
@@ -43,24 +49,31 @@ class FirebaseRoomManager {
     fun saveOffer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "offer", sdp, onSuccess, onError)
     fun saveAnswer(code: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = saveSdp(code, "answer", sdp, onSuccess, onError)
     private fun saveSdp(code: String, name: String, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code)) return onError("Invalid room code")
+        if (name !in setOf("offer", "answer") || !SessionSecurityPolicy.validSdp(sdp)) return onError("Invalid WebRTC description")
         rooms.child(code).child(name).setValue(sdp).addOnSuccessListener { Log.d(TAG, "Firebase $name stored: $code"); onSuccess() }
             .addOnFailureListener { onError(it.message ?: "Failed to save $name") }
     }
 
     fun getOffer(code: String, onSuccess: (String) -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code)) return onError("Invalid room code")
         rooms.child(code).child("offer").get().addOnSuccessListener {
-            it.getValue(String::class.java)?.let { offer -> Log.d(TAG, "Offer found: $code"); onSuccess(offer) }
+            it.getValue(String::class.java)?.takeIf(SessionSecurityPolicy::validSdp)?.let { offer -> Log.d(TAG, "Offer found: $code"); onSuccess(offer) }
                 ?: onError("Room has no WebRTC offer yet")
         }.addOnFailureListener { onError(it.message ?: "Failed to load offer") }
     }
 
     fun listenForAnswer(code: String, onAnswer: (String) -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code)) return onError("Invalid room code")
         val query = rooms.child(code).child("answer")
         var delivered = false
         val listener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val answer = snapshot.getValue(String::class.java)
-                if (!delivered && answer != null) { delivered = true; Log.d(TAG, "Answer received: $code"); onAnswer(answer) }
+                if (!delivered && answer != null) {
+                    if (!SessionSecurityPolicy.validSdp(answer)) { onError("Invalid WebRTC answer"); return }
+                    delivered = true; Log.d(TAG, "Answer received: $code"); onAnswer(answer)
+                }
             }
             override fun onCancelled(error: DatabaseError) = onError(error.message)
         }
@@ -69,6 +82,9 @@ class FirebaseRoomManager {
     }
 
     fun saveIceCandidate(code: String, side: String, candidate: String, sdpMid: String?, sdpMLineIndex: Int, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code) || !SessionSecurityPolicy.validSide(side) || !SessionSecurityPolicy.validIce(candidate, sdpMid, sdpMLineIndex)) {
+            onError("Invalid ICE candidate"); return
+        }
         val data = mapOf("candidate" to candidate, "sdpMid" to sdpMid, "sdpMLineIndex" to sdpMLineIndex, "createdAt" to ServerValue.TIMESTAMP)
         rooms.child(code).child("${side}Candidates").push().setValue(data)
             .addOnSuccessListener { Log.d(TAG, "ICE candidate stored: room=$code side=$side") }
@@ -76,12 +92,20 @@ class FirebaseRoomManager {
     }
 
     fun listenForIceCandidates(code: String, side: String, onCandidate: (String, String?, Int) -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code) || !SessionSecurityPolicy.validSide(side)) return onError("Invalid ICE listener")
         val query = rooms.child(code).child("${side}Candidates")
+        val delivered = HashSet<String>()
         val listener = object : ChildEventListener {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
+                if (delivered.size >= SessionSecurityPolicy.MAX_PENDING_ICE) { Log.w(TAG, "ICE candidate limit reached; extra signaling ignored"); return }
                 val candidate = snapshot.child("candidate").getValue(String::class.java) ?: return
                 val mid = snapshot.child("sdpMid").getValue(String::class.java)
                 val line = snapshot.child("sdpMLineIndex").getValue(Long::class.java)?.toInt() ?: return
+                val createdAt = snapshot.child("createdAt").getValue(Long::class.java) ?: return
+                if (!SessionSecurityPolicy.fresh(createdAt) || !SessionSecurityPolicy.validIce(candidate, mid, line) || !delivered.add("$mid|$line|$candidate")) {
+                    Log.w(TAG, "Malformed, stale, or duplicate ICE candidate ignored")
+                    return
+                }
                 Log.d(TAG, "ICE candidate received from Firebase: room=$code side=$side")
                 onCandidate(candidate, mid, line)
             }
@@ -101,5 +125,8 @@ class FirebaseRoomManager {
         Log.d(TAG, "Firebase signaling listeners removed")
     }
 
-    fun deleteRoom(code: String) { rooms.child(code).removeValue().addOnCompleteListener { Log.d(TAG, "Host room removed: $code success=${it.isSuccessful}") } }
+    fun deleteRoom(code: String) {
+        if (!SessionSecurityPolicy.validRoomCode(code)) return
+        rooms.child(code).removeValue().addOnCompleteListener { Log.d(TAG, "Host room removed: success=${it.isSuccessful}") }
+    }
 }

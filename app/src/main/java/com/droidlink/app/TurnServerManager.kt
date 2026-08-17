@@ -9,6 +9,9 @@ import java.net.URL
 
 object TurnServerManager {
 
+    private const val MAX_RESPONSE_BYTES = 64 * 1024
+    private const val MAX_ICE_SERVERS = 12
+
     private const val WORKER_URL =
         "https://droidlink-turnn.camperkins30.workers.dev/"
 
@@ -57,9 +60,18 @@ object TurnServerManager {
                         connection.errorStream
                     }
 
-                val responseBody =
-                    stream.bufferedReader()
-                        .use { it.readText() }
+                val responseBytes = stream.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(4096)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (output.size() + count > MAX_RESPONSE_BYTES) throw IOException("TURN response exceeded safe limit")
+                        output.write(buffer, 0, count)
+                    }
+                    output.toByteArray()
+                }
+                val responseBody = responseBytes.toString(Charsets.UTF_8)
 
                 Log.d(
                     "DroidLink",
@@ -68,10 +80,7 @@ object TurnServerManager {
 
                 if (responseCode !in 200..299) {
 
-                    throw IOException(
-                        "TURN Worker failed: " +
-                                "$responseCode $responseBody"
-                    )
+                    throw IOException("TURN Worker failed with HTTP $responseCode")
                 }
 
                 val json =
@@ -87,10 +96,8 @@ object TurnServerManager {
                             PeerConnection.IceServer
                             >()
 
-                for (
-                index in
-                0 until serverArray.length()
-                ) {
+                if (serverArray.length() !in 1..MAX_ICE_SERVERS) throw IOException("TURN response contained an invalid server count")
+                for (index in 0 until serverArray.length()) {
 
                     val server =
                         serverArray
@@ -104,16 +111,13 @@ object TurnServerManager {
                     val urls =
                         mutableListOf<String>()
 
-                    for (
-                    urlIndex in
-                    0 until urlsArray.length()
-                    ) {
-
-                        urls.add(
-                            urlsArray.getString(
-                                urlIndex
-                            )
-                        )
+                    if (urlsArray.length() !in 1..8) throw IOException("TURN response contained an invalid URL count")
+                    for (urlIndex in 0 until urlsArray.length()) {
+                        val iceUrl = urlsArray.getString(urlIndex)
+                        if (iceUrl.length > 1024 || !(iceUrl.startsWith("stun:") || iceUrl.startsWith("turn:") || iceUrl.startsWith("turns:"))) {
+                            throw IOException("TURN response contained an invalid ICE URL")
+                        }
+                        urls.add(iceUrl)
                     }
 
                     val builder =
@@ -131,6 +135,8 @@ object TurnServerManager {
                             "credential",
                             ""
                         )
+
+                    if (username.length > 1024 || credential.length > 2048) throw IOException("TURN credentials exceeded safe limits")
 
                     if (
                         username.isNotEmpty()

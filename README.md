@@ -8,6 +8,7 @@
 [![Android](https://img.shields.io/badge/Android-29%2B-3DDC84?logo=android&logoColor=white)](https://github.com/Aihoward/DroidLink)
 [![Kotlin](https://img.shields.io/badge/Kotlin-Android-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![WebRTC](https://img.shields.io/badge/Streaming-WebRTC-55ff33)](https://webrtc.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/Aihoward/DroidLink?include_prereleases&label=latest%20beta&color=55ff33)](https://github.com/Aihoward/DroidLink/releases)
 
 [Download the latest APK](https://github.com/Aihoward/DroidLink/releases) · [All releases](https://github.com/Aihoward/DroidLink/releases) · [Report an issue](https://github.com/Aihoward/DroidLink/issues)
@@ -92,6 +93,10 @@ DroidLink is under active beta development. Physical-device results are the sour
 Bug reports should include the DroidLink version, both device models and Android versions, connection type, relevant `DroidLink` Logcat messages, and clear reproduction steps.
 
 Use [GitHub Issues](https://github.com/Aihoward/DroidLink/issues) for reproducible bugs and compatibility reports.
+
+## License
+
+DroidLink is open-source software released under the [MIT License](LICENSE).
 
 ---
 

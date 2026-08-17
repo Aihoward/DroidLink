@@ -14,10 +14,12 @@ class WebRtcManager(private val context: Context) {
         private const val TAG = "DroidLink"
         private const val CONTROL_CHANNEL = "droidlink-controls"
         private const val AXIS_CHANNEL = "droidlink-axes"
-        private const val RECEIVE_PLAYOUT_MAX_MS = 80
+        private const val RECEIVE_PLAYOUT_MAX_MS = 60
+        private const val VIDEO_STREAM_ID = "DROIDLINK_VIDEO_STREAM"
+        private const val AUDIO_STREAM_ID = "DROIDLINK_AUDIO_STREAM"
         private const val RECEIVE_FIELD_TRIALS =
-            "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:80/" +
-                "WebRTC-ZeroPlayoutDelay/min_pacing:8ms,max_decode_queue_size:1/"
+            "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:60/" +
+                "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:1/"
     }
 
     var onControlMessageReceived: ((String) -> Unit)? = null
@@ -74,6 +76,10 @@ class WebRtcManager(private val context: Context) {
     private var observedJitterBufferMaxMs: Double? = null
     private var lastAudioBytesSent = 0L
     private var lastAudioBytesReceived = 0L
+    private var lastAudioJitterBufferDelaySeconds = 0.0
+    private var lastAudioJitterBufferTargetDelaySeconds = 0.0
+    private var lastAudioJitterBufferMinimumDelaySeconds = 0.0
+    private var lastAudioJitterBufferEmittedCount = 0L
     private var captureWindowStartMs = 0L
     private var captureWindowFrames = 0
     private var gameAudioSendConfirmed = false
@@ -100,7 +106,8 @@ class WebRtcManager(private val context: Context) {
                 .setFieldTrials(RECEIVE_FIELD_TRIALS)
                 .createInitializationOptions()
             PeerConnectionFactory.initialize(initializationOptions)
-            Log.d(TAG, "VIDEO_RECEIVE_LOW_LATENCY_CONFIG: minPlayoutMs=0 maxPlayoutMs=$RECEIVE_PLAYOUT_MAX_MS minDecodePacingMs=8 maxDecodeQueueFrames=1 jitterBuffer=enabled")
+            Log.d(TAG, "VIDEO_RECEIVE_LOW_LATENCY_CONFIG: minPlayoutMs=0 maxPlayoutMs=$RECEIVE_PLAYOUT_MAX_MS minDecodePacingMs=4 maxDecodeQueueFrames=1 jitterBuffer=enabled")
+            Log.d(TAG, "GAMING_PLAYOUT_MODE: avSync=false videoStream=$VIDEO_STREAM_ID audioStream=$AUDIO_STREAM_ID reason=prevent_audio_playout_buffer_from_raising_video_minimum")
             audioStreaming.onStatus = { status ->
                 Log.d(TAG, status)
                 onAudioStatus?.invoke(status)
@@ -142,6 +149,7 @@ class WebRtcManager(private val context: Context) {
                 enableCpuOveruseDetection = true
                 suspendBelowMinBitrate = false
                 screencastMinBitrate = 100_000
+                audioJitterBufferFastAccelerate = true
             }
             val created = currentFactory.createPeerConnection(config, observer())
             if (created == null) { onError("WebRTC failed to create PeerConnection"); return@fetchIceServers }
@@ -205,7 +213,7 @@ class WebRtcManager(private val context: Context) {
             Log.d(TAG, "GAME_AUDIO_PLAYOUT_ACTIVE: enabled=${mediaTrack.enabled()}")
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
             val routes = audioManager.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).joinToString { "${it.productName}/${it.type}" }
-            Log.d(TAG, "GAME_AUDIO_ROUTE: outputs=$routes mediaVolume=${audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)}/${audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)} muted=${audioManager.isStreamMute(android.media.AudioManager.STREAM_MUSIC)}")
+            Log.d(TAG, "GAME_AUDIO_ROUTE: usage=GAME content=MUSIC availableOutputs=$routes mediaVolume=${audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)}/${audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)} muted=${audioManager.isStreamMute(android.media.AudioManager.STREAM_MUSIC)}")
             onAudioStatus?.invoke("GAME_AUDIO_REMOTE_TRACK_RECEIVED")
             return
         }
@@ -234,7 +242,12 @@ class WebRtcManager(private val context: Context) {
             override fun onStateChange() { Log.d(TAG, "DataChannel state ($origin/${channel.label()}): ${channel.state()}"); onDataChannelStateChanged?.invoke(channel.label(), channel.state()) }
             override fun onMessage(buffer: DataChannel.Buffer?) {
                 buffer ?: return
-                val bytes = ByteArray(buffer.data.remaining()); buffer.data.get(bytes)
+                val size = buffer.data.remaining()
+                if (buffer.binary || !SessionSecurityPolicy.validControlPayloadSize(size)) {
+                    Log.w(TAG, "CONTROL_PAYLOAD_REJECTED: binary=${buffer.binary} bytes=$size")
+                    return
+                }
+                val bytes = ByteArray(size); buffer.data.get(bytes)
                 String(bytes, Charsets.UTF_8).let {
                     if (++axisReceiveLogCounter % 120 == 1) Log.d(TAG, "CONTROL_RECEIVE_SUMMARY: packets=$axisReceiveLogCounter channel=${channel.label()} type=${it.substringBefore('|')}")
                     onControlMessageReceived?.invoke(it)
@@ -301,6 +314,8 @@ class WebRtcManager(private val context: Context) {
         var totalEncodeTimeSeconds = 0.0; var totalDecodeTimeSeconds = 0.0; var totalCaptureDelaySeconds = 0.0
         var jitterBufferDelaySeconds = 0.0; var jitterBufferTargetDelaySeconds = 0.0; var jitterBufferMinimumDelaySeconds = 0.0; var jitterBufferEmittedCount = 0L
         var audioBytesSent = 0L; var audioPacketsSent = 0L; var audioBytesReceived = 0L; var audioPacketsReceived = 0L
+        var audioJitterBufferDelaySeconds = 0.0; var audioJitterBufferTargetDelaySeconds = 0.0; var audioJitterBufferMinimumDelaySeconds = 0.0; var audioJitterBufferEmittedCount = 0L
+        var audioConcealedSamples = 0L; var audioConcealmentEvents = 0L
         var codecId: String? = null; var encoderImplementation: String? = null; var decoderImplementation: String? = null
         var frameWidth: Int? = null; var frameHeight: Int? = null
         var hasOutboundVideo = false; var hasInboundVideo = false; var hasFramesRenderedStat = false
@@ -341,7 +356,15 @@ class WebRtcManager(private val context: Context) {
                     jitterBufferTargetDelaySeconds += (m["jitterBufferTargetDelay"] as? Number)?.toDouble() ?: 0.0
                     jitterBufferMinimumDelaySeconds += (m["jitterBufferMinimumDelay"] as? Number)?.toDouble() ?: 0.0
                     jitterBufferEmittedCount += number(m["jitterBufferEmittedCount"])
-                } else if (kind == "audio") { audioBytesReceived += number(m["bytesReceived"]); audioPacketsReceived += number(m["packetsReceived"]) }
+                } else if (kind == "audio") {
+                    audioBytesReceived += number(m["bytesReceived"]); audioPacketsReceived += number(m["packetsReceived"])
+                    audioJitterBufferDelaySeconds += (m["jitterBufferDelay"] as? Number)?.toDouble() ?: 0.0
+                    audioJitterBufferTargetDelaySeconds += (m["jitterBufferTargetDelay"] as? Number)?.toDouble() ?: 0.0
+                    audioJitterBufferMinimumDelaySeconds += (m["jitterBufferMinimumDelay"] as? Number)?.toDouble() ?: 0.0
+                    audioJitterBufferEmittedCount += number(m["jitterBufferEmittedCount"])
+                    audioConcealedSamples += number(m["concealedSamples"])
+                    audioConcealmentEvents += number(m["concealmentEvents"])
+                }
                 "media-source" -> if (kind == "video") {
                     framesCaptured += number(m["frames"] ?: m["framesCaptured"])
                     totalCaptureDelaySeconds += (m["totalCaptureDelay"] as? Number)?.toDouble() ?: 0.0
@@ -387,6 +410,9 @@ class WebRtcManager(private val context: Context) {
         val jitterBufferTargetMs = VideoStatsPolicy.intervalAverageMs(jitterBufferTargetDelaySeconds, lastJitterBufferTargetDelaySeconds, jitterBufferEmittedCount, lastJitterBufferEmittedCount)
         val jitterBufferMinimumMs = VideoStatsPolicy.intervalAverageMs(jitterBufferMinimumDelaySeconds, lastJitterBufferMinimumDelaySeconds, jitterBufferEmittedCount, lastJitterBufferEmittedCount)
         val jitterBufferTrend = VideoStatsPolicy.trend(jitterBufferMs, lastJitterBufferIntervalMs)
+        val audioJitterBufferMs = VideoStatsPolicy.intervalAverageMs(audioJitterBufferDelaySeconds, lastAudioJitterBufferDelaySeconds, audioJitterBufferEmittedCount, lastAudioJitterBufferEmittedCount)
+        val audioJitterBufferTargetMs = VideoStatsPolicy.intervalAverageMs(audioJitterBufferTargetDelaySeconds, lastAudioJitterBufferTargetDelaySeconds, audioJitterBufferEmittedCount, lastAudioJitterBufferEmittedCount)
+        val audioJitterBufferMinimumMs = VideoStatsPolicy.intervalAverageMs(audioJitterBufferMinimumDelaySeconds, lastAudioJitterBufferMinimumDelaySeconds, audioJitterBufferEmittedCount, lastAudioJitterBufferEmittedCount)
         jitterBufferMs?.let {
             observedJitterBufferMinMs = minOf(observedJitterBufferMinMs ?: it, it)
             observedJitterBufferMaxMs = maxOf(observedJitterBufferMaxMs ?: it, it)
@@ -408,6 +434,10 @@ class WebRtcManager(private val context: Context) {
         lastJitterBufferMinimumDelaySeconds = jitterBufferMinimumDelaySeconds
         lastJitterBufferEmittedCount = jitterBufferEmittedCount
         lastJitterBufferIntervalMs = jitterBufferMs
+        lastAudioJitterBufferDelaySeconds = audioJitterBufferDelaySeconds
+        lastAudioJitterBufferTargetDelaySeconds = audioJitterBufferTargetDelaySeconds
+        lastAudioJitterBufferMinimumDelaySeconds = audioJitterBufferMinimumDelaySeconds
+        lastAudioJitterBufferEmittedCount = audioJitterBufferEmittedCount
         val pair = selectedPair ?: selectedPairId?.let(report.statsMap::get)
         val local = pair?.members?.get("localCandidateId")?.toString()?.let(report.statsMap::get)
         val remote = pair?.members?.get("remoteCandidateId")?.toString()?.let(report.statsMap::get)
@@ -482,6 +512,16 @@ class WebRtcManager(private val context: Context) {
                 gameAudioBytesSent = audioBytesSent,
                 gameAudioPacketsReceived = audioPacketsReceived,
                 gameAudioBytesReceived = audioBytesReceived,
+                audioJitterBufferMs = audioJitterBufferMs,
+                audioJitterBufferTargetMs = audioJitterBufferTargetMs,
+                audioJitterBufferMinimumMs = audioJitterBufferMinimumMs,
+                audioConcealedSamples = audioConcealedSamples,
+                audioConcealmentEvents = audioConcealmentEvents,
+                audioPlayoutDelayMs = null,
+                audioOutputRoute = "Android media/game route",
+                audioTrackState = audioStreaming.outputState,
+                audioUnderruns = null,
+                avSyncMode = "Independent gaming playout",
                 controlBufferedBytes = controlBufferedBytes,
                 digitalQueueDepth = digitalQueueDepth,
                 analogQueueDepth = analogQueueDepth,
@@ -492,6 +532,7 @@ class WebRtcManager(private val context: Context) {
         Log.d(TAG, "VIDEO_ENCODE_FPS: ${format(encodedFps)}")
         Log.d(TAG, "VIDEO_ENCODE_TIME: intervalAvgMs=${format(encodeTimeMs)}")
         Log.d(TAG, "VIDEO_JITTER_BUFFER_INTERVAL: actualMs=${format(jitterBufferMs)} targetMs=${format(jitterBufferTargetMs)} minimumMs=${format(jitterBufferMinimumMs)} observedMinMs=${format(observedJitterBufferMinMs)} observedMaxMs=${format(observedJitterBufferMaxMs)} trend=$jitterBufferTrend emitted=$jitterBufferEmittedCount configuredMaxMs=$RECEIVE_PLAYOUT_MAX_MS")
+        Log.d(TAG, "AUDIO_JITTER_BUFFER_INTERVAL: actualMs=${format(audioJitterBufferMs)} targetMs=${format(audioJitterBufferTargetMs)} minimumMs=${format(audioJitterBufferMinimumMs)} emitted=$audioJitterBufferEmittedCount concealedSamples=$audioConcealedSamples concealmentEvents=$audioConcealmentEvents playoutDelayMs=unavailable underruns=unavailable")
         Log.d(TAG, "VIDEO_PIPELINE_LATENCY: captureMs=${format(captureLatencyMs)} encodeMs=${format(encodeTimeMs)} jitterBufferIntervalAvgMs=${format(jitterBufferMs)} decodeMs=${format(processingLatencyMs)} renderQueueEstimateMs=${format(renderLatencyMs)}")
         Log.d(TAG, "VIDEO_QUEUE_DIAGNOSTICS: instantaneousDepths=unavailable encoderIntervalPressure=$encoderPressure")
         Log.d(TAG, "VIDEO_PIPELINE_DELAY_ESTIMATE: estimatedMs=${format(estimatedPipelineDelayMs)} method=available-local-components+rtt/2+jitterBufferIntervalAvg+decode+renderQueueEstimate notCrossDeviceMotionToPhoton=true")
@@ -556,6 +597,7 @@ class WebRtcManager(private val context: Context) {
     fun setRemoteAnswer(sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) = setRemote(SessionDescription.Type.ANSWER, sdp, onSuccess, onError)
 
     private fun setRemote(type: SessionDescription.Type, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validSdp(sdp)) return onError("Remote description failed validation")
         val current = peer ?: return onError("PeerConnection has not been created")
         if (remoteDescriptionSet) { Log.w(TAG, "Duplicate remote description ignored: $type"); onSuccess(); return }
         current.setRemoteDescription(object : SimpleSdpObserver() {
@@ -570,9 +612,13 @@ class WebRtcManager(private val context: Context) {
     }
 
     fun addIceCandidate(candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
+        if (!SessionSecurityPolicy.validIce(candidate, sdpMid, sdpMLineIndex)) { Log.w(TAG, "ICE candidate rejected by validation"); return }
         val ice = IceCandidate(sdpMid, sdpMLineIndex, candidate)
         synchronized(lock) {
-            if (!remoteDescriptionSet) { pendingCandidates += ice; Log.d(TAG, "ICE candidate queued: mid=$sdpMid mLine=$sdpMLineIndex pending=${pendingCandidates.size}"); return }
+            if (!remoteDescriptionSet) {
+                if (pendingCandidates.size >= SessionSecurityPolicy.MAX_PENDING_ICE) { Log.w(TAG, "ICE candidate queue limit reached"); return }
+                pendingCandidates += ice; Log.d(TAG, "ICE candidate queued: mid=$sdpMid mLine=$sdpMLineIndex pending=${pendingCandidates.size}"); return
+            }
         }
         applyCandidate(ice)
     }
@@ -643,10 +689,11 @@ class WebRtcManager(private val context: Context) {
         screenCapturer!!.initialize(textureHelper, context.applicationContext, debug)
         screenTrack = currentFactory.createVideoTrack("DROIDLINK_SCREEN", screenSource)
         screenTrack!!.setEnabled(true)
-        val sender = currentPeer.addTrack(screenTrack, listOf("DROIDLINK_STREAM"))
+        val sender = currentPeer.addTrack(screenTrack, listOf(VIDEO_STREAM_ID))
         check(sender != null) { "Failed to add screen video track to PeerConnection" }
         videoSender = sender
         adaptiveProfile = profile; baseCaptureWidth = width; baseCaptureHeight = height; baseCaptureFps = fps; adaptationLevel = 0; lastAdaptationMs = 0L
+        updateDiagnostics { copy(requestedCaptureFps = fps, videoAdaptationLevel = 0) }
         configureVideoSender(sender, profile, fps)
         preferH264WithFallback()
         Log.d(TAG, "Host video sender created: senderId=${sender.id()} trackId=${sender.track()?.id()} enabled=${sender.track()?.enabled()}")
@@ -673,7 +720,7 @@ class WebRtcManager(private val context: Context) {
             localAudioTrack = currentFactory.createAudioTrack("DROIDLINK_GAME_AUDIO", localAudioSource).apply { setEnabled(true) }
             Log.d(TAG, "GAME_AUDIO_TRACK_CREATED: id=${localAudioTrack?.id()}")
             Log.d(TAG, "GAME_AUDIO_TRACK_ENABLED: ${localAudioTrack?.enabled()}")
-            val sender = currentPeer.addTrack(localAudioTrack, listOf("DROIDLINK_STREAM"))
+            val sender = currentPeer.addTrack(localAudioTrack, listOf(AUDIO_STREAM_ID))
             if (sender == null) {
                 val reason = "PeerConnection rejected local playback audio track"
                 Log.e(TAG, "AUDIO_UNAVAILABLE_REASON: $reason"); onAudioStatus?.invoke(reason)
@@ -722,6 +769,7 @@ class WebRtcManager(private val context: Context) {
     private fun applyVideoAdaptation(level: Int, now: Long, reason: String) {
         val sender = videoSender ?: return
         adaptationLevel = level.coerceIn(0, 3); lastAdaptationMs = now
+        updateDiagnostics { copy(videoAdaptationLevel = adaptationLevel) }
         val scale = when (adaptationLevel) { 3 -> 0.5; 2 -> 0.75; else -> 1.0 }
         val fps = when (adaptationLevel) { 0, 1 -> baseCaptureFps; 2 -> minOf(baseCaptureFps, 45); else -> minOf(baseCaptureFps, 30) }
         val maxBitrate = when (adaptationLevel) { 0 -> if (adaptiveProfile == "Low Latency") 3_500_000 else 5_000_000; 1 -> 2_500_000; 2 -> 1_500_000; else -> 800_000 }
