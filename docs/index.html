@@ -20,6 +20,7 @@
   <title>DroidLink — Android remote gaming</title>
   <link rel="icon" href="assets/droidlink-logo.png">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="community.css">
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -31,7 +32,7 @@
     </a>
     <button class="menu-toggle" aria-expanded="false" aria-controls="site-nav">Menu</button>
     <nav id="site-nav" aria-label="Main navigation">
-      <a href="#home">Home</a><a href="#download">Download</a><a href="#releases">Releases</a><a href="#about">About</a>
+      <a href="#home">Home</a><a href="#download">Download</a><a href="#releases">Releases</a><a href="#community">Community</a><a href="#about">About</a>
       <a href="https://github.com/Aihoward/DroidLink" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
     </nav>
   </header>
@@ -44,6 +45,10 @@
         <p class="hero-lede">Low-latency Android-to-Android screen streaming, game audio, and controller sharing—built for real gameplay.</p>
         <div class="hero-actions">
           <a class="button button-primary latest-download disabled" href="https://github.com/Aihoward/DroidLink/releases" aria-disabled="true">Checking latest APK…</a>
+          <a class="button button-discord" href="https://discord.gg/HdKQpKjWKY" target="_blank" rel="noopener noreferrer">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M19.5 5.34A16.3 16.3 0 0 0 15.44 4l-.5 1.03a15.1 15.1 0 0 0-5.87 0L8.55 4A16.5 16.5 0 0 0 4.5 5.35C1.93 9.17 1.24 12.9 1.59 16.57a16.5 16.5 0 0 0 4.98 2.5l1.2-1.65a10.8 10.8 0 0 1-1.88-.9l.46-.35c3.63 1.68 7.57 1.68 11.16 0l.47.35c-.6.35-1.24.65-1.9.9l1.2 1.65a16.4 16.4 0 0 0 4.98-2.5c.42-4.25-.72-7.94-2.76-11.23ZM8.77 14.3c-1.1 0-2-1.01-2-2.25s.88-2.26 2-2.26c1.12 0 2.02 1.02 2 2.26 0 1.24-.88 2.25-2 2.25Zm6.46 0c-1.1 0-2-1.01-2-2.25s.88-2.26 2-2.26c1.12 0 2.02 1.02 2 2.26 0 1.24-.88 2.25-2 2.25Z"/></svg>
+            Join the DroidLink Discord
+          </a>
           <a class="button button-secondary" href="#releases">View releases</a>
         </div>
         <div class="release-summary" aria-live="polite">
@@ -96,8 +101,21 @@
       <p class="safety-note">DroidLink never asks you to disable Android security globally or bypass Play Protect.</p>
     </section>
 
+    <section class="section" id="community">
+      <div class="community-card">
+        <div>
+          <div class="section-heading"><span>05 / COMMUNITY</span><h2>Join the DroidLink community</h2></div>
+          <p>Talk with other users, get help, compare device and controller compatibility, share test results, and follow development updates. Use GitHub Issues for formal, reproducible bug reports.</p>
+        </div>
+        <a class="button button-discord" href="https://discord.gg/HdKQpKjWKY" target="_blank" rel="noopener noreferrer">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M19.5 5.34A16.3 16.3 0 0 0 15.44 4l-.5 1.03a15.1 15.1 0 0 0-5.87 0L8.55 4A16.5 16.5 0 0 0 4.5 5.35C1.93 9.17 1.24 12.9 1.59 16.57a16.5 16.5 0 0 0 4.98 2.5l1.2-1.65a10.8 10.8 0 0 1-1.88-.9l.46-.35c3.63 1.68 7.57 1.68 11.16 0l.47.35c-.6.35-1.24.65-1.9.9l1.2 1.65a16.4 16.4 0 0 0 4.98-2.5c.42-4.25-.72-7.94-2.76-11.23ZM8.77 14.3c-1.1 0-2-1.01-2-2.25s.88-2.26 2-2.26c1.12 0 2.02 1.02 2 2.26 0 1.24-.88 2.25-2 2.25Zm6.46 0c-1.1 0-2-1.01-2-2.25s.88-2.26 2-2.26c1.12 0 2.02 1.02 2 2.26 0 1.24-.88 2.25-2 2.25Z"/></svg>
+          Join the DroidLink Discord
+        </a>
+      </div>
+    </section>
+
     <section class="section about-grid" id="about">
-      <div><div class="section-heading"><span>05 / ABOUT</span><h2>Independent. Open source. Tested on real devices.</h2></div><p>DroidLink is an independently created Android project built through AI-assisted development and iterative physical-device testing. It is not an official product of OpenAI, Google, Android, or any device manufacturer.</p></div>
+      <div><div class="section-heading"><span>06 / ABOUT</span><h2>Independent. Open source. Tested on real devices.</h2></div><p>DroidLink is an independently created Android project built through AI-assisted development and iterative physical-device testing. It is not an official product of OpenAI, Google, Android, or any device manufacturer.</p></div>
       <div class="github-card"><img src="assets/droidlink-logo.png" width="88" height="88" alt="DroidLink controller-link logo"><h3>Explore the project</h3><p>View the MIT-licensed source, report reproducible bugs, or browse every release on GitHub.</p><div class="card-actions"><a href="https://github.com/Aihoward/DroidLink" target="_blank" rel="noopener noreferrer">Repository</a><a href="https://github.com/Aihoward/DroidLink/releases" target="_blank" rel="noopener noreferrer">Releases</a><a href="https://github.com/Aihoward/DroidLink/issues" target="_blank" rel="noopener noreferrer">Issues</a></div></div>
     </section>
   </main>
