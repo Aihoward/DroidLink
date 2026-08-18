@@ -14,12 +14,8 @@ class WebRtcManager(private val context: Context) {
         private const val TAG = "DroidLink"
         private const val CONTROL_CHANNEL = "droidlink-controls"
         private const val AXIS_CHANNEL = "droidlink-axes"
-        private const val RECEIVE_PLAYOUT_MAX_MS = 60
         private const val VIDEO_STREAM_ID = "DROIDLINK_VIDEO_STREAM"
         private const val AUDIO_STREAM_ID = "DROIDLINK_AUDIO_STREAM"
-        private const val RECEIVE_FIELD_TRIALS =
-            "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:60/" +
-                "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:1/"
     }
 
     var onControlMessageReceived: ((String) -> Unit)? = null
@@ -38,6 +34,10 @@ class WebRtcManager(private val context: Context) {
     private var peer: PeerConnection? = null
     private var dataChannel: DataChannel? = null
     private var axisDataChannel: DataChannel? = null
+    private var ownsControllerChannels = false
+    private var lastChannelRecoveryMs = 0L
+    private var controlSendFailures = 0L
+    private var axisSendFailures = 0L
     private var screenCapturer: ScreenCapturerAndroid? = null
     private var textureHelper: SurfaceTextureHelper? = null
     private var screenSource: VideoSource? = null
@@ -87,6 +87,10 @@ class WebRtcManager(private val context: Context) {
     private var stagnantDecodeIntervals = 0
     private var axisSendLogCounter = 0
     private var axisReceiveLogCounter = 0
+    @Volatile private var controlPacketsSent = 0L
+    @Volatile private var controlPacketsReceived = 0L
+    @Volatile private var lastControlSentMs = 0L
+    @Volatile private var lastControlReceivedMs = 0L
     private var droppedAnalogPackets = 0L
     @Volatile private var controlBufferedBytes = 0L
     @Volatile private var digitalQueueDepth = 0
@@ -103,10 +107,10 @@ class WebRtcManager(private val context: Context) {
             if (factory != null) return
             closed = false
             val initializationOptions = PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
-                .setFieldTrials(RECEIVE_FIELD_TRIALS)
+                .setFieldTrials(StreamingLatencyPolicy.RECEIVE_FIELD_TRIALS)
                 .createInitializationOptions()
             PeerConnectionFactory.initialize(initializationOptions)
-            Log.d(TAG, "VIDEO_RECEIVE_LOW_LATENCY_CONFIG: minPlayoutMs=0 maxPlayoutMs=$RECEIVE_PLAYOUT_MAX_MS minDecodePacingMs=4 maxDecodeQueueFrames=1 jitterBuffer=enabled")
+            Log.d(TAG, "VIDEO_RECEIVE_LOW_LATENCY_CONFIG: minPlayoutMs=0 maxPlayoutMs=${StreamingLatencyPolicy.RECEIVE_PLAYOUT_MAX_MS} minDecodePacingMs=${StreamingLatencyPolicy.RECEIVE_MIN_DECODE_PACING_MS} maxDecodeQueueFrames=${StreamingLatencyPolicy.RECEIVE_MAX_DECODE_QUEUE_FRAMES} jitterBuffer=enabled")
             Log.d(TAG, "GAMING_PLAYOUT_MODE: avSync=false videoStream=$VIDEO_STREAM_ID audioStream=$AUDIO_STREAM_ID reason=prevent_audio_playout_buffer_from_raising_video_minimum")
             audioStreaming.onStatus = { status ->
                 Log.d(TAG, status)
@@ -125,6 +129,7 @@ class WebRtcManager(private val context: Context) {
     fun eglContext(): EglBase.Context = eglBase.eglBaseContext
 
     fun createPeerConnection(createControlChannel: Boolean, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        ownsControllerChannels = createControlChannel
         val currentFactory = synchronized(lock) {
             if (peer != null) { Log.w(TAG, "PeerConnection creation skipped: already created"); onSuccess(); return }
             factory
@@ -239,7 +244,15 @@ class WebRtcManager(private val context: Context) {
         previous?.takeIf { it !== channel }?.let { try { it.unregisterObserver(); it.close(); it.dispose() } catch (_: Exception) {} }
         if (isAxis) axisDataChannel = channel else dataChannel = channel
         channel.registerObserver(object : DataChannel.Observer {
-            override fun onStateChange() { Log.d(TAG, "DataChannel state ($origin/${channel.label()}): ${channel.state()}"); onDataChannelStateChanged?.invoke(channel.label(), channel.state()) }
+            override fun onStateChange() {
+                val state = channel.state()
+                Log.d(TAG, "DataChannel state ($origin/${channel.label()}): $state")
+                onDataChannelStateChanged?.invoke(channel.label(), state)
+                if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) {
+                    val isCurrent = if (isAxis) axisDataChannel === channel else dataChannel === channel
+                    if (isCurrent) recoverControllerChannels("${channel.label()} $state")
+                }
+            }
             override fun onMessage(buffer: DataChannel.Buffer?) {
                 buffer ?: return
                 val size = buffer.data.remaining()
@@ -249,6 +262,8 @@ class WebRtcManager(private val context: Context) {
                 }
                 val bytes = ByteArray(size); buffer.data.get(bytes)
                 String(bytes, Charsets.UTF_8).let {
+                    controlPacketsReceived++
+                    lastControlReceivedMs = android.os.SystemClock.elapsedRealtime()
                     if (++axisReceiveLogCounter % 120 == 1) Log.d(TAG, "CONTROL_RECEIVE_SUMMARY: packets=$axisReceiveLogCounter channel=${channel.label()} type=${it.substringBefore('|')}")
                     onControlMessageReceived?.invoke(it)
                 }
@@ -531,7 +546,7 @@ class WebRtcManager(private val context: Context) {
         Log.d(TAG, "WEBRTC STATS: VIDEO BITRATE send=${sendBitrate ?: "unavailable"} receive=${receiveBitrate ?: "unavailable"} FRAMES RECEIVED=$framesReceived ENCODED=$framesEncoded DECODED=$framesDecoded RENDERED=${if (hasFramesRenderedStat) framesRendered else "unavailable"} DROPPED=$framesDropped RTT_MS=${format(rttMs)} PACKET LOSS=$packetsLost JITTER_MS=${format(jitterMs)} AVAILABLE SEND BITRATE=${if (hasOutboundVideo) format(availableSendBps) else "not-local-video"}")
         Log.d(TAG, "VIDEO_ENCODE_FPS: ${format(encodedFps)}")
         Log.d(TAG, "VIDEO_ENCODE_TIME: intervalAvgMs=${format(encodeTimeMs)}")
-        Log.d(TAG, "VIDEO_JITTER_BUFFER_INTERVAL: actualMs=${format(jitterBufferMs)} targetMs=${format(jitterBufferTargetMs)} minimumMs=${format(jitterBufferMinimumMs)} observedMinMs=${format(observedJitterBufferMinMs)} observedMaxMs=${format(observedJitterBufferMaxMs)} trend=$jitterBufferTrend emitted=$jitterBufferEmittedCount configuredMaxMs=$RECEIVE_PLAYOUT_MAX_MS")
+        Log.d(TAG, "VIDEO_JITTER_BUFFER_INTERVAL: actualMs=${format(jitterBufferMs)} targetMs=${format(jitterBufferTargetMs)} minimumMs=${format(jitterBufferMinimumMs)} observedMinMs=${format(observedJitterBufferMinMs)} observedMaxMs=${format(observedJitterBufferMaxMs)} trend=$jitterBufferTrend emitted=$jitterBufferEmittedCount configuredMaxMs=${StreamingLatencyPolicy.RECEIVE_PLAYOUT_MAX_MS}")
         Log.d(TAG, "AUDIO_JITTER_BUFFER_INTERVAL: actualMs=${format(audioJitterBufferMs)} targetMs=${format(audioJitterBufferTargetMs)} minimumMs=${format(audioJitterBufferMinimumMs)} emitted=$audioJitterBufferEmittedCount concealedSamples=$audioConcealedSamples concealmentEvents=$audioConcealmentEvents playoutDelayMs=unavailable underruns=unavailable")
         Log.d(TAG, "VIDEO_PIPELINE_LATENCY: captureMs=${format(captureLatencyMs)} encodeMs=${format(encodeTimeMs)} jitterBufferIntervalAvgMs=${format(jitterBufferMs)} decodeMs=${format(processingLatencyMs)} renderQueueEstimateMs=${format(renderLatencyMs)}")
         Log.d(TAG, "VIDEO_QUEUE_DIAGNOSTICS: instantaneousDepths=unavailable encoderIntervalPressure=$encoderPressure")
@@ -629,8 +644,18 @@ class WebRtcManager(private val context: Context) {
     }
 
     fun sendControlMessage(message: String, realtimeAnalog: Boolean = false): Boolean {
+        val payload = message.toByteArray(Charsets.UTF_8)
+        if (!SessionSecurityPolicy.validControlPayloadSize(payload.size)) {
+            Log.w(TAG, "CONTROL_PAYLOAD_REJECTED: outbound bytes=${payload.size}")
+            return false
+        }
         val channel = if (realtimeAnalog) axisDataChannel else dataChannel
-        if (channel?.state() != DataChannel.State.OPEN) { Log.d(TAG, "Control message skipped; DataChannel state=${channel?.state()}"); return false }
+        if (channel?.state() != DataChannel.State.OPEN) {
+            if (realtimeAnalog) axisSendFailures++ else controlSendFailures++
+            Log.w(TAG, "CONTROL_SEND_FAILED: type=${if (realtimeAnalog) "axis" else "button"} state=${channel?.state()} failures=${if (realtimeAnalog) axisSendFailures else controlSendFailures}")
+            recoverControllerChannels("send attempted while ${channel?.state()}")
+            return false
+        }
         val buffered = channel.bufferedAmount()
         if (realtimeAnalog && ControllerTransportPolicy.shouldDropAnalog(buffered)) {
             droppedAnalogPackets++
@@ -644,13 +669,43 @@ class WebRtcManager(private val context: Context) {
             Log.w(TAG, "CONTROL_BACKPRESSURE: channel=${channel.label()} bufferedBytes=$buffered action=PRESERVE_DIGITAL")
         }
         val started = android.os.SystemClock.elapsedRealtimeNanos()
-        val sent = channel.send(DataChannel.Buffer(ByteBuffer.wrap(message.toByteArray(Charsets.UTF_8)), false))
+        val sent = channel.send(DataChannel.Buffer(ByteBuffer.wrap(payload), false))
+        if (sent) {
+            controlPacketsSent++
+            lastControlSentMs = android.os.SystemClock.elapsedRealtime()
+        } else {
+            if (realtimeAnalog) axisSendFailures++ else controlSendFailures++
+            Log.e(TAG, "CONTROL_SEND_FAILED: type=${if (realtimeAnalog) "axis" else "button"} open=true failures=${if (realtimeAnalog) axisSendFailures else controlSendFailures}")
+            recoverControllerChannels("DataChannel.send returned false")
+        }
         val sendMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
         controlBufferedBytes = channel.bufferedAmount()
         if (realtimeAnalog) analogQueueDepth = if (controlBufferedBytes > 0L) 1 else 0
         else digitalQueueDepth = if (controlBufferedBytes > 0L) 1 else 0
         if (++axisSendLogCounter % 120 == 1) Log.d(TAG, "CONTROL_SEND_SUMMARY: packets=$axisSendLogCounter channel=${channel.label()} type=${message.substringBefore('|')} success=$sent sendMs=${sendMicros / 1000.0} bufferedBytes=${channel.bufferedAmount()}")
         return sent
+    }
+
+    fun logControllerTransportHealth(reason: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        fun age(timestamp: Long) = if (timestamp == 0L) "never" else "${now - timestamp}ms"
+        val pendingAnalog = synchronized(lock) { pendingLatestAnalogMessage != null }
+        Log.d(TAG, "CONTROLLER_TRANSPORT_HEALTH: reason=$reason sent=$controlPacketsSent received=$controlPacketsReceived buttonSendFailures=$controlSendFailures axisSendFailures=$axisSendFailures lastSentAge=${age(lastControlSentMs)} lastReceivedAge=${age(lastControlReceivedMs)} controlState=${dataChannel?.state()} axisState=${axisDataChannel?.state()} controlBuffered=${dataChannel?.bufferedAmount() ?: 0L} axisBuffered=${axisDataChannel?.bufferedAmount() ?: 0L} pendingLatestAnalog=$pendingAnalog ownsChannels=$ownsControllerChannels closed=$closed")
+    }
+
+    fun recoverControllerChannels(reason: String): Boolean {
+        if (!ownsControllerChannels || closed || peer?.connectionState() != PeerConnection.PeerConnectionState.CONNECTED) return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastChannelRecoveryMs < ControllerTransportPolicy.CHANNEL_RECOVERY_COOLDOWN_MS) return false
+        val recoverControl = dataChannel?.state() != DataChannel.State.OPEN
+        val recoverAxis = axisDataChannel?.state() != DataChannel.State.OPEN
+        if (!recoverControl && !recoverAxis) return false
+        lastChannelRecoveryMs = now
+        Log.w(TAG, "CONTROLLER_CHANNEL_RECOVERY_STARTED: reason=$reason control=$recoverControl axis=$recoverAxis virtualDeviceUnaffected=true")
+        val currentPeer = peer ?: return false
+        if (recoverControl) registerDataChannel(currentPeer.createDataChannel(CONTROL_CHANNEL, DataChannel.Init().apply { ordered = true }), "recovery")
+        if (recoverAxis) registerDataChannel(currentPeer.createDataChannel(AXIS_CHANNEL, DataChannel.Init().apply { ordered = false; maxRetransmits = 0 }), "recovery")
+        return true
     }
 
     fun startScreenShare(permissionData: Intent, width: Int = 1280, height: Int = 720, fps: Int = 60, profile: String = "Auto") {
@@ -844,6 +899,7 @@ class WebRtcManager(private val context: Context) {
         screenCapturer = null; textureHelper = null; screenTrack = null; screenSource = null; videoSender = null
         remoteVideoTrack = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
         audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null
+        ownsControllerChannels = false; lastChannelRecoveryMs = 0L; controlSendFailures = 0L; axisSendFailures = 0L
         synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
         diagnostics = BetaDiagnostics()
         lastStatsTimestampMs = 0L; lastBytesSent = 0L; lastBytesReceived = 0L; lastFramesDecoded = 0L; lastFramesEncoded = 0L
@@ -855,6 +911,7 @@ class WebRtcManager(private val context: Context) {
         gameAudioSendConfirmed = false; gameAudioReceiveConfirmed = false
         adaptationLevel = 0; lastAdaptationMs = 0L; lastPacketsLost = 0L
         axisSendLogCounter = 0; axisReceiveLogCounter = 0
+        controlPacketsSent = 0L; controlPacketsReceived = 0L; lastControlSentMs = 0L; lastControlReceivedMs = 0L
         droppedAnalogPackets = 0L
         controlBufferedBytes = 0L; digitalQueueDepth = 0; analogQueueDepth = 0; lastBufferedAmountLogMs = 0L
         synchronized(lock) { pendingLatestAnalogMessage = null }

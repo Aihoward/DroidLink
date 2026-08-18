@@ -95,11 +95,24 @@ object VideoStatsPolicy {
     }
 }
 
+object StreamingLatencyPolicy {
+    const val RECEIVE_PLAYOUT_MAX_MS = 60
+    const val RECEIVE_MIN_DECODE_PACING_MS = 4
+    const val RECEIVE_MAX_DECODE_QUEUE_FRAMES = 1
+    const val RECEIVE_FIELD_TRIALS =
+        "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:60/" +
+            "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:1/"
+}
+
 object ControllerTransportPolicy {
     const val ANALOG_SEND_INTERVAL_MS = 10L
     const val ANALOG_HEARTBEAT_MS = 250L
     const val MAX_ANALOG_BUFFERED_BYTES = 1L * 1024L
     const val STALE_ANALOG_RTT_THRESHOLD_MS = 300L
+    const val CHANNEL_RECOVERY_COOLDOWN_MS = 2_000L
+    const val HEALTH_INTERVAL_MS = 2_000L
+    const val STALE_ACTIVE_INPUT_MS = 2_500L
+    const val HEALTH_LOG_EVERY_TICKS = 15
 
     fun shouldDropAnalog(bufferedBytes: Long) = bufferedBytes >= MAX_ANALOG_BUFFERED_BYTES
     fun estimatedPacketAgeMs(captureMs: Long, roundTripMs: Long?) =

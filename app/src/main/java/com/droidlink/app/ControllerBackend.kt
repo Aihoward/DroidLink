@@ -19,6 +19,7 @@ interface ControllerBackend {
     fun updateAxes(context: ControllerEventContext, leftX: Float, leftY: Float, rightX: Float, rightY: Float, leftTrigger: Float, rightTrigger: Float, dpadX: Float, dpadY: Float): Boolean
     fun updateDpad(context: ControllerEventContext, dpadX: Int, dpadY: Int): Boolean = false
     fun resetNeutral(reason: String) = Unit
+    fun logHealth(reason: String) = Unit
     fun close() = Unit
 }
 
@@ -65,6 +66,12 @@ class UinputVirtualGamepadBackend : ControllerBackend {
     override val capabilityDescription = DEVICE_NAME
     private val handle: Long = nativeCreate(DEVICE_NAME).also { check(it >= 0) { "native uinput create failed errno=${-it}" } }
     private var digitalWriteCounter = 0
+    private var failedDigitalWrites = 0L
+    private var failedAxisWrites = 0L
+    private var failedDpadWrites = 0L
+    private var neutralResetCounter = 0L
+    private var closed = false
+    private var lastWriteMs = 0L
 
     init {
         Log.d(TAG, "UINPUT_PERMISSION: granted")
@@ -93,22 +100,32 @@ class UinputVirtualGamepadBackend : ControllerBackend {
         val linux = logical.linuxCode ?: return false
         val started = android.os.SystemClock.elapsedRealtimeNanos()
         check(nativeKey(handle, linux, value != 0))
+        lastWriteMs = android.os.SystemClock.elapsedRealtime()
         val writeMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
         if (++digitalWriteCounter % 64 == 1) Log.d(TAG, "UINPUT_DIGITAL_SUMMARY: writes=$digitalWriteCounter logical=${logical.displayName} value=$value writeMs=${writeMicros / 1000.0}")
         true
-    } catch (error: Throwable) { Log.e(TAG, "CONTROL_INJECTION_FAILED: ${error.message}", error); false }
+    } catch (error: Throwable) {
+        failedDigitalWrites++
+        Log.e(TAG, "CONTROL_INJECTION_FAILED: type=digital failures=$failedDigitalWrites ${error.message}", error)
+        false
+    }
 
     private var axisWriteCounter = 0
     override fun updateAxes(context: ControllerEventContext, leftX: Float, leftY: Float, rightX: Float, rightY: Float, leftTrigger: Float, rightTrigger: Float, dpadX: Float, dpadY: Float): Boolean = try {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
         check(nativeAxes(handle, leftX, leftY, rightX, rightY, leftTrigger, rightTrigger, dpadX, dpadY))
+        lastWriteMs = android.os.SystemClock.elapsedRealtime()
         if (++axisWriteCounter % 120 == 1) {
             val writeMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
             Log.d(TAG, "UINPUT_EVENT_WRITTEN: logical=AXES lx=$leftX ly=$leftY rx=$rightX ry=$rightY lt=$leftTrigger rt=$rightTrigger hat=$dpadX,$dpadY")
             Log.d(TAG, "UINPUT_WRITE_MS: ${writeMicros / 1000.0} type=analog")
         }
         true
-    } catch (error: Throwable) { Log.e(TAG, "CONTROL_INJECTION_FAILED: ${error.message}", error); false }
+    } catch (error: Throwable) {
+        failedAxisWrites++
+        Log.e(TAG, "CONTROL_INJECTION_FAILED: type=analog failures=$failedAxisWrites ${error.message}", error)
+        false
+    }
     override fun updateDpad(context: ControllerEventContext, dpadX: Int, dpadY: Int): Boolean = try {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
         check(nativeDpad(handle, dpadX, dpadY))
@@ -116,7 +133,26 @@ class UinputVirtualGamepadBackend : ControllerBackend {
         Log.d(TAG, "UINPUT_EVENT_WRITTEN: logical=DPAD state=${DpadState(dpadX, dpadY).label} hat=$dpadX,$dpadY")
         Log.d(TAG, "UINPUT_WRITE_MS: ${writeMicros / 1000.0} type=dpad")
         true
-    } catch (error: Throwable) { Log.e(TAG, "CONTROL_INJECTION_FAILED: dpad ${error.message}", error); false }
-    override fun resetNeutral(reason: String) { if (nativeReset(handle)) Log.d(TAG, "CONTROL_NEUTRAL_RESET: $reason") else Log.e(TAG, "CONTROL_INJECTION_FAILED: neutral reset failed reason=$reason") }
-    override fun close() { resetNeutral("backend close"); nativeDestroy(handle); Log.d(TAG, "Virtual gamepad released") }
+    } catch (error: Throwable) {
+        failedDpadWrites++
+        Log.e(TAG, "CONTROL_INJECTION_FAILED: type=dpad failures=$failedDpadWrites ${error.message}", error)
+        false
+    }
+    override fun resetNeutral(reason: String) {
+        neutralResetCounter++
+        if (nativeReset(handle)) Log.d(TAG, "CONTROL_NEUTRAL_RESET: $reason") else Log.e(TAG, "CONTROL_INJECTION_FAILED: neutral reset failed reason=$reason")
+    }
+    override fun logHealth(reason: String) {
+        Log.d(TAG, "VIRTUAL_GAMEPAD_HEALTH: reason=$reason registered=${!closed} handle=$handle identity=${System.identityHashCode(this)} digitalWrites=$digitalWriteCounter axisWrites=$axisWriteCounter failedDigital=$failedDigitalWrites failedAxis=$failedAxisWrites failedDpad=$failedDpadWrites neutralResets=$neutralResetCounter lastWriteMs=$lastWriteMs")
+    }
+    override fun close() {
+        if (closed) {
+            Log.w(TAG, "VIRTUAL_GAMEPAD_DESTROY_SKIPPED: already destroyed handle=$handle")
+            return
+        }
+        resetNeutral("backend close")
+        closed = true
+        nativeDestroy(handle)
+        Log.d(TAG, "VIRTUAL_GAMEPAD_DESTROYED: handle=$handle digitalWrites=$digitalWriteCounter axisWrites=$axisWriteCounter lastWriteMs=$lastWriteMs reason=backend close")
+    }
 }

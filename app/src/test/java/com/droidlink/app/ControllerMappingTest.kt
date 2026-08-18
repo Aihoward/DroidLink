@@ -19,15 +19,25 @@ class ControllerMappingTest {
         assertEquals(LogicalControl.R1, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_R1))
         assertEquals(LogicalControl.START, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_START))
         assertEquals(LogicalControl.SELECT, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_BUTTON_SELECT))
-        assertEquals(LogicalControl.START, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_MENU))
-        assertEquals(LogicalControl.SELECT, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_ESCAPE))
+        assertEquals(null, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_MENU))
+        assertEquals(null, ControllerMapping.logicalForAndroidKey(KeyEvent.KEYCODE_ESCAPE))
     }
 
-    @Test fun broadAxisFallbacksCoverCommonAndroidGamepads() {
-        assertTrue(ControllerMapping.rightXAxisCandidates.contains(android.view.MotionEvent.AXIS_RX))
-        assertTrue(ControllerMapping.rightYAxisCandidates.contains(android.view.MotionEvent.AXIS_RY))
-        assertTrue(ControllerMapping.leftTriggerCandidates.contains(android.view.MotionEvent.AXIS_BRAKE))
-        assertTrue(ControllerMapping.rightTriggerCandidates.contains(android.view.MotionEvent.AXIS_GAS))
+    @Test fun stableMappingTableUsesCanonicalAndroidAxes() {
+        assertEquals("android-gamepad-v1", ControllerMapping.TABLE_VERSION)
+        assertEquals(
+            listOf(
+                android.view.MotionEvent.AXIS_X,
+                android.view.MotionEvent.AXIS_Y,
+                android.view.MotionEvent.AXIS_Z,
+                android.view.MotionEvent.AXIS_RZ,
+                android.view.MotionEvent.AXIS_LTRIGGER,
+                android.view.MotionEvent.AXIS_RTRIGGER,
+                android.view.MotionEvent.AXIS_HAT_X,
+                android.view.MotionEvent.AXIS_HAT_Y
+            ),
+            ControllerMapping.axisMap.map { it.androidAxis }
+        )
     }
 
     @Test fun logicalStateReturnsButtonsAndDpadToNeutral() {
