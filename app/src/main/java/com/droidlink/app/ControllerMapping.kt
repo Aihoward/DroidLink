@@ -24,7 +24,7 @@ enum class LogicalControl(val displayName: String, val linuxCode: Int?) {
 }
 
 object ControllerMapping {
-    const val TABLE_VERSION = "android-gamepad-v2"
+    const val TABLE_VERSION = "android-gamepad-v1"
 
     private val keyMap = mapOf(
         KeyEvent.KEYCODE_BUTTON_A to LogicalControl.A,
@@ -40,8 +40,6 @@ object ControllerMapping {
         KeyEvent.KEYCODE_BUTTON_START to LogicalControl.START,
         KeyEvent.KEYCODE_BUTTON_SELECT to LogicalControl.SELECT,
         KeyEvent.KEYCODE_BACK to LogicalControl.SELECT,
-        KeyEvent.KEYCODE_ESCAPE to LogicalControl.SELECT,
-        KeyEvent.KEYCODE_MENU to LogicalControl.START,
         KeyEvent.KEYCODE_BUTTON_MODE to LogicalControl.GUIDE,
         KeyEvent.KEYCODE_DPAD_UP to LogicalControl.DPAD_UP,
         KeyEvent.KEYCODE_DPAD_DOWN to LogicalControl.DPAD_DOWN,
@@ -62,11 +60,6 @@ object ControllerMapping {
         AxisMapping(MotionEvent.AXIS_HAT_X, "D-pad X", false),
         AxisMapping(MotionEvent.AXIS_HAT_Y, "D-pad Y", false)
     )
-
-    val rightXAxisCandidates = intArrayOf(MotionEvent.AXIS_Z, MotionEvent.AXIS_RX)
-    val rightYAxisCandidates = intArrayOf(MotionEvent.AXIS_RZ, MotionEvent.AXIS_RY)
-    val leftTriggerCandidates = intArrayOf(MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE)
-    val rightTriggerCandidates = intArrayOf(MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS)
 
     fun tableDescription() = keyMap.entries
         .sortedBy { it.key }

@@ -161,6 +161,40 @@ class MainActivity : ComponentActivity() {
     private var activeSessionId = "none"
     private var sessionGeneration = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var controllerHealthRunning = false
+    private var controllerHealthTicks = 0
+    private var lastRemoteInputPacketMs = 0L
+    private var watchdogNeutralResets = 0L
+    private val controllerHealthRunnable = object : Runnable {
+        override fun run() {
+            if (!controllerHealthRunning) return
+            controllerHealthTicks++
+            hostRtc.recoverControllerChannels("periodic health check")
+            val now = android.os.SystemClock.elapsedRealtime()
+            val axesActive = listOf(
+                logicalControllerState.leftX, logicalControllerState.leftY,
+                logicalControllerState.rightX, logicalControllerState.rightY,
+                logicalControllerState.leftTrigger, logicalControllerState.rightTrigger,
+                logicalControllerState.dpadX, logicalControllerState.dpadY
+            ).any { kotlin.math.abs(it) > 0.05f }
+            if (hostPeerState == PeerConnection.PeerConnectionState.CONNECTED &&
+                lastRemoteInputPacketMs > 0L && axesActive &&
+                now - lastRemoteInputPacketMs >= ControllerTransportPolicy.STALE_ACTIVE_INPUT_MS
+            ) {
+                watchdogNeutralResets++
+                Log.e(TAG, "CONTROLLER_WATCHDOG_RESET: staleMs=${now - lastRemoteInputPacketMs} resets=$watchdogNeutralResets virtualDeviceRecreated=false")
+                resetRemoteInput("controller packet watchdog")
+                lastRemoteInputPacketMs = now
+            }
+            if (controllerHealthTicks % ControllerTransportPolicy.HEALTH_LOG_EVERY_TICKS == 0) {
+                hostRtc.logControllerTransportHealth("periodic")
+                clientRtc.logControllerTransportHealth("periodic")
+                controllerBackend.logHealth("periodic")
+                Log.d(TAG, "CONTROLLER_SESSION_HEALTH: session=$activeSessionId active=$sessionActive captureEnabled=$clientControlActive physicalDeviceId=$lastControllerDeviceId backend=${controllerBackend.status.label} backendIdentity=${System.identityHashCode(controllerBackend)} packetsWindow=$controllerWindowPackets peerHost=$hostPeerState peerClient=$clientPeerState watchdogResets=$watchdogNeutralResets")
+            }
+            mainHandler.postDelayed(this, ControllerTransportPolicy.HEALTH_INTERVAL_MS)
+        }
+    }
     private var backendUnavailableLogged = false
     private var controllerWindowStart = android.os.SystemClock.elapsedRealtime()
     private var controllerWindowPackets = 0
@@ -405,7 +439,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("2.0 V2", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("2.7", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -764,7 +798,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 2.0 V2")
+                SettingInfo("Version", "DroidLink 2.7")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1034,7 +1068,8 @@ class MainActivity : ComponentActivity() {
                         uiFeedback(window.decorView, success = true)
                     }
                     PeerConnection.PeerConnectionState.DISCONNECTED -> {
-                        hostStatus = "Reconnecting…"; resetRemoteInput("PeerConnection $state")
+                        hostStatus = "Reconnecting…"
+                        Log.w(TAG, "CONTROLLER_PATH_PRESERVED: transient host disconnect; virtual controller identity=${System.identityHashCode(controllerBackend)}")
                         mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
                         mainHandler.postDelayed(hostDisconnectGraceRunnable, 15_000L)
                     }
@@ -1119,8 +1154,7 @@ class MainActivity : ComponentActivity() {
                     }, 10_000L)
                 }
                 PeerConnection.PeerConnectionState.DISCONNECTED -> {
-                    sendNeutralReset("connection interrupted")
-                    clientControlActive = false
+                    Log.w(TAG, "CONTROLLER_CAPTURE_PRESERVED: transient disconnect; DataChannel state gates sends during in-place recovery")
                     transitionJoinState(JoinSessionState.Reconnecting, "PeerConnection DISCONNECTED", "Connection interrupted - recovering...")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
                     mainHandler.postDelayed(disconnectGraceRunnable, 15_000L)
@@ -1203,6 +1237,9 @@ class MainActivity : ComponentActivity() {
     private fun handleControlMessageInternal(message: String) {
         recordControllerPacket()
         val parts = message.split('|')
+        if (parts.firstOrNull() in setOf("KEY", "AXIS", "DPAD", "RESET")) {
+            lastRemoteInputPacketMs = android.os.SystemClock.elapsedRealtime()
+        }
         when (parts.firstOrNull()) {
             "ACK" -> {
                 val sentAt = parts.getOrNull(2)?.toLongOrNull() ?: return
@@ -1513,6 +1550,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateSessionActive(active: Boolean, showReadiness: Boolean = true) {
+        if (active && !controllerHealthRunning) {
+            controllerHealthRunning = true
+            mainHandler.removeCallbacks(controllerHealthRunnable)
+            controllerHealthTicks = 0
+            mainHandler.postDelayed(controllerHealthRunnable, ControllerTransportPolicy.HEALTH_INTERVAL_MS)
+            Log.d(TAG, "CONTROLLER_DIAGNOSTICS_STARTED: intervalMs=${ControllerTransportPolicy.HEALTH_INTERVAL_MS}")
+        } else if (!active && controllerHealthRunning) {
+            controllerHealthRunning = false
+            mainHandler.removeCallbacks(controllerHealthRunnable)
+            Log.d(TAG, "CONTROLLER_DIAGNOSTICS_STOPPED: session inactive")
+        }
         sessionActive = active
         if (active) revealSessionMenuButton()
         sessionBackCallback.isEnabled = active || sessionMenuOpen || sessionStatsOpen || sessionSettingsOpen || sessionGameAudioOpen
@@ -1530,6 +1578,9 @@ class MainActivity : ComponentActivity() {
 
     private fun cleanupSession(deleteHostRoom: Boolean) {
         sessionGeneration++
+        controllerHealthRunning = false
+        mainHandler.removeCallbacks(controllerHealthRunnable)
+        Log.d(TAG, "CONTROLLER_CLEANUP_TRIGGERED: reason=session cleanup deleteHostRoom=$deleteHostRoom session=$activeSessionId")
         sendNeutralReset("session cleanup")
         resetRemoteInput("session cleanup")
         firebase.stopListening()
@@ -1552,6 +1603,7 @@ class MainActivity : ComponentActivity() {
         latestControllerLatencyMs = null; latestControllerPacketAgeMs = null; controllerPacketAgeTotalMs = 0L; controllerPacketAgeSamples = 0L
         recentControllerLatencies.clear(); controlThreadLogCounter = 0; controllerAckLogCounter = 0
         duplicateControlPacketsDropped = 0L; outOfOrderControlPacketsDropped = 0L; staleAnalogPacketsDropped = 0L; player2Classification = "Unknown"
+        lastRemoteInputPacketMs = 0L; watchdogNeutralResets = 0L; controllerHealthTicks = 0
         logicalControllerState = ControllerInputState(); controllerTestDisplayState = ControllerInputState(); lastControllerTestUiMs = 0L
         resetLocalDpadState("session cleanup"); hostDpadState.reset(); dpadDuplicateDrops = 0L
         controllerWindowPackets = 0; controllerWindowStart = android.os.SystemClock.elapsedRealtime(); betaDiagnostics = BetaDiagnostics()
@@ -1564,9 +1616,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (controllerInputTestOpen && isController(event.source)) {
-            ControllerMapping.logicalForAndroidKey(keyCode)?.let { updateLogicalButton(it, true) }
-        }
         if (clientControlActive && isController(event.source)) {
             noteController(event.deviceId, event.device?.name)
             if (handleDpadKey(keyCode, down = true, event)) return true
@@ -1576,9 +1625,6 @@ class MainActivity : ComponentActivity() {
         return super.onKeyDown(keyCode, event)
     }
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (controllerInputTestOpen && isController(event.source)) {
-            ControllerMapping.logicalForAndroidKey(keyCode)?.let { updateLogicalButton(it, false) }
-        }
         if (clientControlActive && isController(event.source)) {
             noteController(event.deviceId, event.device?.name)
             if (handleDpadKey(keyCode, down = false, event)) return true
@@ -1662,21 +1708,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if ((clientControlActive || controllerInputTestOpen) && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
+        if (clientControlActive && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
             noteController(event.deviceId, event.device?.name)
-            val values = floatArrayOf(
-                normalizeAxis(event, MotionEvent.AXIS_X, false),
-                normalizeAxis(event, MotionEvent.AXIS_Y, false),
-                normalizeFirstAvailableAxis(event, ControllerMapping.rightXAxisCandidates, false),
-                normalizeFirstAvailableAxis(event, ControllerMapping.rightYAxisCandidates, false),
-                normalizeFirstAvailableAxis(event, ControllerMapping.leftTriggerCandidates, true),
-                normalizeFirstAvailableAxis(event, ControllerMapping.rightTriggerCandidates, true),
-                normalizeAxis(event, MotionEvent.AXIS_HAT_X, false),
-                normalizeAxis(event, MotionEvent.AXIS_HAT_Y, false)
-            )
-            if (controllerInputTestOpen) updateLogicalAxes(values)
+            val values = ControllerMapping.axisMap.map { normalizeAxis(event, it.androidAxis, it.trigger) }.toFloatArray()
             val rawDpad = DpadState(values[6].toInt().coerceIn(-1, 1), values[7].toInt().coerceIn(-1, 1))
-            if (rawDpad != joinerDpadState.state || controllerInputTestOpen) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
+            if (rawDpad != joinerDpadState.state) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
             val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED
             if (rawDpad != DpadState() || selected == DpadSource.HAT) {
                 if (selected != DpadSource.HAT) {
@@ -1687,7 +1723,6 @@ class MainActivity : ComponentActivity() {
                 sendDpadIfChanged(rawDpad, event, DpadSource.HAT)
             }
             values[6] = 0f; values[7] = 0f
-            if (!clientControlActive) return true
             val now = android.os.SystemClock.uptimeMillis(); if (now - lastAxisSendTime < ControllerTransportPolicy.ANALOG_SEND_INTERVAL_MS) return true; lastAxisSendTime = now
             val meaningful = values.indices.any { lastAxes[it].isNaN() || kotlin.math.abs(values[it] - lastAxes[it]) >= 0.01f }
             if (!meaningful && now - lastAxisHeartbeatTime < ControllerTransportPolicy.ANALOG_HEARTBEAT_MS) return true
@@ -1710,12 +1745,6 @@ class MainActivity : ComponentActivity() {
         val deadzone = event.device?.getMotionRange(axis, event.source)?.flat?.coerceAtLeast(if (trigger) 0.02f else 0.12f) ?: if (trigger) 0.02f else 0.12f
         value = if (kotlin.math.abs(value) <= deadzone) 0f else value
         return if (trigger) value.coerceIn(0f, 1f) else value.coerceIn(-1f, 1f)
-    }
-
-    private fun normalizeFirstAvailableAxis(event: MotionEvent, candidates: IntArray, trigger: Boolean): Float {
-        val device = event.device
-        val axis = candidates.firstOrNull { device?.getMotionRange(it, event.source) != null } ?: candidates.first()
-        return normalizeAxis(event, axis, trigger)
     }
 
     override fun onDestroy() {
