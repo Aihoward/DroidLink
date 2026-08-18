@@ -97,10 +97,23 @@
   }
 
   $('show-more').addEventListener('click', () => { state.visible += 8; renderReleases(); });
-  const loadReleases = () => fetch(LOCAL_RELEASES_URL, { cache: 'no-cache' })
-    .then((response) => { if (!response.ok) throw new Error('Local release data unavailable'); return response.json(); })
-    .catch(() => fetch(API_URL, { headers: { Accept: 'application/vnd.github+json' } })
-      .then((response) => { if (!response.ok) throw new Error(`GitHub API ${response.status}`); return response.json(); }));
+
+  // Prefer the live GitHub Releases API so manually published releases appear on the site immediately.
+  // Fall back to the bundled releases.json only when the live API is unavailable.
+  const loadReleases = () => fetch(API_URL, {
+    cache: 'no-store',
+    headers: { Accept: 'application/vnd.github+json' }
+  })
+    .then((response) => {
+      if (!response.ok) throw new Error(`GitHub API ${response.status}`);
+      return response.json();
+    })
+    .catch(() => fetch(LOCAL_RELEASES_URL, { cache: 'no-cache' })
+      .then((response) => {
+        if (!response.ok) throw new Error('Local release data unavailable');
+        return response.json();
+      }));
+
   loadReleases()
     .then((releases) => {
       state.releases = releases.filter((release) => !release.draft)
