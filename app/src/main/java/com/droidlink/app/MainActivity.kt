@@ -74,6 +74,7 @@ class MainActivity : ComponentActivity() {
     private val firebase = FirebaseRoomManager()
     private val hostRtc by lazy { WebRtcManager(this) }
     private val clientRtc by lazy { WebRtcManager(this) }
+    private lateinit var menuMusicController: MenuMusicController
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -99,6 +100,7 @@ class MainActivity : ComponentActivity() {
     private var animatedBackground by mutableStateOf(true)
     private var hapticFeedback by mutableStateOf(true)
     private var uiSoundEffects by mutableStateOf(true)
+    private var menuMusicEnabled by mutableStateOf(true)
     private var accentName by mutableStateOf("Green")
     private var selectedControllerProfile by mutableStateOf(ControllerProfile.PC_WINLATOR)
     private var onboardingVisible by mutableStateOf(false)
@@ -288,6 +290,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        menuMusicController = MenuMusicController(this)
         enableImmersiveMode()
         ContextCompat.registerReceiver(this, projectionReadyReceiver, IntentFilter(ScreenCaptureService.ACTION_READY), ContextCompat.RECEIVER_NOT_EXPORTED)
         receiverRegistered = true
@@ -310,6 +313,7 @@ class MainActivity : ComponentActivity() {
             animatedBackground = preferences.getBoolean("animated_background", true)
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
+            menuMusicEnabled = preferences.getBoolean("menu_music", true)
             accentName = preferences.getString("accent_color", "Green")?.takeIf { it in ACCENT_COLORS } ?: "Green"
             selectedControllerProfile = ControllerProfile.fromStorage(preferences.getString("controller_profile", null))
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
@@ -344,7 +348,6 @@ class MainActivity : ComponentActivity() {
                         if (sessionActive && readinessVisible) PreGameReadiness()
                     }
                 }
-                LaunchedEffect(sessionStatsOpen) { setPerformanceDiagnosticsActive(sessionStatsOpen) }
                 LaunchedEffect(Unit) {
                     if (showIntroAnimation) delay(1_150L)
                     introVisible = false
@@ -353,9 +356,32 @@ class MainActivity : ComponentActivity() {
                     if (keepScreenAwake && sessionActive) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+                LaunchedEffect(menuMusicEnabled, mode, introVisible, onboardingVisible, sessionActive, sessionStarting, joinSessionState) {
+                    syncMenuMusic()
+                }
             }
         }
         requestUnbufferedControllerDispatch()
+    }
+
+    override fun onPause() {
+        menuMusicController.onBackground()
+        super.onPause()
+    }
+
+    private fun syncMenuMusic() {
+        val normalMenuVisible = !introVisible &&
+            !onboardingVisible &&
+            mode != "disconnecting" &&
+            !joinSessionState.showsActiveSession
+        menuMusicController.setPlaybackDesired(
+            MenuMusicPolicy.shouldPlay(
+                enabled = menuMusicEnabled,
+                normalMenuVisible = normalMenuVisible,
+                sessionActive = sessionActive,
+                sessionStarting = sessionStarting
+            )
+        )
     }
 
     private fun requestUnbufferedControllerDispatch() {
@@ -415,7 +441,18 @@ class MainActivity : ComponentActivity() {
 
     @Composable private fun MainShell() = Column(Modifier.fillMaxSize().background(Color(0xA8050705)).windowInsetsPadding(WindowInsets.safeDrawing).padding(20.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            NeonTextButton("SETTINGS", compact = true) { mainPage = "settings" }
+            val view = LocalView.current
+            IconButton(
+                onClick = { uiFeedback(view); mainPage = "settings" },
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(
+                    painter = painterResource(android.R.drawable.ic_menu_preferences),
+                    contentDescription = "Settings",
+                    tint = if (mainPage == "settings") neonGreen else Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
         }
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             when (mainPage) {
@@ -428,7 +465,6 @@ class MainActivity : ComponentActivity() {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             NavButton("HOME", mainPage == "home") { mainPage = "home" }
             NavButton("STATS", mainPage == "stats") { mainPage = "stats" }
-            NavButton("SETTINGS", mainPage == "settings") { mainPage = "settings" }
             NavButton("ABOUT", mainPage == "about") { mainPage = "about" }
         }
     }
@@ -453,8 +489,9 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("3.0.1", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("3.0", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
+        Text("Menu Music: Prod. By S.P.L. BEATS", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
         SettingInfo("Open source", "WebRTC • AndroidX • Firebase")
@@ -595,7 +632,7 @@ class MainActivity : ComponentActivity() {
             Text("SESSION", color = Color.White, fontWeight = FontWeight.Black, fontSize = 18.sp, letterSpacing = 3.sp)
             Text(if (mode == "host") "Hosting • $hostRoomCode" else "Connected to host", color = mutedText, fontSize = 11.sp)
             SessionActionButton("RESUME") { sessionMenuOpen = false; revealSessionMenuButton() }
-            SessionActionButton("DIAGNOSTICS", filled = false) { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }
+            SessionActionButton("STATS", filled = false) { sessionMenuOpen = false; sessionStatsOpen = true; controllerInputTestOpen = false }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 CompactSessionButton("AUDIO") { sessionMenuOpen = false; sessionGameAudioOpen = true }
                 CompactSessionButton("SETTINGS") { sessionMenuOpen = false; sessionSettingsOpen = true }
@@ -613,14 +650,12 @@ class MainActivity : ComponentActivity() {
             Text("Volume ${(gameAudioVolume * 100).toInt()}%", color = mutedText)
             Slider(value = gameAudioVolume, onValueChange = { gameAudioVolume = it; clientRtc.setGameAudioVolume(it) }, enabled = gameAudioEnabled, colors = SliderDefaults.colors(thumbColor = neonGreen, activeTrackColor = neonGreen))
             SettingInfo("Capture", friendlyAudioStatus())
-            SettingInfo("RTP sent", "${betaDiagnostics.gameAudioPacketsSent} packets")
-            SettingInfo("RTP received", "${betaDiagnostics.gameAudioPacketsReceived} packets")
             NeonButton("BACK TO SESSION MENU", filled = false) { sessionGameAudioOpen = false; sessionMenuOpen = true }
         }
     }
 
     @Composable private fun SessionStats() = Box(Modifier.fillMaxSize().background(Color(0xBB000000)).windowInsetsPadding(WindowInsets.safeDrawing), contentAlignment = Alignment.Center) {
-        if (controllerInputTestOpen) ControllerInputTestPanel() else ConnectionStatsSummary(showBack = true)
+        ConnectionStatsSummary(showBack = true)
     }
 
     @Composable private fun ConnectionStatsSummary(showBack: Boolean) {
@@ -628,42 +663,14 @@ class MainActivity : ComponentActivity() {
         val connectionQuality = connectionQuality()
         Column(Modifier.widthIn(max = 620.dp).fillMaxWidth().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("CONNECTION STATS", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
-            StatSection("SESSION") { diagnosticLine("Player 1", "Host"); diagnosticLine("Player 2", "Joiner") }
-            StatSection("CONNECTION") { diagnosticLine("Quality", connectionQuality); diagnosticLine("State", "${d.connectionState} / ICE ${d.iceState}"); diagnosticLine("Route", d.route); diagnosticLine("RTT / Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—") }
+            StatSection("CONNECTION") {
+                diagnosticLine("Quality", connectionQuality)
+                diagnosticLine("Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—")
+            }
             StatSection("VIDEO") {
-                diagnosticLine("Resolution", d.resolution); diagnosticLine("Host capture FPS", d.captureFps?.let { "%.1f".format(it) } ?: "Unavailable on this peer")
-                diagnosticLine("Requested FPS / adaptation", "${d.requestedCaptureFps ?: "Unavailable on this peer"} / level ${d.videoAdaptationLevel}")
-                diagnosticLine("Host encode FPS", d.encodeFps?.let { "%.1f".format(it) } ?: "Unavailable on this peer"); diagnosticLine("Receive / decode FPS", "${d.receiveFps?.let { "%.1f".format(it) } ?: "Unavailable"} / ${d.decodeFps?.let { "%.1f".format(it) } ?: "Unavailable"}")
-                diagnosticLine("Render FPS", d.renderFps?.let { "%.1f".format(it) } ?: "Unavailable from WebRTC stats"); diagnosticLine("Video bitrate", d.videoBitrateBps?.let { "${it / 1_000} kbps" } ?: "Unavailable")
-                diagnosticLine("Available outbound (host only)", d.availableOutgoingBitrateBps?.let { "${it / 1_000} kbps" } ?: "Unavailable on this peer"); diagnosticLine("Packets received", d.packetsReceived.toString()); diagnosticLine("Dropped frames", d.framesDropped.toString())
-                diagnosticLine("Estimated pipeline delay", d.frameAgeAtRenderMs?.let { "~%.1f ms".format(it) } ?: "Unavailable")
-                diagnosticLine("Capture / encode", "${d.captureLatencyMs?.let { "%.1f ms".format(it) } ?: "—"} / ${d.averageEncodeTimeMs?.let { "%.1f ms".format(it) } ?: "—"}")
-                diagnosticLine("Jitter actual / target", "${d.videoJitterBufferMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.videoJitterBufferTargetMs?.let { "%.1f ms".format(it) } ?: "Unavailable"}")
-                diagnosticLine("Jitter min / observed range", "${d.videoJitterBufferMinimumMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.videoJitterBufferObservedMinMs?.let { "%.1f".format(it) } ?: "—"}–${d.videoJitterBufferObservedMaxMs?.let { "%.1f ms".format(it) } ?: "—"}")
-                diagnosticLine("Jitter trend / decode", "${d.videoJitterBufferTrend} / ${d.averageDecodeTimeMs?.let { "%.1f ms".format(it) } ?: "Unavailable"}")
-                diagnosticLine("Encoder / decoder", "${d.encoderImplementation} / ${d.decoderImplementation}")
-                diagnosticLine("Video queues E / D / R", "${d.encoderQueueDepth ?: "Unavailable"} / ${d.decoderQueueDepth ?: "Unavailable"} / ${d.renderQueueDepth ?: "Unavailable"}")
-                diagnosticLine("Bottleneck", d.videoBottleneck)
-            }
-            StatSection("NETWORK") { diagnosticLine("Packet loss", d.packetLoss.toString()); diagnosticLine("Jitter", d.jitterMs?.let { "%.1f ms".format(it) } ?: "—"); diagnosticLine("Path", d.route) }
-            StatSection("CONTROLLER") { diagnosticLine("Player 2", d.player2Status); diagnosticLine("Latency", d.lastControllerLatencyMs?.let { "$it ms" } ?: "—"); diagnosticLine("Packet age", d.controllerPacketAgeMs?.let { "$it ms (avg ${d.averageControllerPacketAgeMs ?: it} ms)" } ?: "—"); diagnosticLine("Packets/sec", "%.1f".format(d.controllerPacketsPerSecond)) }
-            StatSection("GAME AUDIO") {
-                diagnosticLine("Capture", friendlyAudioStatus()); diagnosticLine("RTP sent", "${d.gameAudioPacketsSent} packets / ${d.gameAudioBytesSent} bytes")
-                diagnosticLine("RTP received", "${d.gameAudioPacketsReceived} packets / ${d.gameAudioBytesReceived} bytes"); diagnosticLine("Playing", if (gameAudioEnabled) "Enabled" else "Disabled")
-                diagnosticLine("Output / state", "${d.audioOutputRoute} / ${d.audioTrackState}")
-                diagnosticLine("Jitter actual / target", "${d.audioJitterBufferMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.audioJitterBufferTargetMs?.let { "%.1f ms".format(it) } ?: "Unavailable"}")
-                diagnosticLine("Jitter minimum", d.audioJitterBufferMinimumMs?.let { "%.1f ms".format(it) } ?: "Unavailable")
-                diagnosticLine("Concealed samples / events", "${d.audioConcealedSamples} / ${d.audioConcealmentEvents}")
-                diagnosticLine("Playout delay / underruns", "${d.audioPlayoutDelayMs?.let { "%.1f ms".format(it) } ?: "Unavailable"} / ${d.audioUnderruns ?: "Unavailable"}")
-                diagnosticLine("A/V sync", d.avSyncMode)
-            }
-            var advanced by remember { mutableStateOf(false) }
-            NeonTextButton(if (advanced) "HIDE ADVANCED DIAGNOSTICS" else "ADVANCED DIAGNOSTICS") { advanced = !advanced }
-            if (advanced) {
-                diagnosticLine("Candidate pair", d.candidatePair); diagnosticLine("Frames encoded / received / decoded / rendered", "${d.framesEncoded} / ${d.framesReceived} / ${d.framesDecoded} / ${d.framesRendered ?: "Unavailable"}")
-                diagnosticLine("Encode / decode time", "${d.averageEncodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"} / ${d.averageDecodeTimeMs?.let { "%.2f ms".format(it) } ?: "—"}")
-                diagnosticLine("Queue digital / analog", "${d.digitalQueueDepth} / ${d.analogQueueDepth}"); diagnosticLine("DataChannel buffer", "${d.controlBufferedBytes} bytes")
-                diagnosticLine("Duplicate / out-of-order", "${d.duplicateControlPacketsDropped} / ${d.outOfOrderControlPacketsDropped}")
+                diagnosticLine("Resolution", d.resolution)
+                val fps = d.renderFps ?: d.receiveFps ?: d.captureFps ?: d.encodeFps
+                diagnosticLine("FPS", fps?.let { "%.1f".format(it) } ?: "—")
             }
             if (showBack) NeonTextButton("RETURN TO GAME") { sessionStatsOpen = false; sessionMenuOpen = false }
         }
@@ -691,7 +698,7 @@ class MainActivity : ComponentActivity() {
         Text(detail, color = mutedText, textAlign = TextAlign.Center)
         NeonButton("RETRY", onClick = onRetry)
         NeonTextButton("BACK TO HOME") { onBack() }
-        NeonTextButton("VIEW DIAGNOSTICS") { onBack(); mainPage = "stats" }
+        NeonTextButton("VIEW STATS") { onBack(); mainPage = "stats" }
     }
 
     @Composable private fun ControllerInputTestPanel() {
@@ -776,31 +783,17 @@ class MainActivity : ComponentActivity() {
                 SettingInfo("Resolution / FPS", when (qualityPreset) { "Low Latency" -> "720p / 60 FPS target"; "Balanced" -> "720p / Auto FPS"; "High Quality" -> "1080p / 30 FPS target"; else -> "Automatic (recommended)" })
                 SettingInfo("Bitrate", "Automatic WebRTC adaptation")
             }
-            SettingSection("CONTROLLER") {
-                Text("Compatibility profile", color = mutedText, fontSize = 12.sp)
-                ControllerProfile.entries.forEach { profile ->
-                    FilterChip(
-                        selected = selectedControllerProfile == profile,
-                        onClick = { setControllerProfile(profile) },
-                        enabled = !inSession,
-                        label = { Text(profile.label, fontSize = 11.sp) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                SettingInfo("Player 2", betaDiagnostics.player2Status)
-                SettingInfo("Virtual gamepad", friendlyControllerStatus())
-                SettingInfo("Controller slot", "Automatic")
-                SettingInfo("Stick deadzone", "Hardware/default mapping")
-                SettingInfo("Players 3–4", "Coming later")
-                NeonTextButton("CONTROLLER TEST") { controllerInputTestOpen = true; sessionSettingsOpen = false; sessionStatsOpen = true }
-            }
             SettingSection("AUDIO") {
                 SettingInfo("Game audio", friendlyAudioStatus())
                 SettingInfo("Volume", "Controlled by device")
+                SettingSwitch("Menu Music", menuMusicEnabled) { enabled ->
+                    menuMusicEnabled = enabled
+                    getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putBoolean("menu_music", enabled).apply()
+                    syncMenuMusic()
+                }
             }
             SettingSection("CONNECTION") {
                 SettingInfo("Connection mode", "Automatic (recommended)")
-                SettingInfo("Current route", betaDiagnostics.route)
                 SettingInfo("Auto reconnect", "Enabled by session recovery")
             }
             SettingSection("APP") {
@@ -822,7 +815,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 3.0.1")
+                SettingInfo("Version", "DroidLink 3.0")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -909,10 +902,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun resetUiSettings() {
+        val preferences = getSharedPreferences("droid_link_ui", MODE_PRIVATE)
+        val preservedControllerProfile = preferences.getString("controller_profile", null)
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
-        animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
-        accentName = "Green"; selectedControllerProfile = ControllerProfile.PC_WINLATOR
-        getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
+        animatedBackground = true; hapticFeedback = true; uiSoundEffects = true; menuMusicEnabled = true
+        accentName = "Green"
+        preferences.edit().clear().putBoolean("onboarding_complete", true).putBoolean("menu_music", true).also { editor ->
+            if (preservedControllerProfile != null) editor.putString("controller_profile", preservedControllerProfile)
+        }.apply()
+        syncMenuMusic()
     }
 
     private fun revealSessionMenuButton() {
@@ -956,6 +954,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        menuMusicController.onForeground()
+        syncMenuMusic()
         window.decorView.post { enableImmersiveMode() }
     }
 
@@ -1889,6 +1889,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)
         hostRtc.release(); clientRtc.release()
+        menuMusicController.release()
         if (receiverRegistered) { try { unregisterReceiver(projectionReadyReceiver) } catch (_: Exception) {}; receiverRegistered = false }
         try { (getSystemService(Context.INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener) } catch (_: Exception) {}
         super.onDestroy()
