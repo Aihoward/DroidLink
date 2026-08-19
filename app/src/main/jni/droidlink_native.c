@@ -77,7 +77,7 @@ JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_n
 }
 
 JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeReset(JNIEnv* e,jclass c,jlong h){
-  int fd=(int)h,ok=1;int keys[]={BTN_SOUTH,BTN_EAST,BTN_NORTH,BTN_WEST,BTN_TL,BTN_TR,BTN_START,BTN_MODE};
+  int fd=(int)h,ok=1;int keys[]={BTN_SOUTH,BTN_EAST,BTN_NORTH,BTN_WEST,BTN_TL,BTN_TR,BTN_TR2,BTN_START,BTN_MODE};
   int axes[]={ABS_X,ABS_Y,ABS_RX,ABS_RY,ABS_Z,ABS_RZ,ABS_HAT0X,ABS_HAT0Y};
   for(unsigned i=0;i<sizeof(keys)/sizeof(keys[0]);i++)ok&=emit(fd,EV_KEY,keys[i],0);
   for(unsigned i=0;i<sizeof(axes)/sizeof(axes[0]);i++)ok&=emit(fd,EV_ABS,axes[i],0);

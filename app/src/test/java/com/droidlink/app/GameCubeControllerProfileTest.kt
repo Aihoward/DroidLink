@@ -9,15 +9,15 @@ import org.junit.Test
 
 class GameCubeControllerProfileTest {
     @Test fun dolphinProfileTargetsTheEstablishedPlayer2Device() {
-        assertEquals("gamecube-dolphin-v3", GameCubeMapping.TABLE_VERSION)
+        assertEquals("gamecube-dolphin-v3.0.1", GameCubeMapping.TABLE_VERSION)
         assertEquals("DroidLink Player 2", GameCubeMapping.DOLPHIN_DEVICE_NAME)
     }
 
     @Test fun dolphinDigitalOutputsUseAndroidMappedButtons() {
         assertEquals(315, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_START))
         assertEquals(315, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_MENU))
-        assertEquals(316, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_R1))
-        assertEquals(316, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_Z))
+        assertEquals(313, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_R1))
+        assertEquals(313, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_Z))
         assertEquals(310, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_L2))
         assertEquals(311, GameCubeMapping.linuxCodeForAndroidKey(KeyEvent.KEYCODE_BUTTON_R2))
     }

@@ -63,4 +63,19 @@ class ControllerMappingTest {
         assertEquals("UP_LEFT", DpadState(-1, -1).label)
         assertEquals("DOWN_RIGHT", DpadState(1, 1).label)
     }
+
+    @Test fun systemFacingControllerButtonsAreCanonicalizedBeforeTransport() {
+        assertEquals(
+            KeyEvent.KEYCODE_BUTTON_START,
+            ControllerButtonNormalization.canonicalKeyCode(KeyEvent.KEYCODE_MENU)
+        )
+        assertEquals(
+            KeyEvent.KEYCODE_BUTTON_SELECT,
+            ControllerButtonNormalization.canonicalKeyCode(KeyEvent.KEYCODE_BACK)
+        )
+        assertEquals(
+            KeyEvent.KEYCODE_BUTTON_R1,
+            ControllerButtonNormalization.canonicalKeyCode(KeyEvent.KEYCODE_BUTTON_R1)
+        )
+    }
 }

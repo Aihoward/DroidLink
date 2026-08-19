@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.*
 import android.media.projection.MediaProjectionManager
 import android.hardware.input.InputManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Debug
 import android.os.Handler
@@ -154,7 +155,7 @@ class MainActivity : ComponentActivity() {
     private var digitalSequence = 0L
     private var analogSequence = 0L
     private var lastControllerDeviceId = -1
-    private val controllerAxisLayouts = mutableMapOf<Int, ControllerAxisLayout>()
+    private val controllerAxisLayouts = mutableMapOf<Int, ControllerDeviceAxisState>()
     private val dpadSources = mutableMapOf<Int, DpadSource>()
     private val joinerDpadKeys = mutableSetOf<LogicalControl>()
     private val joinerDpadState = DpadStateMachine()
@@ -354,6 +355,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        requestUnbufferedControllerDispatch()
+    }
+
+    private fun requestUnbufferedControllerDispatch() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.decorView.requestUnbufferedDispatch(
+                InputDevice.SOURCE_CLASS_BUTTON or InputDevice.SOURCE_CLASS_JOYSTICK
+            )
+            Log.d(TAG, "CONTROLLER_UNBUFFERED_DISPATCH: button+joystick enabled")
+        }
     }
 
     private val neonGreen: Color get() = accentColor(accentName)
@@ -442,7 +453,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("3.0", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("3.0.1", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -811,7 +822,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 3.0")
+                SettingInfo("Version", "DroidLink 3.0.1")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1673,25 +1684,28 @@ class MainActivity : ComponentActivity() {
         renderer?.let { releaseRenderer(it, "session detach") }
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) {
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (clientControlActive && isControllerEvent(event.source, event.device)) {
+            val down = event.action == KeyEvent.ACTION_DOWN
+            val up = event.action == KeyEvent.ACTION_UP
+            if (!down && !up) return true
             noteController(event.deviceId, event.device?.name)
-            if (handleDpadKey(keyCode, down = true, event)) return true
-            if (event.repeatCount == 0) sendKey(keyCode, "DOWN", event)
+            val keyCode = ControllerButtonNormalization.canonicalKeyCode(event.keyCode)
+            if (handleDpadKey(keyCode, down, event)) return true
+            if (up || event.repeatCount == 0) sendKey(keyCode, if (down) "DOWN" else "UP", event)
             return true
         }
-        return super.onKeyDown(keyCode, event)
+        return super.dispatchKeyEvent(event)
     }
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) {
-            noteController(event.deviceId, event.device?.name)
-            if (handleDpadKey(keyCode, down = false, event)) return true
-            sendKey(keyCode, "UP", event)
-            return true
-        }
-        return super.onKeyUp(keyCode, event)
+
+    private fun isControllerEvent(source: Int, device: InputDevice?): Boolean {
+        val deviceSources = device?.sources ?: 0
+        return source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD ||
+            source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
+            deviceSources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            deviceSources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
     }
-    private fun isController(source: Int) = source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD || source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD || source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
 
     private fun noteController(deviceId: Int, name: String?) {
         if (lastControllerDeviceId == deviceId) return
@@ -1767,18 +1781,45 @@ class MainActivity : ComponentActivity() {
         if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=joiner sequence=$digitalSequence")
     }
 
-    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if (clientControlActive && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (handleControllerMotionEvent(event)) return true
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun handleControllerMotionEvent(event: MotionEvent): Boolean {
+        val joystickEvent = event.source and InputDevice.SOURCE_CLASS_JOYSTICK != 0 ||
+            (event.device?.sources ?: 0) and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        if (clientControlActive && joystickEvent && event.actionMasked == MotionEvent.ACTION_MOVE) {
             noteController(event.deviceId, event.device?.name)
-            val axisLayout = controllerAxisLayouts.getOrPut(event.deviceId) {
-                val available = event.device?.motionRanges?.map { it.axis }?.toSet().orEmpty()
-                ControllerAxisCompatibility.resolve(available).also { resolved ->
-                    val ranges = event.device?.motionRanges?.joinToString { range -> "${MotionEvent.axisToString(range.axis)}=${range.min}..${range.max} flat=${range.flat}" }.orEmpty()
-                    Log.d(TAG, "JOINER_AXIS_LAYOUT: player=2 deviceId=${event.deviceId} resolved=[${resolved.description()}] available=[$ranges]")
+            val axisState = controllerAxisLayouts.getOrPut(event.deviceId) {
+                val available = ControllerAxisCompatibility.candidateAxes.filterTo(mutableSetOf()) { axis ->
+                    controllerMotionRange(event.device, axis) != null
                 }
+                val layout = ControllerAxisCompatibility.resolve(available)
+                val ranges = available.joinToString { axis ->
+                    val range = controllerMotionRange(event.device, axis)
+                    "${MotionEvent.axisToString(axis)}=${range?.min}..${range?.max} flat=${range?.flat}"
+                }
+                Log.d(TAG, "JOINER_AXIS_LAYOUT: player=2 deviceId=${event.deviceId} resolved=[${layout.description()}] available=[$ranges]")
+                ControllerDeviceAxisState(layout)
             }
-            val values = axisLayout.orderedMappings().map { normalizeAxis(event, it.androidAxis, it.trigger) }.toFloatArray()
-            val rawDpad = DpadState(values[6].toInt().coerceIn(-1, 1), values[7].toInt().coerceIn(-1, 1))
+            val layout = axisState.layout
+            val leftTrigger = normalizeTriggerAxis(event, layout.leftTrigger, axisState, left = true)
+            val rightTrigger = normalizeTriggerAxis(event, layout.rightTrigger, axisState, left = false)
+            val values = floatArrayOf(
+                normalizeStickAxis(event, layout.leftX),
+                normalizeStickAxis(event, layout.leftY),
+                normalizeStickAxis(event, layout.rightX),
+                normalizeStickAxis(event, layout.rightY),
+                leftTrigger,
+                rightTrigger,
+                0f,
+                0f
+            )
+            val rawDpad = DpadState(
+                ControllerAxisNormalizer.dpadDirection(axisValue(event, layout.hatX)),
+                ControllerAxisNormalizer.dpadDirection(axisValue(event, layout.hatY))
+            )
             if (rawDpad != joinerDpadState.state) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
             val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED
             if (rawDpad != DpadState() || selected == DpadSource.HAT) {
@@ -1804,16 +1845,46 @@ class MainActivity : ComponentActivity() {
             recordControllerPacket()
             clientRtc.sendControlMessage(message, realtimeAnalog = true); return true
         }
-        return super.onGenericMotionEvent(event)
+        return false
     }
 
-    private fun normalizeAxis(event: MotionEvent, axis: Int, trigger: Boolean): Float {
-        var value = event.getAxisValue(axis)
-        if (trigger && value < 0f) value = (value + 1f) / 2f
-        val deadzone = event.device?.getMotionRange(axis, event.source)?.flat?.coerceAtLeast(if (trigger) 0.02f else 0.12f) ?: if (trigger) 0.02f else 0.12f
-        value = if (kotlin.math.abs(value) <= deadzone) 0f else value
-        return if (trigger) value.coerceIn(0f, 1f) else value.coerceIn(-1f, 1f)
+    private fun normalizeStickAxis(event: MotionEvent, axis: Int): Float {
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return 0f
+        return ControllerAxisNormalizer.normalizeStick(
+            event.getAxisValue(axis),
+            controllerMotionRange(event.device, axis)?.toAxisRange()
+        )
     }
+
+    private fun normalizeTriggerAxis(
+        event: MotionEvent,
+        axis: Int,
+        state: ControllerDeviceAxisState,
+        left: Boolean
+    ): Float {
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return 0f
+        val raw = event.getAxisValue(axis)
+        val range = controllerMotionRange(event.device, axis)?.toAxisRange()
+        if (ControllerAxisNormalizer.centeredTriggerActivated(raw, range)) {
+            if (left) state.leftCenteredTriggerActivated = true else state.rightCenteredTriggerActivated = true
+        }
+        val activated = if (left) state.leftCenteredTriggerActivated else state.rightCenteredTriggerActivated
+        return ControllerAxisNormalizer.normalizeTrigger(raw, range, activated)
+    }
+
+    private fun axisValue(event: MotionEvent, axis: Int): Float =
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) 0f else event.getAxisValue(axis)
+
+    private fun controllerMotionRange(device: InputDevice?, axis: Int): InputDevice.MotionRange? {
+        if (device == null || axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return null
+        return device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK)
+            ?: device.getMotionRange(axis, InputDevice.SOURCE_GAMEPAD)
+            ?: device.motionRanges.firstOrNull { range ->
+                range.axis == axis && range.source and InputDevice.SOURCE_CLASS_JOYSTICK != 0
+            }
+    }
+
+    private fun InputDevice.MotionRange.toAxisRange() = ControllerAxisRange(min, max, flat)
 
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)

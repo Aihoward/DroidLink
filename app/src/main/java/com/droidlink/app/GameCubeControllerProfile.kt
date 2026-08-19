@@ -37,7 +37,7 @@ data class GameCubeControllerState(
 }
 
 object GameCubeMapping {
-    const val TABLE_VERSION = "gamecube-dolphin-v3"
+    const val TABLE_VERSION = "gamecube-dolphin-v3.0.1"
     const val DOLPHIN_DEVICE_NAME = "DroidLink Player 2"
     const val DIGITAL_TRIGGER_THRESHOLD = 0.90f
 
@@ -65,7 +65,7 @@ object GameCubeMapping {
         KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> 310
         KeyEvent.KEYCODE_BUTTON_R2 -> 311
         KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_MENU -> 315
-        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_Z -> 316
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_Z -> 313
         else -> null
     }
 

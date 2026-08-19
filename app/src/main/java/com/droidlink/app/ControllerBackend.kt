@@ -94,7 +94,7 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: name=$DEVICE_NAME vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
         Log.d(TAG, "DOLPHIN_BUTTON_MAPPING: physical A/B/X/Y->GameCube A/B/X/Y; Start->Start; R1->Z")
         Log.d(TAG, "DOLPHIN_TRIGGER_MAPPING: L2/R2 analog->Analog L/R; threshold=${GameCubeMapping.DIGITAL_TRIGGER_THRESHOLD}; L1/L2 button->Digital L; R2 button->Digital R")
-        Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button Mode; Digital L=Button L1; Digital R=Button R1; Analog L/R=Axis LTRIGGER/RTRIGGER")
+        Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button R2; Digital L=Button L1; Digital R=Button R1; Analog L/R=Axis LTRIGGER/RTRIGGER")
         Log.d(TAG, "DOLPHIN_AXIS_MAPPING: left stick->Main Stick; right stick->C-Stick; direct Android polarity")
         if (instances > 1) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
     }

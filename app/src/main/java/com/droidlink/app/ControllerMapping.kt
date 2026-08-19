@@ -66,6 +66,14 @@ object ControllerMapping {
         .joinToString { "${KeyEvent.keyCodeToString(it.key)}->${it.value.displayName}/EV_KEY_${it.value.linuxCode}" }
 }
 
+object ControllerButtonNormalization {
+    fun canonicalKeyCode(androidKeyCode: Int): Int = when (androidKeyCode) {
+        KeyEvent.KEYCODE_MENU -> KeyEvent.KEYCODE_BUTTON_START
+        KeyEvent.KEYCODE_BACK -> KeyEvent.KEYCODE_BUTTON_SELECT
+        else -> androidKeyCode
+    }
+}
+
 data class AxisMapping(val androidAxis: Int, val logicalName: String, val trigger: Boolean)
 
 enum class DpadSource { UNSELECTED, KEY, HAT }
