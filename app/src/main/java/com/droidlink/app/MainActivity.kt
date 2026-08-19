@@ -154,6 +154,7 @@ class MainActivity : ComponentActivity() {
     private var digitalSequence = 0L
     private var analogSequence = 0L
     private var lastControllerDeviceId = -1
+    private val controllerAxisLayouts = mutableMapOf<Int, ControllerAxisLayout>()
     private val dpadSources = mutableMapOf<Int, DpadSource>()
     private val joinerDpadKeys = mutableSetOf<LogicalControl>()
     private val joinerDpadState = DpadStateMachine()
@@ -222,8 +223,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var sessionBackCallback: OnBackPressedCallback
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceChanged(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceRemoved(deviceId: Int) { if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
+        override fun onInputDeviceChanged(deviceId: Int) { controllerAxisLayouts.remove(deviceId); inspectPlayer2Device(deviceId) }
+        override fun onInputDeviceRemoved(deviceId: Int) { controllerAxisLayouts.remove(deviceId); if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
     }
     private val disconnectGraceRunnable = Runnable {
         if (joinSessionState == JoinSessionState.Reconnecting) {
@@ -441,7 +442,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("2.9", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("3.0", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -810,7 +811,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 2.9")
+                SettingInfo("Version", "DroidLink 3.0")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1655,7 +1656,7 @@ class MainActivity : ComponentActivity() {
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
-        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
+        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; controllerAxisLayouts.clear(); backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
         latestControllerLatencyMs = null; latestControllerPacketAgeMs = null; controllerPacketAgeTotalMs = 0L; controllerPacketAgeSamples = 0L
         recentControllerLatencies.clear(); controlThreadLogCounter = 0; controllerAckLogCounter = 0
@@ -1769,7 +1770,14 @@ class MainActivity : ComponentActivity() {
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (clientControlActive && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
             noteController(event.deviceId, event.device?.name)
-            val values = ControllerMapping.axisMap.map { normalizeAxis(event, it.androidAxis, it.trigger) }.toFloatArray()
+            val axisLayout = controllerAxisLayouts.getOrPut(event.deviceId) {
+                val available = event.device?.motionRanges?.map { it.axis }?.toSet().orEmpty()
+                ControllerAxisCompatibility.resolve(available).also { resolved ->
+                    val ranges = event.device?.motionRanges?.joinToString { range -> "${MotionEvent.axisToString(range.axis)}=${range.min}..${range.max} flat=${range.flat}" }.orEmpty()
+                    Log.d(TAG, "JOINER_AXIS_LAYOUT: player=2 deviceId=${event.deviceId} resolved=[${resolved.description()}] available=[$ranges]")
+                }
+            }
+            val values = axisLayout.orderedMappings().map { normalizeAxis(event, it.androidAxis, it.trigger) }.toFloatArray()
             val rawDpad = DpadState(values[6].toInt().coerceIn(-1, 1), values[7].toInt().coerceIn(-1, 1))
             if (rawDpad != joinerDpadState.state) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
             val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED

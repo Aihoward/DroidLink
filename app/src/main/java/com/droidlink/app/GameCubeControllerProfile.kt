@@ -37,7 +37,7 @@ data class GameCubeControllerState(
 }
 
 object GameCubeMapping {
-    const val TABLE_VERSION = "gamecube-dolphin-v2"
+    const val TABLE_VERSION = "gamecube-dolphin-v3"
     const val DOLPHIN_DEVICE_NAME = "DroidLink Player 2"
     const val DIGITAL_TRIGGER_THRESHOLD = 0.90f
 
@@ -46,14 +46,26 @@ object GameCubeMapping {
         KeyEvent.KEYCODE_BUTTON_B -> state.withButton(GameCubeButton.B, down)
         KeyEvent.KEYCODE_BUTTON_X -> state.withButton(GameCubeButton.X, down)
         KeyEvent.KEYCODE_BUTTON_Y -> state.withButton(GameCubeButton.Y, down)
-        KeyEvent.KEYCODE_BUTTON_START -> state.withButton(GameCubeButton.START, down)
-        KeyEvent.KEYCODE_BUTTON_R1 -> state.withButton(GameCubeButton.Z, down)
+        KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_MENU -> state.withButton(GameCubeButton.START, down)
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_Z -> state.withButton(GameCubeButton.Z, down)
         KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> state.copy(
             digitalLKeys = state.digitalLKeys.withKey(androidKeyCode, down)
         )
         KeyEvent.KEYCODE_BUTTON_R2 -> state.copy(
             digitalRKeys = state.digitalRKeys.withKey(androidKeyCode, down)
         )
+        else -> null
+    }
+
+    fun linuxCodeForAndroidKey(androidKeyCode: Int): Int? = when (androidKeyCode) {
+        KeyEvent.KEYCODE_BUTTON_A -> 304
+        KeyEvent.KEYCODE_BUTTON_B -> 305
+        KeyEvent.KEYCODE_BUTTON_X -> 307
+        KeyEvent.KEYCODE_BUTTON_Y -> 308
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> 310
+        KeyEvent.KEYCODE_BUTTON_R2 -> 311
+        KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_MENU -> 315
+        KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_Z -> 316
         else -> null
     }
 

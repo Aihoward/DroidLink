@@ -60,24 +60,28 @@ JNIEXPORT jlong JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nati
 fail: { int e=errno; close(fd); return -e; }
 }
 
-JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeUpdateState(
-    JNIEnv* e,jclass c,jlong h,
-    jboolean a,jboolean b,jboolean x,jboolean y,jboolean start,jboolean z,
-    jboolean digital_l,jboolean digital_r,jint dpad_x,jint dpad_y,
-    jfloat main_x,jfloat main_y,jfloat c_x,jfloat c_y,jfloat analog_l,jfloat analog_r) {
-  int fd=(int)h;
-  if(dpad_x>1)dpad_x=1;if(dpad_x<-1)dpad_x=-1;
-  if(dpad_y>1)dpad_y=1;if(dpad_y<-1)dpad_y=-1;
-  int ok=emit(fd,EV_KEY,BTN_SOUTH,a?1:0)&&emit(fd,EV_KEY,BTN_EAST,b?1:0)&&
-      emit(fd,EV_KEY,BTN_NORTH,x?1:0)&&emit(fd,EV_KEY,BTN_WEST,y?1:0)&&
-      emit(fd,EV_KEY,BTN_START,start?1:0)&&emit(fd,EV_KEY,BTN_TR,z?1:0)&&
-      emit(fd,EV_KEY,BTN_TL2,digital_l?1:0)&&emit(fd,EV_KEY,BTN_TR2,digital_r?1:0)&&
-      emit(fd,EV_ABS,ABS_HAT0X,dpad_x)&&emit(fd,EV_ABS,ABS_HAT0Y,dpad_y)&&
-      emit(fd,EV_ABS,ABS_X,sv(main_x))&&emit(fd,EV_ABS,ABS_Y,sv(main_y))&&
-      emit(fd,EV_ABS,ABS_RX,sv(c_x))&&emit(fd,EV_ABS,ABS_RY,sv(c_y))&&
-      emit(fd,EV_ABS,ABS_Z,tv(analog_l))&&emit(fd,EV_ABS,ABS_RZ,tv(analog_r))&&
-      emit(fd,EV_SYN,SYN_REPORT,0);
-  return ok;
+JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeKey(JNIEnv* e,jclass c,jlong h,jint code,jboolean down){int fd=(int)h;return emit(fd,EV_KEY,code,down?1:0)&&emit(fd,EV_SYN,SYN_REPORT,0);}
+
+JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeAxes(JNIEnv* e,jclass c,jlong h,jfloat main_x,jfloat main_y,jfloat c_x,jfloat c_y,jfloat analog_l,jfloat analog_r,jboolean digital_l,jboolean digital_r){
+  int fd=(int)h,ok=1;
+  ok&=emit(fd,EV_KEY,BTN_TL,digital_l?1:0);ok&=emit(fd,EV_KEY,BTN_TR,digital_r?1:0);
+  ok&=emit(fd,EV_ABS,ABS_X,sv(main_x));ok&=emit(fd,EV_ABS,ABS_Y,sv(main_y));
+  ok&=emit(fd,EV_ABS,ABS_RX,sv(c_x));ok&=emit(fd,EV_ABS,ABS_RY,sv(c_y));
+  ok&=emit(fd,EV_ABS,ABS_Z,tv(analog_l));ok&=emit(fd,EV_ABS,ABS_RZ,tv(analog_r));
+  ok&=emit(fd,EV_SYN,SYN_REPORT,0);return ok;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeDpad(JNIEnv* e,jclass c,jlong h,jint dpad_x,jint dpad_y){
+  int fd=(int)h,ok=1;if(dpad_x>1)dpad_x=1;if(dpad_x<-1)dpad_x=-1;if(dpad_y>1)dpad_y=1;if(dpad_y<-1)dpad_y=-1;
+  ok&=emit(fd,EV_ABS,ABS_HAT0X,dpad_x);ok&=emit(fd,EV_ABS,ABS_HAT0Y,dpad_y);ok&=emit(fd,EV_SYN,SYN_REPORT,0);return ok;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeReset(JNIEnv* e,jclass c,jlong h){
+  int fd=(int)h,ok=1;int keys[]={BTN_SOUTH,BTN_EAST,BTN_NORTH,BTN_WEST,BTN_TL,BTN_TR,BTN_START,BTN_MODE};
+  int axes[]={ABS_X,ABS_Y,ABS_RX,ABS_RY,ABS_Z,ABS_RZ,ABS_HAT0X,ABS_HAT0Y};
+  for(unsigned i=0;i<sizeof(keys)/sizeof(keys[0]);i++)ok&=emit(fd,EV_KEY,keys[i],0);
+  for(unsigned i=0;i<sizeof(axes)/sizeof(axes[0]);i++)ok&=emit(fd,EV_ABS,axes[i],0);
+  ok&=emit(fd,EV_SYN,SYN_REPORT,0);return ok;
 }
 
 JNIEXPORT void JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeDestroy(JNIEnv* e,jclass c,jlong h){int fd=(int)h;if(fd>=0){ioctl(fd,UI_DEV_DESTROY);close(fd);}}

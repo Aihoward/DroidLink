@@ -65,25 +65,10 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         init { System.loadLibrary("droidlink_native") }
 
         @JvmStatic private external fun nativeCreate(name: String): Long
-        @JvmStatic private external fun nativeUpdateState(
-            handle: Long,
-            a: Boolean,
-            b: Boolean,
-            x: Boolean,
-            y: Boolean,
-            start: Boolean,
-            z: Boolean,
-            digitalL: Boolean,
-            digitalR: Boolean,
-            dpadX: Int,
-            dpadY: Int,
-            mainX: Float,
-            mainY: Float,
-            cX: Float,
-            cY: Float,
-            analogL: Float,
-            analogR: Float
-        ): Boolean
+        @JvmStatic private external fun nativeKey(handle: Long, code: Int, pressed: Boolean): Boolean
+        @JvmStatic private external fun nativeAxes(handle: Long, mainX: Float, mainY: Float, cX: Float, cY: Float, analogL: Float, analogR: Float, digitalL: Boolean, digitalR: Boolean): Boolean
+        @JvmStatic private external fun nativeDpad(handle: Long, dpadX: Int, dpadY: Int): Boolean
+        @JvmStatic private external fun nativeReset(handle: Long): Boolean
         @JvmStatic private external fun nativeDestroy(handle: Long)
     }
 
@@ -109,7 +94,7 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: name=$DEVICE_NAME vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
         Log.d(TAG, "DOLPHIN_BUTTON_MAPPING: physical A/B/X/Y->GameCube A/B/X/Y; Start->Start; R1->Z")
         Log.d(TAG, "DOLPHIN_TRIGGER_MAPPING: L2/R2 analog->Analog L/R; threshold=${GameCubeMapping.DIGITAL_TRIGGER_THRESHOLD}; L1/L2 button->Digital L; R2 button->Digital R")
-        Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button R1; Digital L=Button L2; Digital R=Button R2; Analog L/R=Axis Z/RZ")
+        Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button Mode; Digital L=Button L1; Digital R=Button R1; Analog L/R=Axis LTRIGGER/RTRIGGER")
         Log.d(TAG, "DOLPHIN_AXIS_MAPPING: left stick->Main Stick; right stick->C-Stick; direct Android polarity")
         if (instances > 1) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
     }
@@ -122,13 +107,20 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         state = next
         digitalTransitions++
         val logical = when (keyCode) {
-            KeyEvent.KEYCODE_BUTTON_R1 -> "Z"
+            KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_Z -> "Z"
             KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> "L_DIGITAL"
             KeyEvent.KEYCODE_BUTTON_R2 -> "R_DIGITAL"
+            KeyEvent.KEYCODE_MENU -> "Start"
             else -> ControllerMapping.logicalForAndroidKey(keyCode)?.displayName ?: keyCode.toString()
         }
         Log.d(TAG, "DOLPHIN_BUTTON_TRANSITION: control=$logical state=${if (down) "DOWN" else "UP"} transitions=$digitalTransitions")
-        val generated = writeStateLocked("digital:$logical")
+        val linuxCode = GameCubeMapping.linuxCodeForAndroidKey(keyCode) ?: return@synchronized false
+        val outputPressed = when (keyCode) {
+            KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> state.digitalL
+            KeyEvent.KEYCODE_BUTTON_R2 -> state.digitalR
+            else -> down
+        }
+        val generated = writeDigitalLocked("digital:$logical", linuxCode, outputPressed)
         Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON control=$logical action=${if (down) "DOWN" else "UP"} success=$generated")
         generated
     }
@@ -146,7 +138,15 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
     ): Boolean = synchronized(stateLock) {
         state = GameCubeMapping.updateAxes(state, leftX, leftY, rightX, rightY, leftTrigger, rightTrigger)
         axisUpdates++
-        val result = writeStateLocked("analog")
+        val result = try {
+            check(!closed) { "Dolphin backend is closed" }
+            check(nativeAxes(handle, state.mainX, state.mainY, state.cX, state.cY, state.analogL, state.analogR, state.digitalL, state.digitalR))
+            recordSuccessfulUpdate()
+            true
+        } catch (error: Throwable) {
+            recordFailedUpdate("analog", error)
+            false
+        }
         if (axisUpdates % 120L == 1L) {
             Log.d(TAG, "DOLPHIN_ANALOG_SUMMARY: updates=$axisUpdates main=${state.mainX},${state.mainY} c=${state.cX},${state.cY} analogL=${state.analogL} analogR=${state.analogR} digitalL=${state.digitalL} digitalR=${state.digitalR}")
             Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS success=$result")
@@ -158,46 +158,50 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         state = GameCubeMapping.updateDpad(state, dpadX, dpadY)
         dpadUpdates++
         Log.d(TAG, "DOLPHIN_DPAD_TRANSITION: state=${DpadState(state.dpadX, state.dpadY).label} updates=$dpadUpdates")
-        val generated = writeStateLocked("dpad")
+        val generated = try {
+            check(!closed) { "Dolphin backend is closed" }
+            check(nativeDpad(handle, state.dpadX, state.dpadY))
+            recordSuccessfulUpdate()
+            true
+        } catch (error: Throwable) {
+            recordFailedUpdate("dpad", error)
+            false
+        }
         Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${DpadState(state.dpadX, state.dpadY).label} success=$generated")
         generated
     }
 
-    private fun writeStateLocked(reason: String): Boolean = try {
+    private fun writeDigitalLocked(reason: String, linuxCode: Int, pressed: Boolean): Boolean = try {
         check(!closed) { "Dolphin backend is closed" }
-        check(nativeUpdateState(
-            handle,
-            state.isPressed(GameCubeButton.A),
-            state.isPressed(GameCubeButton.B),
-            state.isPressed(GameCubeButton.X),
-            state.isPressed(GameCubeButton.Y),
-            state.isPressed(GameCubeButton.START),
-            state.isPressed(GameCubeButton.Z),
-            state.digitalL,
-            state.digitalR,
-            state.dpadX,
-            state.dpadY,
-            state.mainX,
-            state.mainY,
-            state.cX,
-            state.cY,
-            state.analogL,
-            state.analogR
-        ))
-        stateUpdates++
-        lastSuccessfulUpdateMs = android.os.SystemClock.elapsedRealtime()
+        check(nativeKey(handle, linuxCode, pressed))
+        recordSuccessfulUpdate()
         true
     } catch (error: Throwable) {
+        recordFailedUpdate(reason, error)
+        false
+    }
+
+    private fun recordSuccessfulUpdate() {
+        stateUpdates++
+        lastSuccessfulUpdateMs = android.os.SystemClock.elapsedRealtime()
+    }
+
+    private fun recordFailedUpdate(reason: String, error: Throwable) {
         failedUpdates++
         Log.e(TAG, "DOLPHIN_INPUT_UPDATE_FAILED: reason=$reason failures=$failedUpdates ${error.message}", error)
-        false
     }
 
     override fun resetNeutral(reason: String) = synchronized(stateLock) {
         if (closed) return@synchronized
         state = GameCubeControllerState()
         neutralResets++
-        if (writeStateLocked("neutral:$reason")) Log.d(TAG, "DOLPHIN_NEUTRAL_RESET: reason=$reason resets=$neutralResets virtualDeviceRecreated=false")
+        try {
+            check(nativeReset(handle))
+            recordSuccessfulUpdate()
+            Log.d(TAG, "DOLPHIN_NEUTRAL_RESET: reason=$reason resets=$neutralResets virtualDeviceRecreated=false")
+        } catch (error: Throwable) {
+            recordFailedUpdate("neutral:$reason", error)
+        }
     }
 
     override fun logHealth(reason: String) {
