@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.*
 import android.media.projection.MediaProjectionManager
 import android.hardware.input.InputManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Debug
 import android.os.Handler
@@ -99,6 +100,7 @@ class MainActivity : ComponentActivity() {
     private var hapticFeedback by mutableStateOf(true)
     private var uiSoundEffects by mutableStateOf(true)
     private var accentName by mutableStateOf("Green")
+    private var selectedControllerProfile by mutableStateOf(ControllerProfile.PC_WINLATOR)
     private var onboardingVisible by mutableStateOf(false)
     private var onboardingPage by mutableIntStateOf(0)
     private var readinessVisible by mutableStateOf(false)
@@ -153,6 +155,7 @@ class MainActivity : ComponentActivity() {
     private var digitalSequence = 0L
     private var analogSequence = 0L
     private var lastControllerDeviceId = -1
+    private val controllerAxisLayouts = mutableMapOf<Int, ControllerDeviceAxisState>()
     private val dpadSources = mutableMapOf<Int, DpadSource>()
     private val joinerDpadKeys = mutableSetOf<LogicalControl>()
     private val joinerDpadState = DpadStateMachine()
@@ -221,8 +224,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var sessionBackCallback: OnBackPressedCallback
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceChanged(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceRemoved(deviceId: Int) { if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
+        override fun onInputDeviceChanged(deviceId: Int) { controllerAxisLayouts.remove(deviceId); inspectPlayer2Device(deviceId) }
+        override fun onInputDeviceRemoved(deviceId: Int) { controllerAxisLayouts.remove(deviceId); if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
     }
     private val disconnectGraceRunnable = Runnable {
         if (joinSessionState == JoinSessionState.Reconnecting) {
@@ -308,6 +311,7 @@ class MainActivity : ComponentActivity() {
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
             accentName = preferences.getString("accent_color", "Green")?.takeIf { it in ACCENT_COLORS } ?: "Green"
+            selectedControllerProfile = ControllerProfile.fromStorage(preferences.getString("controller_profile", null))
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
             introVisible = showIntroAnimation
         }
@@ -350,6 +354,16 @@ class MainActivity : ComponentActivity() {
                     else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
             }
+        }
+        requestUnbufferedControllerDispatch()
+    }
+
+    private fun requestUnbufferedControllerDispatch() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.decorView.requestUnbufferedDispatch(
+                InputDevice.SOURCE_CLASS_BUTTON or InputDevice.SOURCE_CLASS_JOYSTICK
+            )
+            Log.d(TAG, "CONTROLLER_UNBUFFERED_DISPATCH: button+joystick enabled")
         }
     }
 
@@ -439,7 +453,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("2.7", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("3.0.1", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -763,6 +777,16 @@ class MainActivity : ComponentActivity() {
                 SettingInfo("Bitrate", "Automatic WebRTC adaptation")
             }
             SettingSection("CONTROLLER") {
+                Text("Compatibility profile", color = mutedText, fontSize = 12.sp)
+                ControllerProfile.entries.forEach { profile ->
+                    FilterChip(
+                        selected = selectedControllerProfile == profile,
+                        onClick = { setControllerProfile(profile) },
+                        enabled = !inSession,
+                        label = { Text(profile.label, fontSize = 11.sp) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 SettingInfo("Player 2", betaDiagnostics.player2Status)
                 SettingInfo("Virtual gamepad", friendlyControllerStatus())
                 SettingInfo("Controller slot", "Automatic")
@@ -798,7 +822,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 2.7")
+                SettingInfo("Version", "DroidLink 3.0.1")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -887,7 +911,7 @@ class MainActivity : ComponentActivity() {
     private fun resetUiSettings() {
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
         animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
-        accentName = "Green"
+        accentName = "Green"; selectedControllerProfile = ControllerProfile.PC_WINLATOR
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
     }
 
@@ -908,6 +932,13 @@ class MainActivity : ComponentActivity() {
         if (name !in ACCENT_COLORS) return
         accentName = name
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("accent_color", name).apply()
+    }
+
+    private fun setControllerProfile(profile: ControllerProfile) {
+        if (sessionActive || sessionStarting) return
+        selectedControllerProfile = profile
+        getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("controller_profile", profile.storageValue).apply()
+        Log.d(TAG, "CONTROLLER_PROFILE_CONFIGURED: ${profile.label}")
     }
 
     private fun enableImmersiveMode() {
@@ -1048,7 +1079,8 @@ class MainActivity : ComponentActivity() {
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
             controllerBackend.close()
-            controllerBackend = ControllerBackendSelector.select()
+            player2Classification = "Unknown"
+            controllerBackend = ControllerBackendSelector.select(selectedControllerProfile)
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
             schedulePlayer2Inspection()
             hostRtc.initialize()
@@ -1279,6 +1311,9 @@ class MainActivity : ComponentActivity() {
                 if (action == "UP" && !heldRemoteButtons.remove(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
                 val started = android.os.SystemClock.elapsedRealtime()
                 val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
+                if (controllerBackend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON key=${KeyEvent.keyCodeToString(key)} action=$action sequence=$sequence")
+                }
                 if (logical != null && isDpadControl(logical)) {
                     val legacyDpad = DpadState(
                         x = (if (KeyEvent.KEYCODE_DPAD_RIGHT in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_LEFT in heldRemoteButtons) 1 else 0),
@@ -1321,6 +1356,9 @@ class MainActivity : ComponentActivity() {
                     updateLogicalAxes(axes)
                     val started = android.os.SystemClock.elapsedRealtime()
                     val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
+                    if (controllerBackend is DolphinVirtualGamepadBackend && sequence % 120L == 1L) {
+                        Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS main=${axes[0]},${axes[1]} c=${axes[2]},${axes[3]} triggers=${axes[4]},${axes[5]} sequence=$sequence")
+                    }
                     val injected = controllerBackend.updateAxes(context, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7])
                     val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                     if (++axisAckCounter % 20 == 1) hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
@@ -1348,6 +1386,9 @@ class MainActivity : ComponentActivity() {
                     return
                 }
                 val context = ControllerEventContext(session, parts[2], parts[3].toIntOrNull() ?: 2, sequence, sentAt)
+                if (controllerBackend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${next.label} source=$source sequence=$sequence")
+                }
                 val started = android.os.SystemClock.elapsedRealtimeNanos()
                 val injected = controllerBackend.updateDpad(context, x, y)
                 val injectMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L
@@ -1432,7 +1473,11 @@ class MainActivity : ComponentActivity() {
         mainHandler.postDelayed({ inspectAllPlayer2Devices() }, 1_000L)
         mainHandler.postDelayed({
             if (player2Classification == "Unknown" && controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) {
-                Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: Android has not enumerated DroidLink Player 2 yet; start Winlator only after WINLATOR_GAMEPAD_READY")
+                if (selectedControllerProfile == ControllerProfile.GAMECUBE_DOLPHIN) {
+                    Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: Android has not enumerated ${GameCubeMapping.DOLPHIN_DEVICE_NAME} yet")
+                } else {
+                    Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: Android has not enumerated DroidLink Player 2 yet; start Winlator only after WINLATOR_GAMEPAD_READY")
+                }
             }
         }, 2_000L)
     }
@@ -1441,6 +1486,10 @@ class MainActivity : ComponentActivity() {
 
     private fun inspectPlayer2Device(deviceId: Int) {
         val device = InputDevice.getDevice(deviceId) ?: return
+        if (selectedControllerProfile == ControllerProfile.GAMECUBE_DOLPHIN) {
+            inspectDolphinDevice(deviceId, device)
+            return
+        }
         if (device.name != "DroidLink Player 2") return
         val sources = device.sources
         val gamepad = sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
@@ -1460,6 +1509,26 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "GAMEPAD_VID_PID: %04x:%04x".format(device.vendorId, device.productId))
         if (gamepad && joystick && !keyboard) Log.d(TAG, "WINLATOR_GAMEPAD_READY: Android classified DroidLink Player 2 as GAMEPAD/JOYSTICK; start Winlator container now")
         else Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: classification=$classification; do not start Winlator until GAMEPAD/JOYSTICK classification is confirmed")
+    }
+
+    private fun inspectDolphinDevice(deviceId: Int, device: InputDevice) {
+        if (device.name != GameCubeMapping.DOLPHIN_DEVICE_NAME) return
+        val sources = device.sources
+        val gamepad = sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
+        val joystick = sources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        val keyboard = sources and InputDevice.SOURCE_KEYBOARD == InputDevice.SOURCE_KEYBOARD
+        val classification = buildList {
+            if (gamepad) add("GAMEPAD")
+            if (joystick) add("JOYSTICK")
+            if (keyboard) add("KEYBOARD")
+        }.ifEmpty { listOf("UNKNOWN") }.joinToString(" / ")
+        player2Classification = classification
+        updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label, player2Classification = classification) }
+        val axes = device.motionRanges.joinToString { "${MotionEvent.axisToString(it.axis)}=${it.min}..${it.max}" }
+        Log.d(TAG, "DOLPHIN_ANDROID_DEVICE: id=$deviceId name=${device.name} sources=0x${sources.toString(16)} descriptor=${device.descriptor} vidPid=%04x:%04x axes=[$axes]".format(device.vendorId, device.productId))
+        Log.d(TAG, "DOLPHIN_DEVICE_CLASSIFICATION: gamepad=$gamepad joystick=$joystick keyboard=$keyboard")
+        if (gamepad && joystick && !keyboard) Log.d(TAG, "DOLPHIN_CONTROLLER_READY: Android classified ${GameCubeMapping.DOLPHIN_DEVICE_NAME} as GAMEPAD/JOYSTICK")
+        else Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: classification=$classification expected=GAMEPAD/JOYSTICK")
     }
 
     private fun recordControllerPacket() {
@@ -1598,7 +1667,7 @@ class MainActivity : ComponentActivity() {
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
-        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; backendUnavailableLogged = false; axisAckCounter = 0
+        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; controllerAxisLayouts.clear(); backendUnavailableLogged = false; axisAckCounter = 0
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
         latestControllerLatencyMs = null; latestControllerPacketAgeMs = null; controllerPacketAgeTotalMs = 0L; controllerPacketAgeSamples = 0L
         recentControllerLatencies.clear(); controlThreadLogCounter = 0; controllerAckLogCounter = 0
@@ -1615,25 +1684,28 @@ class MainActivity : ComponentActivity() {
         renderer?.let { releaseRenderer(it, "session detach") }
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) {
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (clientControlActive && isControllerEvent(event.source, event.device)) {
+            val down = event.action == KeyEvent.ACTION_DOWN
+            val up = event.action == KeyEvent.ACTION_UP
+            if (!down && !up) return true
             noteController(event.deviceId, event.device?.name)
-            if (handleDpadKey(keyCode, down = true, event)) return true
-            if (event.repeatCount == 0) sendKey(keyCode, "DOWN", event)
+            val keyCode = ControllerButtonNormalization.canonicalKeyCode(event.keyCode)
+            if (handleDpadKey(keyCode, down, event)) return true
+            if (up || event.repeatCount == 0) sendKey(keyCode, if (down) "DOWN" else "UP", event)
             return true
         }
-        return super.onKeyDown(keyCode, event)
+        return super.dispatchKeyEvent(event)
     }
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (clientControlActive && isController(event.source)) {
-            noteController(event.deviceId, event.device?.name)
-            if (handleDpadKey(keyCode, down = false, event)) return true
-            sendKey(keyCode, "UP", event)
-            return true
-        }
-        return super.onKeyUp(keyCode, event)
+
+    private fun isControllerEvent(source: Int, device: InputDevice?): Boolean {
+        val deviceSources = device?.sources ?: 0
+        return source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD ||
+            source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
+            deviceSources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            deviceSources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
     }
-    private fun isController(source: Int) = source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD || source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD || source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
 
     private fun noteController(deviceId: Int, name: String?) {
         if (lastControllerDeviceId == deviceId) return
@@ -1646,6 +1718,7 @@ class MainActivity : ComponentActivity() {
         val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
         val message = "KEY|$activeSessionId|device-$lastControllerDeviceId|2|${++digitalSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|$keyCode|$action"
         recordControllerPacket()
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=BUTTON key=${KeyEvent.keyCodeToString(keyCode)} action=$action")
         clientRtc.sendControlMessage(message)
     }
 
@@ -1703,15 +1776,50 @@ class MainActivity : ComponentActivity() {
         val message = "DPAD|$activeSessionId|device-$deviceId|2|${++digitalSequence}|$sentAt|$captureMs|${lastControlRoundTripMs ?: 0L}|${next.x}|${next.y}|$source"
         recordControllerPacket()
         clientRtc.sendControlMessage(message)
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=$deviceId type=DPAD state=${next.label} source=$source")
         Log.d(TAG, "DPAD_LOGICAL_STATE: side=joiner state=${next.label} source=$source sequence=$digitalSequence")
         if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=joiner sequence=$digitalSequence")
     }
 
-    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if (clientControlActive && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (handleControllerMotionEvent(event)) return true
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    private fun handleControllerMotionEvent(event: MotionEvent): Boolean {
+        val joystickEvent = event.source and InputDevice.SOURCE_CLASS_JOYSTICK != 0 ||
+            (event.device?.sources ?: 0) and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        if (clientControlActive && joystickEvent && event.actionMasked == MotionEvent.ACTION_MOVE) {
             noteController(event.deviceId, event.device?.name)
-            val values = ControllerMapping.axisMap.map { normalizeAxis(event, it.androidAxis, it.trigger) }.toFloatArray()
-            val rawDpad = DpadState(values[6].toInt().coerceIn(-1, 1), values[7].toInt().coerceIn(-1, 1))
+            val axisState = controllerAxisLayouts.getOrPut(event.deviceId) {
+                val available = ControllerAxisCompatibility.candidateAxes.filterTo(mutableSetOf()) { axis ->
+                    controllerMotionRange(event.device, axis) != null
+                }
+                val layout = ControllerAxisCompatibility.resolve(available)
+                val ranges = available.joinToString { axis ->
+                    val range = controllerMotionRange(event.device, axis)
+                    "${MotionEvent.axisToString(axis)}=${range?.min}..${range?.max} flat=${range?.flat}"
+                }
+                Log.d(TAG, "JOINER_AXIS_LAYOUT: player=2 deviceId=${event.deviceId} resolved=[${layout.description()}] available=[$ranges]")
+                ControllerDeviceAxisState(layout)
+            }
+            val layout = axisState.layout
+            val leftTrigger = normalizeTriggerAxis(event, layout.leftTrigger, axisState, left = true)
+            val rightTrigger = normalizeTriggerAxis(event, layout.rightTrigger, axisState, left = false)
+            val values = floatArrayOf(
+                normalizeStickAxis(event, layout.leftX),
+                normalizeStickAxis(event, layout.leftY),
+                normalizeStickAxis(event, layout.rightX),
+                normalizeStickAxis(event, layout.rightY),
+                leftTrigger,
+                rightTrigger,
+                0f,
+                0f
+            )
+            val rawDpad = DpadState(
+                ControllerAxisNormalizer.dpadDirection(axisValue(event, layout.hatX)),
+                ControllerAxisNormalizer.dpadDirection(axisValue(event, layout.hatY))
+            )
             if (rawDpad != joinerDpadState.state) Log.d(TAG, "DPAD_RAW_HAT: device=${event.deviceId} state=${rawDpad.label} x=${rawDpad.x} y=${rawDpad.y}")
             val selected = dpadSources[event.deviceId] ?: DpadSource.UNSELECTED
             if (rawDpad != DpadState() || selected == DpadSource.HAT) {
@@ -1730,22 +1838,53 @@ class MainActivity : ComponentActivity() {
             val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
             if (analogSequence % 120L == 0L) {
                 Log.d(TAG, "RAW_AXIS_EVENT: device=${event.deviceId} x=${values[0]} y=${values[1]} z=${values[2]} rz=${values[3]} lt=${values[4]} rt=${values[5]} hat=${rawDpad.x},${rawDpad.y}")
+                Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=AXIS main=${values[0]},${values[1]} c=${values[2]},${values[3]} triggers=${values[4]},${values[5]}")
                 Log.d(TAG, "CONTROL_CAPTURE_MS: $captureDelayMs type=AXIS")
             }
             val message = "AXIS|$activeSessionId|device-$lastControllerDeviceId|2|${++analogSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|${values.joinToString("|")}"
             recordControllerPacket()
             clientRtc.sendControlMessage(message, realtimeAnalog = true); return true
         }
-        return super.onGenericMotionEvent(event)
+        return false
     }
 
-    private fun normalizeAxis(event: MotionEvent, axis: Int, trigger: Boolean): Float {
-        var value = event.getAxisValue(axis)
-        if (trigger && value < 0f) value = (value + 1f) / 2f
-        val deadzone = event.device?.getMotionRange(axis, event.source)?.flat?.coerceAtLeast(if (trigger) 0.02f else 0.12f) ?: if (trigger) 0.02f else 0.12f
-        value = if (kotlin.math.abs(value) <= deadzone) 0f else value
-        return if (trigger) value.coerceIn(0f, 1f) else value.coerceIn(-1f, 1f)
+    private fun normalizeStickAxis(event: MotionEvent, axis: Int): Float {
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return 0f
+        return ControllerAxisNormalizer.normalizeStick(
+            event.getAxisValue(axis),
+            controllerMotionRange(event.device, axis)?.toAxisRange()
+        )
     }
+
+    private fun normalizeTriggerAxis(
+        event: MotionEvent,
+        axis: Int,
+        state: ControllerDeviceAxisState,
+        left: Boolean
+    ): Float {
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return 0f
+        val raw = event.getAxisValue(axis)
+        val range = controllerMotionRange(event.device, axis)?.toAxisRange()
+        if (ControllerAxisNormalizer.centeredTriggerActivated(raw, range)) {
+            if (left) state.leftCenteredTriggerActivated = true else state.rightCenteredTriggerActivated = true
+        }
+        val activated = if (left) state.leftCenteredTriggerActivated else state.rightCenteredTriggerActivated
+        return ControllerAxisNormalizer.normalizeTrigger(raw, range, activated)
+    }
+
+    private fun axisValue(event: MotionEvent, axis: Int): Float =
+        if (axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) 0f else event.getAxisValue(axis)
+
+    private fun controllerMotionRange(device: InputDevice?, axis: Int): InputDevice.MotionRange? {
+        if (device == null || axis == ControllerAxisCompatibility.UNAVAILABLE_AXIS) return null
+        return device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK)
+            ?: device.getMotionRange(axis, InputDevice.SOURCE_GAMEPAD)
+            ?: device.motionRanges.firstOrNull { range ->
+                range.axis == axis && range.source and InputDevice.SOURCE_CLASS_JOYSTICK != 0
+            }
+    }
+
+    private fun InputDevice.MotionRange.toAxisRange() = ControllerAxisRange(min, max, flat)
 
     override fun onDestroy() {
         cleanupSession(deleteHostRoom = true)
