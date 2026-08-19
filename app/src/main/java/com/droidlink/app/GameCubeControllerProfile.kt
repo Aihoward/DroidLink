@@ -37,7 +37,8 @@ data class GameCubeControllerState(
 }
 
 object GameCubeMapping {
-    const val TABLE_VERSION = "gamecube-dolphin-v1"
+    const val TABLE_VERSION = "gamecube-dolphin-v2"
+    const val DOLPHIN_DEVICE_NAME = "DroidLink Player 2"
     const val DIGITAL_TRIGGER_THRESHOLD = 0.90f
 
     fun updateKey(state: GameCubeControllerState, androidKeyCode: Int, down: Boolean): GameCubeControllerState? = when (androidKeyCode) {

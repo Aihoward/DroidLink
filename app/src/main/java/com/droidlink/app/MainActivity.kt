@@ -441,7 +441,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("2.8", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("2.9", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -810,7 +810,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 2.8")
+                SettingInfo("Version", "DroidLink 2.9")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -1299,6 +1299,9 @@ class MainActivity : ComponentActivity() {
                 if (action == "UP" && !heldRemoteButtons.remove(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
                 val started = android.os.SystemClock.elapsedRealtime()
                 val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
+                if (controllerBackend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON key=${KeyEvent.keyCodeToString(key)} action=$action sequence=$sequence")
+                }
                 if (logical != null && isDpadControl(logical)) {
                     val legacyDpad = DpadState(
                         x = (if (KeyEvent.KEYCODE_DPAD_RIGHT in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_LEFT in heldRemoteButtons) 1 else 0),
@@ -1341,6 +1344,9 @@ class MainActivity : ComponentActivity() {
                     updateLogicalAxes(axes)
                     val started = android.os.SystemClock.elapsedRealtime()
                     val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
+                    if (controllerBackend is DolphinVirtualGamepadBackend && sequence % 120L == 1L) {
+                        Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS main=${axes[0]},${axes[1]} c=${axes[2]},${axes[3]} triggers=${axes[4]},${axes[5]} sequence=$sequence")
+                    }
                     val injected = controllerBackend.updateAxes(context, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7])
                     val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                     if (++axisAckCounter % 20 == 1) hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
@@ -1368,6 +1374,9 @@ class MainActivity : ComponentActivity() {
                     return
                 }
                 val context = ControllerEventContext(session, parts[2], parts[3].toIntOrNull() ?: 2, sequence, sentAt)
+                if (controllerBackend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${next.label} source=$source sequence=$sequence")
+                }
                 val started = android.os.SystemClock.elapsedRealtimeNanos()
                 val injected = controllerBackend.updateDpad(context, x, y)
                 val injectMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L
@@ -1453,7 +1462,7 @@ class MainActivity : ComponentActivity() {
         mainHandler.postDelayed({
             if (player2Classification == "Unknown" && controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) {
                 if (selectedControllerProfile == ControllerProfile.GAMECUBE_DOLPHIN) {
-                    Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: Android has not enumerated DroidLink GameCube Player 2 yet")
+                    Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: Android has not enumerated ${GameCubeMapping.DOLPHIN_DEVICE_NAME} yet")
                 } else {
                     Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: Android has not enumerated DroidLink Player 2 yet; start Winlator only after WINLATOR_GAMEPAD_READY")
                 }
@@ -1491,7 +1500,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun inspectDolphinDevice(deviceId: Int, device: InputDevice) {
-        if (device.name != "DroidLink GameCube Player 2") return
+        if (device.name != GameCubeMapping.DOLPHIN_DEVICE_NAME) return
         val sources = device.sources
         val gamepad = sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
         val joystick = sources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
@@ -1506,7 +1515,7 @@ class MainActivity : ComponentActivity() {
         val axes = device.motionRanges.joinToString { "${MotionEvent.axisToString(it.axis)}=${it.min}..${it.max}" }
         Log.d(TAG, "DOLPHIN_ANDROID_DEVICE: id=$deviceId name=${device.name} sources=0x${sources.toString(16)} descriptor=${device.descriptor} vidPid=%04x:%04x axes=[$axes]".format(device.vendorId, device.productId))
         Log.d(TAG, "DOLPHIN_DEVICE_CLASSIFICATION: gamepad=$gamepad joystick=$joystick keyboard=$keyboard")
-        if (gamepad && joystick && !keyboard) Log.d(TAG, "DOLPHIN_CONTROLLER_READY: Android classified DroidLink GameCube Player 2 as GAMEPAD/JOYSTICK")
+        if (gamepad && joystick && !keyboard) Log.d(TAG, "DOLPHIN_CONTROLLER_READY: Android classified ${GameCubeMapping.DOLPHIN_DEVICE_NAME} as GAMEPAD/JOYSTICK")
         else Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: classification=$classification expected=GAMEPAD/JOYSTICK")
     }
 
@@ -1694,6 +1703,7 @@ class MainActivity : ComponentActivity() {
         val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
         val message = "KEY|$activeSessionId|device-$lastControllerDeviceId|2|${++digitalSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|$keyCode|$action"
         recordControllerPacket()
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=BUTTON key=${KeyEvent.keyCodeToString(keyCode)} action=$action")
         clientRtc.sendControlMessage(message)
     }
 
@@ -1751,6 +1761,7 @@ class MainActivity : ComponentActivity() {
         val message = "DPAD|$activeSessionId|device-$deviceId|2|${++digitalSequence}|$sentAt|$captureMs|${lastControlRoundTripMs ?: 0L}|${next.x}|${next.y}|$source"
         recordControllerPacket()
         clientRtc.sendControlMessage(message)
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=$deviceId type=DPAD state=${next.label} source=$source")
         Log.d(TAG, "DPAD_LOGICAL_STATE: side=joiner state=${next.label} source=$source sequence=$digitalSequence")
         if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=joiner sequence=$digitalSequence")
     }
@@ -1778,6 +1789,7 @@ class MainActivity : ComponentActivity() {
             val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
             if (analogSequence % 120L == 0L) {
                 Log.d(TAG, "RAW_AXIS_EVENT: device=${event.deviceId} x=${values[0]} y=${values[1]} z=${values[2]} rz=${values[3]} lt=${values[4]} rt=${values[5]} hat=${rawDpad.x},${rawDpad.y}")
+                Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=AXIS main=${values[0]},${values[1]} c=${values[2]},${values[3]} triggers=${values[4]},${values[5]}")
                 Log.d(TAG, "CONTROL_CAPTURE_MS: $captureDelayMs type=AXIS")
             }
             val message = "AXIS|$activeSessionId|device-$lastControllerDeviceId|2|${++analogSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|${values.joinToString("|")}"

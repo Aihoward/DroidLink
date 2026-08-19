@@ -8,6 +8,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GameCubeControllerProfileTest {
+    @Test fun dolphinProfileTargetsTheEstablishedPlayer2Device() {
+        assertEquals("gamecube-dolphin-v2", GameCubeMapping.TABLE_VERSION)
+        assertEquals("DroidLink Player 2", GameCubeMapping.DOLPHIN_DEVICE_NAME)
+    }
+
     @Test fun profilesHaveStableStorageValuesAndSafeDefault() {
         assertEquals(ControllerProfile.PC_WINLATOR, ControllerProfile.fromStorage(null))
         assertEquals(ControllerProfile.PC_WINLATOR, ControllerProfile.fromStorage("unknown"))

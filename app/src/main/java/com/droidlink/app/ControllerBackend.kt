@@ -59,7 +59,7 @@ object ControllerBackendSelector {
 class DolphinVirtualGamepadBackend : ControllerBackend {
     companion object {
         private const val TAG = "DroidLink"
-        private const val DEVICE_NAME = "DroidLink GameCube Player 2"
+        private const val DEVICE_NAME = GameCubeMapping.DOLPHIN_DEVICE_NAME
         private val activeInstances = AtomicInteger(0)
 
         init { System.loadLibrary("droidlink_native") }
@@ -104,7 +104,7 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
     init {
         val instances = activeInstances.incrementAndGet()
         Log.d(TAG, "GAMECUBE_PROFILE_ACTIVATED: mapping=${GameCubeMapping.TABLE_VERSION}")
-        Log.d(TAG, "DOLPHIN_CONTROLLER_CREATED: name=$DEVICE_NAME handle=$handle")
+        Log.d(TAG, "DOLPHIN_CONTROLLER_CREATED: name=$DEVICE_NAME handle=$handle compatibleWithSavedDolphinSelection=true")
         Log.d(TAG, "DOLPHIN_CONTROLLER_REGISTERED: true")
         Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: name=$DEVICE_NAME vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
         Log.d(TAG, "DOLPHIN_BUTTON_MAPPING: physical A/B/X/Y->GameCube A/B/X/Y; Start->Start; R1->Z")
@@ -114,10 +114,10 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         if (instances > 1) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
     }
 
-    override fun keyDown(context: ControllerEventContext, keyCode: Int) = updateKey(keyCode, true)
-    override fun keyUp(context: ControllerEventContext, keyCode: Int) = updateKey(keyCode, false)
+    override fun keyDown(context: ControllerEventContext, keyCode: Int) = updateKey(context, keyCode, true)
+    override fun keyUp(context: ControllerEventContext, keyCode: Int) = updateKey(context, keyCode, false)
 
-    private fun updateKey(keyCode: Int, down: Boolean): Boolean = synchronized(stateLock) {
+    private fun updateKey(context: ControllerEventContext, keyCode: Int, down: Boolean): Boolean = synchronized(stateLock) {
         val next = GameCubeMapping.updateKey(state, keyCode, down) ?: return@synchronized false
         state = next
         digitalTransitions++
@@ -128,7 +128,9 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
             else -> ControllerMapping.logicalForAndroidKey(keyCode)?.displayName ?: keyCode.toString()
         }
         Log.d(TAG, "DOLPHIN_BUTTON_TRANSITION: control=$logical state=${if (down) "DOWN" else "UP"} transitions=$digitalTransitions")
-        writeStateLocked("digital:$logical")
+        val generated = writeStateLocked("digital:$logical")
+        Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON control=$logical action=${if (down) "DOWN" else "UP"} success=$generated")
+        generated
     }
 
     override fun updateAxes(
@@ -147,6 +149,7 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         val result = writeStateLocked("analog")
         if (axisUpdates % 120L == 1L) {
             Log.d(TAG, "DOLPHIN_ANALOG_SUMMARY: updates=$axisUpdates main=${state.mainX},${state.mainY} c=${state.cX},${state.cY} analogL=${state.analogL} analogR=${state.analogR} digitalL=${state.digitalL} digitalR=${state.digitalR}")
+            Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS success=$result")
         }
         result
     }
@@ -155,7 +158,9 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         state = GameCubeMapping.updateDpad(state, dpadX, dpadY)
         dpadUpdates++
         Log.d(TAG, "DOLPHIN_DPAD_TRANSITION: state=${DpadState(state.dpadX, state.dpadY).label} updates=$dpadUpdates")
-        writeStateLocked("dpad")
+        val generated = writeStateLocked("dpad")
+        Log.d(TAG, "DOLPHIN_COMPAT_EVENT_GENERATED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${DpadState(state.dpadX, state.dpadY).label} success=$generated")
+        generated
     }
 
     private fun writeStateLocked(reason: String): Boolean = try {

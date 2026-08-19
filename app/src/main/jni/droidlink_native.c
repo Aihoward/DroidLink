@@ -41,7 +41,8 @@ JNIEXPORT void JNICALL Java_com_droidlink_app_UinputVirtualGamepadBackend_native
 
 JNIEXPORT jlong JNICALL Java_com_droidlink_app_DolphinVirtualGamepadBackend_nativeCreate(JNIEnv* env, jclass cls, jstring jname) {
   int fd=open("/dev/uinput", O_WRONLY|O_NONBLOCK); if(fd<0) return -errno;
-  int keys[]={BTN_SOUTH,BTN_EAST,BTN_NORTH,BTN_WEST,BTN_START,BTN_TR,BTN_TL2,BTN_TR2};
+  /* Match the proven DroidLink Player 2 capability set so Android and Dolphin keep one identity. */
+  int keys[]={BTN_SOUTH,BTN_EAST,BTN_NORTH,BTN_WEST,BTN_TL,BTN_TR,BTN_TL2,BTN_TR2,BTN_SELECT,BTN_START,BTN_MODE,BTN_THUMBL,BTN_THUMBR,BTN_DPAD_UP,BTN_DPAD_DOWN,BTN_DPAD_LEFT,BTN_DPAD_RIGHT};
   int axes[]={ABS_X,ABS_Y,ABS_RX,ABS_RY,ABS_Z,ABS_RZ,ABS_HAT0X,ABS_HAT0Y};
   if(!bit(fd,UI_SET_EVBIT,EV_KEY)||!bit(fd,UI_SET_EVBIT,EV_ABS)) goto fail;
   for(unsigned i=0;i<sizeof(keys)/sizeof(keys[0]);i++) if(!bit(fd,UI_SET_KEYBIT,keys[i])) goto fail;
