@@ -99,6 +99,7 @@ class MainActivity : ComponentActivity() {
     private var hapticFeedback by mutableStateOf(true)
     private var uiSoundEffects by mutableStateOf(true)
     private var accentName by mutableStateOf("Green")
+    private var selectedControllerProfile by mutableStateOf(ControllerProfile.PC_WINLATOR)
     private var onboardingVisible by mutableStateOf(false)
     private var onboardingPage by mutableIntStateOf(0)
     private var readinessVisible by mutableStateOf(false)
@@ -308,6 +309,7 @@ class MainActivity : ComponentActivity() {
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
             accentName = preferences.getString("accent_color", "Green")?.takeIf { it in ACCENT_COLORS } ?: "Green"
+            selectedControllerProfile = ControllerProfile.fromStorage(preferences.getString("controller_profile", null))
             onboardingVisible = !preferences.getBoolean("onboarding_complete", false)
             introVisible = showIntroAnimation
         }
@@ -439,7 +441,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("2.7", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text("2.8", color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
         SettingInfo("Build type", "Beta / Debug")
@@ -763,6 +765,16 @@ class MainActivity : ComponentActivity() {
                 SettingInfo("Bitrate", "Automatic WebRTC adaptation")
             }
             SettingSection("CONTROLLER") {
+                Text("Compatibility profile", color = mutedText, fontSize = 12.sp)
+                ControllerProfile.entries.forEach { profile ->
+                    FilterChip(
+                        selected = selectedControllerProfile == profile,
+                        onClick = { setControllerProfile(profile) },
+                        enabled = !inSession,
+                        label = { Text(profile.label, fontSize = 11.sp) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 SettingInfo("Player 2", betaDiagnostics.player2Status)
                 SettingInfo("Virtual gamepad", friendlyControllerStatus())
                 SettingInfo("Controller slot", "Automatic")
@@ -798,7 +810,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 2.7")
+                SettingInfo("Version", "DroidLink 2.8")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -887,7 +899,7 @@ class MainActivity : ComponentActivity() {
     private fun resetUiSettings() {
         showIntroAnimation = true; keepScreenAwake = true; qualityPreset = "Auto"
         animatedBackground = true; hapticFeedback = true; uiSoundEffects = true
-        accentName = "Green"
+        accentName = "Green"; selectedControllerProfile = ControllerProfile.PC_WINLATOR
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().clear().putBoolean("onboarding_complete", true).apply()
     }
 
@@ -908,6 +920,13 @@ class MainActivity : ComponentActivity() {
         if (name !in ACCENT_COLORS) return
         accentName = name
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("accent_color", name).apply()
+    }
+
+    private fun setControllerProfile(profile: ControllerProfile) {
+        if (sessionActive || sessionStarting) return
+        selectedControllerProfile = profile
+        getSharedPreferences("droid_link_ui", MODE_PRIVATE).edit().putString("controller_profile", profile.storageValue).apply()
+        Log.d(TAG, "CONTROLLER_PROFILE_CONFIGURED: ${profile.label}")
     }
 
     private fun enableImmersiveMode() {
@@ -1048,7 +1067,8 @@ class MainActivity : ComponentActivity() {
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
             controllerBackend.close()
-            controllerBackend = ControllerBackendSelector.select()
+            player2Classification = "Unknown"
+            controllerBackend = ControllerBackendSelector.select(selectedControllerProfile)
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
             schedulePlayer2Inspection()
             hostRtc.initialize()
@@ -1432,7 +1452,11 @@ class MainActivity : ComponentActivity() {
         mainHandler.postDelayed({ inspectAllPlayer2Devices() }, 1_000L)
         mainHandler.postDelayed({
             if (player2Classification == "Unknown" && controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) {
-                Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: Android has not enumerated DroidLink Player 2 yet; start Winlator only after WINLATOR_GAMEPAD_READY")
+                if (selectedControllerProfile == ControllerProfile.GAMECUBE_DOLPHIN) {
+                    Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: Android has not enumerated DroidLink GameCube Player 2 yet")
+                } else {
+                    Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: Android has not enumerated DroidLink Player 2 yet; start Winlator only after WINLATOR_GAMEPAD_READY")
+                }
             }
         }, 2_000L)
     }
@@ -1441,6 +1465,10 @@ class MainActivity : ComponentActivity() {
 
     private fun inspectPlayer2Device(deviceId: Int) {
         val device = InputDevice.getDevice(deviceId) ?: return
+        if (selectedControllerProfile == ControllerProfile.GAMECUBE_DOLPHIN) {
+            inspectDolphinDevice(deviceId, device)
+            return
+        }
         if (device.name != "DroidLink Player 2") return
         val sources = device.sources
         val gamepad = sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
@@ -1460,6 +1488,26 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "GAMEPAD_VID_PID: %04x:%04x".format(device.vendorId, device.productId))
         if (gamepad && joystick && !keyboard) Log.d(TAG, "WINLATOR_GAMEPAD_READY: Android classified DroidLink Player 2 as GAMEPAD/JOYSTICK; start Winlator container now")
         else Log.w(TAG, "WINLATOR_HOTPLUG_WARNING: classification=$classification; do not start Winlator until GAMEPAD/JOYSTICK classification is confirmed")
+    }
+
+    private fun inspectDolphinDevice(deviceId: Int, device: InputDevice) {
+        if (device.name != "DroidLink GameCube Player 2") return
+        val sources = device.sources
+        val gamepad = sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
+        val joystick = sources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        val keyboard = sources and InputDevice.SOURCE_KEYBOARD == InputDevice.SOURCE_KEYBOARD
+        val classification = buildList {
+            if (gamepad) add("GAMEPAD")
+            if (joystick) add("JOYSTICK")
+            if (keyboard) add("KEYBOARD")
+        }.ifEmpty { listOf("UNKNOWN") }.joinToString(" / ")
+        player2Classification = classification
+        updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label, player2Classification = classification) }
+        val axes = device.motionRanges.joinToString { "${MotionEvent.axisToString(it.axis)}=${it.min}..${it.max}" }
+        Log.d(TAG, "DOLPHIN_ANDROID_DEVICE: id=$deviceId name=${device.name} sources=0x${sources.toString(16)} descriptor=${device.descriptor} vidPid=%04x:%04x axes=[$axes]".format(device.vendorId, device.productId))
+        Log.d(TAG, "DOLPHIN_DEVICE_CLASSIFICATION: gamepad=$gamepad joystick=$joystick keyboard=$keyboard")
+        if (gamepad && joystick && !keyboard) Log.d(TAG, "DOLPHIN_CONTROLLER_READY: Android classified DroidLink GameCube Player 2 as GAMEPAD/JOYSTICK")
+        else Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: classification=$classification expected=GAMEPAD/JOYSTICK")
     }
 
     private fun recordControllerPacket() {

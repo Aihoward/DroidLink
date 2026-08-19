@@ -3,6 +3,7 @@ package com.droidlink.app
 import android.util.Log
 import android.view.KeyEvent
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 data class ControllerEventContext(val sessionId: String, val controllerId: String, val playerSlot: Int, val sequence: Long, val sentAtMs: Long)
 
@@ -38,15 +39,179 @@ class TransportOnlyBackend(
 }
 
 object ControllerBackendSelector {
-    fun select(): ControllerBackend {
+    fun select(profile: ControllerProfile = ControllerProfile.PC_WINLATOR): ControllerBackend {
         Log.d("DroidLink", "UINPUT_AVAILABLE: ${File("/dev/uinput").exists()}")
+        Log.d("DroidLink", "CONTROLLER_PROFILE_SELECTED: ${profile.label}")
         return try {
-            UinputVirtualGamepadBackend()
+            when (profile) {
+                ControllerProfile.GAMECUBE_DOLPHIN -> DolphinVirtualGamepadBackend()
+                ControllerProfile.PC_WINLATOR, ControllerProfile.PS2 -> UinputVirtualGamepadBackend()
+            }
         } catch (error: Throwable) {
             val rootPresent = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su").any { File(it).exists() }
             val status = if (File("/dev/uinput").exists() || rootPresent) ControllerBackendStatus.PERMISSION_REQUIRED else ControllerBackendStatus.UNSUPPORTED
             Log.e("DroidLink", "UINPUT_PERMISSION: denied (${error.message})")
             TransportOnlyBackend(status, if (rootPresent) "Root appears present, but DroidLink has not been granted direct /dev/uinput access" else "Host cannot open/create /dev/uinput; privileged setup is required")
+        }
+    }
+}
+
+class DolphinVirtualGamepadBackend : ControllerBackend {
+    companion object {
+        private const val TAG = "DroidLink"
+        private const val DEVICE_NAME = "DroidLink GameCube Player 2"
+        private val activeInstances = AtomicInteger(0)
+
+        init { System.loadLibrary("droidlink_native") }
+
+        @JvmStatic private external fun nativeCreate(name: String): Long
+        @JvmStatic private external fun nativeUpdateState(
+            handle: Long,
+            a: Boolean,
+            b: Boolean,
+            x: Boolean,
+            y: Boolean,
+            start: Boolean,
+            z: Boolean,
+            digitalL: Boolean,
+            digitalR: Boolean,
+            dpadX: Int,
+            dpadY: Int,
+            mainX: Float,
+            mainY: Float,
+            cX: Float,
+            cY: Float,
+            analogL: Float,
+            analogR: Float
+        ): Boolean
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+    }
+
+    override val status = ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE
+    override val capabilityDescription = DEVICE_NAME
+    private val handle = nativeCreate(DEVICE_NAME).also { check(it >= 0) { "native Dolphin uinput create failed errno=${-it}" } }
+    private val stateLock = Any()
+    private var state = GameCubeControllerState()
+    private var stateUpdates = 0L
+    private var digitalTransitions = 0L
+    private var axisUpdates = 0L
+    private var dpadUpdates = 0L
+    private var failedUpdates = 0L
+    private var neutralResets = 0L
+    private var lastSuccessfulUpdateMs = 0L
+    private var closed = false
+
+    init {
+        val instances = activeInstances.incrementAndGet()
+        Log.d(TAG, "GAMECUBE_PROFILE_ACTIVATED: mapping=${GameCubeMapping.TABLE_VERSION}")
+        Log.d(TAG, "DOLPHIN_CONTROLLER_CREATED: name=$DEVICE_NAME handle=$handle")
+        Log.d(TAG, "DOLPHIN_CONTROLLER_REGISTERED: true")
+        Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: name=$DEVICE_NAME vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
+        Log.d(TAG, "DOLPHIN_BUTTON_MAPPING: physical A/B/X/Y->GameCube A/B/X/Y; Start->Start; R1->Z")
+        Log.d(TAG, "DOLPHIN_TRIGGER_MAPPING: L2/R2 analog->Analog L/R; threshold=${GameCubeMapping.DIGITAL_TRIGGER_THRESHOLD}; L1/L2 button->Digital L; R2 button->Digital R")
+        Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button R1; Digital L=Button L2; Digital R=Button R2; Analog L/R=Axis Z/RZ")
+        Log.d(TAG, "DOLPHIN_AXIS_MAPPING: left stick->Main Stick; right stick->C-Stick; direct Android polarity")
+        if (instances > 1) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
+    }
+
+    override fun keyDown(context: ControllerEventContext, keyCode: Int) = updateKey(keyCode, true)
+    override fun keyUp(context: ControllerEventContext, keyCode: Int) = updateKey(keyCode, false)
+
+    private fun updateKey(keyCode: Int, down: Boolean): Boolean = synchronized(stateLock) {
+        val next = GameCubeMapping.updateKey(state, keyCode, down) ?: return@synchronized false
+        state = next
+        digitalTransitions++
+        val logical = when (keyCode) {
+            KeyEvent.KEYCODE_BUTTON_R1 -> "Z"
+            KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_L2 -> "L_DIGITAL"
+            KeyEvent.KEYCODE_BUTTON_R2 -> "R_DIGITAL"
+            else -> ControllerMapping.logicalForAndroidKey(keyCode)?.displayName ?: keyCode.toString()
+        }
+        Log.d(TAG, "DOLPHIN_BUTTON_TRANSITION: control=$logical state=${if (down) "DOWN" else "UP"} transitions=$digitalTransitions")
+        writeStateLocked("digital:$logical")
+    }
+
+    override fun updateAxes(
+        context: ControllerEventContext,
+        leftX: Float,
+        leftY: Float,
+        rightX: Float,
+        rightY: Float,
+        leftTrigger: Float,
+        rightTrigger: Float,
+        dpadX: Float,
+        dpadY: Float
+    ): Boolean = synchronized(stateLock) {
+        state = GameCubeMapping.updateAxes(state, leftX, leftY, rightX, rightY, leftTrigger, rightTrigger)
+        axisUpdates++
+        val result = writeStateLocked("analog")
+        if (axisUpdates % 120L == 1L) {
+            Log.d(TAG, "DOLPHIN_ANALOG_SUMMARY: updates=$axisUpdates main=${state.mainX},${state.mainY} c=${state.cX},${state.cY} analogL=${state.analogL} analogR=${state.analogR} digitalL=${state.digitalL} digitalR=${state.digitalR}")
+        }
+        result
+    }
+
+    override fun updateDpad(context: ControllerEventContext, dpadX: Int, dpadY: Int): Boolean = synchronized(stateLock) {
+        state = GameCubeMapping.updateDpad(state, dpadX, dpadY)
+        dpadUpdates++
+        Log.d(TAG, "DOLPHIN_DPAD_TRANSITION: state=${DpadState(state.dpadX, state.dpadY).label} updates=$dpadUpdates")
+        writeStateLocked("dpad")
+    }
+
+    private fun writeStateLocked(reason: String): Boolean = try {
+        check(!closed) { "Dolphin backend is closed" }
+        check(nativeUpdateState(
+            handle,
+            state.isPressed(GameCubeButton.A),
+            state.isPressed(GameCubeButton.B),
+            state.isPressed(GameCubeButton.X),
+            state.isPressed(GameCubeButton.Y),
+            state.isPressed(GameCubeButton.START),
+            state.isPressed(GameCubeButton.Z),
+            state.digitalL,
+            state.digitalR,
+            state.dpadX,
+            state.dpadY,
+            state.mainX,
+            state.mainY,
+            state.cX,
+            state.cY,
+            state.analogL,
+            state.analogR
+        ))
+        stateUpdates++
+        lastSuccessfulUpdateMs = android.os.SystemClock.elapsedRealtime()
+        true
+    } catch (error: Throwable) {
+        failedUpdates++
+        Log.e(TAG, "DOLPHIN_INPUT_UPDATE_FAILED: reason=$reason failures=$failedUpdates ${error.message}", error)
+        false
+    }
+
+    override fun resetNeutral(reason: String) = synchronized(stateLock) {
+        if (closed) return@synchronized
+        state = GameCubeControllerState()
+        neutralResets++
+        if (writeStateLocked("neutral:$reason")) Log.d(TAG, "DOLPHIN_NEUTRAL_RESET: reason=$reason resets=$neutralResets virtualDeviceRecreated=false")
+    }
+
+    override fun logHealth(reason: String) {
+        synchronized(stateLock) {
+            Log.d(TAG, "DOLPHIN_CONTROLLER_HEALTH: reason=$reason registered=${!closed} handle=$handle identity=${System.identityHashCode(this)} statesSent=$stateUpdates digitalTransitions=$digitalTransitions axisUpdates=$axisUpdates dpadUpdates=$dpadUpdates failedUpdates=$failedUpdates neutralResets=$neutralResets lastSuccessfulUpdateMs=$lastSuccessfulUpdateMs activeInstances=${activeInstances.get()} state=$state")
+        }
+    }
+
+    override fun close() {
+        synchronized(stateLock) {
+            if (closed) {
+                Log.w(TAG, "DOLPHIN_CONTROLLER_CLEANUP_SKIPPED: already destroyed handle=$handle")
+                return@synchronized
+            }
+            resetNeutral("backend close")
+            closed = true
+            nativeDestroy(handle)
+            val instances = activeInstances.decrementAndGet()
+            Log.d(TAG, "DOLPHIN_CONTROLLER_CLEANUP: handle=$handle statesSent=$stateUpdates activeInstances=$instances")
         }
     }
 }
