@@ -71,18 +71,37 @@ class MainActivity : ComponentActivity() {
         private const val TAG = "DroidLink"
         private val ACCENT_COLORS = setOf("Red", "Blue", "Green", "Yellow", "Purple")
     }
+
+    private class RemoteInputSession(val playerSlot: Int) {
+        var logicalState = ControllerInputState()
+        val heldButtons = mutableSetOf<Int>()
+        val lastSequences = mutableMapOf<String, Long>()
+        val dpadState = DpadStateMachine()
+        var lastPacketMs = 0L
+        var axisAckCounter = 0
+    }
+
     private val firebase = FirebaseRoomManager()
     private val hostRtc by lazy { WebRtcManager(this) }
     private val clientRtc by lazy { WebRtcManager(this) }
+    private val hostRtcBySlot = java.util.concurrent.ConcurrentHashMap<Int, WebRtcManager>()
+    private val hostPeerStates = java.util.concurrent.ConcurrentHashMap<Int, PeerConnection.PeerConnectionState>()
+    private val hostDiagnosticsBySlot = java.util.concurrent.ConcurrentHashMap<Int, BetaDiagnostics>()
+    private val hostDisconnectGraceRunnables = mutableMapOf<Int, Runnable>()
+    private val remoteInputSessions = java.util.concurrent.ConcurrentHashMap<Int, RemoteInputSession>()
+    private val controllerBackends = java.util.concurrent.ConcurrentHashMap<Int, ControllerBackend>()
     private lateinit var menuMusicController: MenuMusicController
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
     private var hostRoomCode by mutableStateOf("")
     private var hostStatus by mutableStateOf("")
+    private var hostClaimedSlots by mutableStateOf(emptySet<Int>())
+    private var hostConnectedSlots by mutableStateOf(emptySet<Int>())
     private var captureStatus by mutableStateOf("DroidLink is ready")
     private var clientStatus by mutableStateOf("Not connected")
     private var joinSessionState by mutableStateOf(JoinSessionState.Idle)
+    private var remoteSlotAssignment by mutableStateOf<RemoteSlotAssignment?>(null)
     private var audioStatus by mutableStateOf("Audio not evaluated")
     private var betaDiagnostics by mutableStateOf(BetaDiagnostics())
     private var sessionActive by mutableStateOf(false)
@@ -161,41 +180,39 @@ class MainActivity : ComponentActivity() {
     private val dpadSources = mutableMapOf<Int, DpadSource>()
     private val joinerDpadKeys = mutableSetOf<LogicalControl>()
     private val joinerDpadState = DpadStateMachine()
-    private val hostDpadState = DpadStateMachine()
     private var dpadDuplicateDrops = 0L
     private var activeSessionId = "none"
     private var sessionGeneration = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
     private var controllerHealthRunning = false
     private var controllerHealthTicks = 0
-    private var lastRemoteInputPacketMs = 0L
     private var watchdogNeutralResets = 0L
     private val controllerHealthRunnable = object : Runnable {
         override fun run() {
             if (!controllerHealthRunning) return
             controllerHealthTicks++
-            hostRtc.recoverControllerChannels("periodic health check")
+            hostRtcBySlot.forEach { (slot, rtc) -> rtc.recoverControllerChannels("P$slot periodic health check") }
             val now = android.os.SystemClock.elapsedRealtime()
-            val axesActive = listOf(
-                logicalControllerState.leftX, logicalControllerState.leftY,
-                logicalControllerState.rightX, logicalControllerState.rightY,
-                logicalControllerState.leftTrigger, logicalControllerState.rightTrigger,
-                logicalControllerState.dpadX, logicalControllerState.dpadY
-            ).any { kotlin.math.abs(it) > 0.05f }
-            if (hostPeerState == PeerConnection.PeerConnectionState.CONNECTED &&
-                lastRemoteInputPacketMs > 0L && axesActive &&
-                now - lastRemoteInputPacketMs >= ControllerTransportPolicy.STALE_ACTIVE_INPUT_MS
-            ) {
-                watchdogNeutralResets++
-                Log.e(TAG, "CONTROLLER_WATCHDOG_RESET: staleMs=${now - lastRemoteInputPacketMs} resets=$watchdogNeutralResets virtualDeviceRecreated=false")
-                resetRemoteInput("controller packet watchdog")
-                lastRemoteInputPacketMs = now
+            remoteInputSessions.forEach { (slot, input) ->
+                val state = input.logicalState
+                val axesActive = listOf(
+                    state.leftX, state.leftY, state.rightX, state.rightY,
+                    state.leftTrigger, state.rightTrigger, state.dpadX, state.dpadY
+                ).any { kotlin.math.abs(it) > 0.05f }
+                if (hostPeerStates[slot] == PeerConnection.PeerConnectionState.CONNECTED && input.lastPacketMs > 0L && axesActive &&
+                    now - input.lastPacketMs >= ControllerTransportPolicy.STALE_ACTIVE_INPUT_MS
+                ) {
+                    watchdogNeutralResets++
+                    Log.e(TAG, "P$slot CONTROLLER_WATCHDOG_RESET: staleMs=${now - input.lastPacketMs} resets=$watchdogNeutralResets virtualDeviceRecreated=false")
+                    resetRemoteInput(slot, "controller packet watchdog")
+                    input.lastPacketMs = now
+                }
             }
             if (controllerHealthTicks % ControllerTransportPolicy.HEALTH_LOG_EVERY_TICKS == 0) {
-                hostRtc.logControllerTransportHealth("periodic")
-                clientRtc.logControllerTransportHealth("periodic")
-                controllerBackend.logHealth("periodic")
-                Log.d(TAG, "CONTROLLER_SESSION_HEALTH: session=$activeSessionId active=$sessionActive captureEnabled=$clientControlActive physicalDeviceId=$lastControllerDeviceId backend=${controllerBackend.status.label} backendIdentity=${System.identityHashCode(controllerBackend)} packetsWindow=$controllerWindowPackets peerHost=$hostPeerState peerClient=$clientPeerState watchdogResets=$watchdogNeutralResets")
+                hostRtcBySlot.forEach { (slot, rtc) -> rtc.logControllerTransportHealth("P$slot periodic") }
+                if (mode == "client") clientRtc.logControllerTransportHealth("P${remoteSlotAssignment?.playerSlot ?: 2} periodic")
+                controllerBackends.forEach { (slot, backend) -> backend.logHealth("P$slot periodic") }
+                Log.d(TAG, "CONTROLLER_SESSION_HEALTH: session=$activeSessionId active=$sessionActive captureEnabled=$clientControlActive physicalDeviceId=$lastControllerDeviceId hostPeers=$hostPeerStates peerClient=$clientPeerState watchdogResets=$watchdogNeutralResets")
             }
             mainHandler.postDelayed(this, ControllerTransportPolicy.HEALTH_INTERVAL_MS)
         }
@@ -203,7 +220,6 @@ class MainActivity : ComponentActivity() {
     private var backendUnavailableLogged = false
     private var controllerWindowStart = android.os.SystemClock.elapsedRealtime()
     private var controllerWindowPackets = 0
-    private var axisAckCounter = 0
     private var controlThreadLogCounter = 0
     private var controllerAckLogCounter = 0
     private var lastControlRoundTripMs: Long? = null
@@ -221,8 +237,6 @@ class MainActivity : ComponentActivity() {
     private var player2Classification = "Unknown"
     private var clientPeerState = PeerConnection.PeerConnectionState.NEW
     private var hostPeerState = PeerConnection.PeerConnectionState.NEW
-    private val heldRemoteButtons = mutableSetOf<Int>()
-    private val lastRemoteSequences = mutableMapOf<String, Long>()
     private lateinit var sessionBackCallback: OnBackPressedCallback
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) { inspectPlayer2Device(deviceId) }
@@ -236,15 +250,6 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "RECONNECT GRACE EXPIRED: PeerConnection remained DISCONNECTED for 15 seconds")
         }
     }
-    private val hostDisconnectGraceRunnable = Runnable {
-        if (hostPeerState == PeerConnection.PeerConnectionState.DISCONNECTED) {
-            hostStatus = "Reconnection failed - retry the session"
-            sessionStarting = false
-            updateSessionActive(false)
-            Log.e(TAG, "HOST RECONNECT GRACE EXPIRED: PeerConnection remained DISCONNECTED for 15 seconds")
-        }
-    }
-
     private val projectionReadyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != ScreenCaptureService.ACTION_READY) return
@@ -420,7 +425,7 @@ class MainActivity : ComponentActivity() {
             val subtitle: String
             val detail: String
             when (onboardingPage) {
-                1 -> { title = "HOST"; subtitle = "Start the game."; detail = "Create a room, allow screen capture, and share the six-digit code with Player 2." }
+                1 -> { title = "HOST"; subtitle = "Start the game."; detail = "Create a room, allow screen capture, and share the six-digit code with up to two players." }
                 2 -> { title = "JOIN"; subtitle = "Play together."; detail = "Enter the room code on another Android device and play using your physical controller." }
                 else -> { title = "DROID LINK"; subtitle = "Play Together. Anywhere."; detail = "Low-latency Android-to-Android game streaming and remote multiplayer." }
             }
@@ -512,10 +517,9 @@ class MainActivity : ComponentActivity() {
             Text(friendlyStatus(hostStatus.ifEmpty { "Ready to start" }), color = Color.White, textAlign = TextAlign.Center)
         }
         NeonButton(if (sessionStarting) "STARTING…" else "START HOST", enabled = !sessionStarting, onClick = onStart)
-        PlayerSlot("PLAYER 1", "Player 1", "HOST • ${if (sessionActive) "CONNECTED" else "READY"}", true)
-        PlayerSlot("PLAYER 2", "Player 2", if (sessionActive) "CONNECTED" else "WAITING", sessionActive)
-        PlayerSlot("PLAYER 3", "", "COMING SOON", false)
-        PlayerSlot("PLAYER 4", "", "COMING SOON", false)
+        PlayerSlot("PLAYER 1", "Player 1", "HOST • READY", true)
+        PlayerSlot("PLAYER 2", "Player 2", hostSlotStatus(RemotePlayerSlots.PLAYER_2), RemotePlayerSlots.PLAYER_2 in hostConnectedSlots)
+        PlayerSlot("PLAYER 3", "Player 3", hostSlotStatus(RemotePlayerSlots.PLAYER_3), RemotePlayerSlots.PLAYER_3 in hostConnectedSlots)
         Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         if (isFailureStatus(hostStatus)) ErrorActions("CONNECTION FAILED", friendlyStatus(hostStatus), onRetry = onStart, onBack = onBack)
@@ -533,7 +537,11 @@ class MainActivity : ComponentActivity() {
         )
         Text("Enter the 6-digit code shown on the host device.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         NeonButton(if (sessionStarting) "CONNECTING…" else "JOIN HOST", enabled = !sessionStarting, onClick = onConnect)
-        StatusCard { Text(friendlyStatus(clientStatus), color = Color.White, textAlign = TextAlign.Center); Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center) }
+        StatusCard {
+            remoteSlotAssignment?.let { Text("PLAYER ${it.playerSlot}", color = neonGreen, fontWeight = FontWeight.Bold) }
+            Text(friendlyStatus(clientStatus), color = Color.White, textAlign = TextAlign.Center)
+            Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+        }
         if (isFailureStatus(clientStatus)) ErrorActions(if (clientStatus.contains("room", true)) "ROOM NOT FOUND" else "CONNECTION FAILED", friendlyStatus(clientStatus), onRetry = onConnect, onBack = onBack)
     }
 
@@ -578,14 +586,14 @@ class MainActivity : ComponentActivity() {
         val controllerReady = if (host) controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE else controlChannelOpen && lastControllerDeviceId != -1
         Box(Modifier.fillMaxSize().background(Color(0xD9000000)).windowInsetsPadding(WindowInsets.safeDrawing), contentAlignment = Alignment.Center) {
             Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("PLAYER 2 READY", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
+                Text("PLAYER ${if (host) hostConnectedSlots.minOrNull() ?: 2 else remoteSlotAssignment?.playerSlot ?: 2} READY", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
                 ReadinessLine("VIDEO", if (videoReady) "READY" else "CHECKING", videoReady)
                 ReadinessLine("AUDIO", if (audioReady) "READY" else if (audioStatus.contains("unavailable", true) || audioStatus.contains("denied", true)) "UNAVAILABLE" else "CHECKING", audioReady)
                 ReadinessLine("CONTROLLER", if (controllerReady) "READY" else if (host && controllerBackend.status != ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) "UNAVAILABLE" else "CHECKING", controllerReady)
                 ReadinessLine("CONNECTION", connectionQuality(), betaDiagnostics.connectionState.contains("CONNECTED", true))
                 ReadinessLine("PING", betaDiagnostics.rttMs?.let { "${it.toInt()} ms" } ?: "CHECKING", betaDiagnostics.rttMs != null)
                 ReadinessLine("PACKET LOSS", betaDiagnostics.packetLoss.toString(), betaDiagnostics.packetLoss < 10)
-                if (!controllerReady) Text(if (host) friendlyControllerStatus() else "Connect or move the Player 2 controller to verify input.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+                if (!controllerReady) Text(if (host) friendlyControllerStatus() else "Connect or move the Player ${remoteSlotAssignment?.playerSlot ?: 2} controller to verify input.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 if (!audioReady && !audioStatus.contains("waiting", true)) Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 NeonButton("START PLAYING") { readinessVisible = false }
                 NeonTextButton("CONNECTION STATS") { readinessVisible = false; sessionStatsOpen = true }
@@ -705,7 +713,7 @@ class MainActivity : ComponentActivity() {
         val state = controllerTestDisplayState
         Column(Modifier.background(Color(0xEE101010)).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("CONTROLLER TEST", color = Color.White)
-            Text(if (sessionActive && mode == "host") "Remote Player 2 input path" else "Local controller input", color = neonGreen, fontSize = 11.sp)
+            Text(if (sessionActive && mode == "host") "Remote multiplayer input path" else "Local controller input", color = neonGreen, fontSize = 11.sp)
             Text("Mapping: ${ControllerMapping.TABLE_VERSION}", color = Color.White)
             diagnosticLine("A / B / X / Y", "${upDown(state, LogicalControl.A)} / ${upDown(state, LogicalControl.B)} / ${upDown(state, LogicalControl.X)} / ${upDown(state, LogicalControl.Y)}")
             diagnosticLine("L1 / R1", "${upDown(state, LogicalControl.L1)} / ${upDown(state, LogicalControl.R1)}")
@@ -998,7 +1006,14 @@ class MainActivity : ComponentActivity() {
 
     private fun isFailureStatus(status: String) = status.contains("failed", true) || status.contains("error", true) || status.contains("not found", true) || status.contains("denied", true)
 
+    private fun hostSlotStatus(slot: Int) = when (slot) {
+        in hostConnectedSlots -> "CONNECTED"
+        in hostClaimedSlots -> "CONNECTING"
+        else -> "WAITING"
+    }
+
     private fun friendlyStatus(status: String): String = when {
+        status.contains("session is full", true) -> "This session already has a Host, Player 2, and Player 3."
         status.contains("room not found", true) -> "Check the room code and try again."
         status.contains("no WebRTC offer", true) -> "The host room exists but is not ready yet. Try again shortly."
         status.contains("screen capture permission denied", true) -> "Screen capture permission is required to host a game."
@@ -1078,65 +1093,225 @@ class MainActivity : ComponentActivity() {
             if (generation != sessionGeneration) { staleSessionCallback("create room", generation); return@createRoom }
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
-            controllerBackend.close()
             player2Classification = "Unknown"
-            controllerBackend = ControllerBackendSelector.select(selectedControllerProfile)
+            controllerBackends.values.forEach(ControllerBackend::close)
+            controllerBackends.clear()
+            RemotePlayerSlots.activeRemoteSlots.forEach { slot ->
+                controllerBackends[slot] = ControllerBackendSelector.select(selectedControllerProfile, slot)
+                remoteInputSessions[slot] = RemoteInputSession(slot)
+            }
+            controllerBackend = controllerBackends.getValue(RemotePlayerSlots.PLAYER_2)
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
             schedulePlayer2Inspection()
+            hostRtcBySlot[RemotePlayerSlots.PLAYER_2] = hostRtc
             hostRtc.initialize()
-            hostRtc.onControlMessageReceived = ::handleControlMessage
-            hostRtc.onAudioStatus = { status -> runOnUiThread { audioStatus = status } }
-            hostRtc.onDiagnostics = { update -> runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) } }
-            hostRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
-                if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
-                if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) resetRemoteInput("DataChannel $state")
-            } }
-            hostRtc.onConnectionStateChanged = { state -> runOnUiThread {
-                hostPeerState = state
-                when (state) {
-                    PeerConnection.PeerConnectionState.CONNECTED -> {
-                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
-                        hostStatus = "Connected"; sessionStarting = false; updateSessionActive(true)
-                        uiFeedback(window.decorView, success = true)
-                    }
-                    PeerConnection.PeerConnectionState.DISCONNECTED -> {
-                        hostStatus = "Reconnecting…"
-                        Log.w(TAG, "CONTROLLER_PATH_PRESERVED: transient host disconnect; virtual controller identity=${System.identityHashCode(controllerBackend)}")
-                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
-                        mainHandler.postDelayed(hostDisconnectGraceRunnable, 15_000L)
-                    }
-                    PeerConnection.PeerConnectionState.FAILED, PeerConnection.PeerConnectionState.CLOSED -> {
-                        mainHandler.removeCallbacks(hostDisconnectGraceRunnable)
-                        hostStatus = "Connection failed"; sessionStarting = false; resetRemoteInput("PeerConnection $state"); updateSessionActive(false)
-                    }
-                    else -> hostStatus = connectionText(state)
-                }
-            } }
-            hostRtc.onIceCandidateReady = { candidate ->
-                firebase.saveIceCandidate(code, "host", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { hostStatus = "ICE save error: $it" }
-            }
+            configureHostPeer(RemotePlayerSlots.PLAYER_2, hostRtc, code, generation)
+            firebase.listenForRemoteClaims(
+                code,
+                hostRoomOwner(generation),
+                { slot, _ -> runOnUiThread {
+                    if (!isCurrentSession(generation, code)) return@runOnUiThread staleSessionCallback("P$slot claim joined", generation)
+                    hostClaimedSlots = hostClaimedSlots + slot
+                    Log.d(TAG, "P$slot joined room; stable slot assigned")
+                } },
+                { slot, _ -> runOnUiThread {
+                    if (!isCurrentSession(generation, code)) return@runOnUiThread staleSessionCallback("P$slot claim left", generation)
+                    hostClaimedSlots = hostClaimedSlots - slot
+                    cleanupHostRemoteSlot(slot, code, generation, "remote claim removed", rebuild = true)
+                } },
+                { error -> runOnUiThread { if (isCurrentSession(generation, code)) hostStatus = "Player listener error: $error" } }
+            )
             hostRtc.createPeerConnection(true, onSuccess = {
                 runOnUiThread {
                     hostStatus = "PeerConnection ready; waiting for screen permission..."
-                    firebase.listenForIceCandidates(code, "client", { c, mid, line -> hostRtc.addIceCandidate(c, mid, line) }, { hostStatus = "ICE listen error: $it" })
-                    pendingOffer = { createAndPublishOffer(code) }
+                    listenForHostSlotIce(code, RemotePlayerSlots.PLAYER_2, hostRtc, generation)
+                    pendingOffer = { publishInitialHostOffers(code, generation) }
                     requestScreenCapture()
                 }
             }, onError = { runOnUiThread { hostStatus = "PeerConnection error: $it"; sessionStarting = false } })
         }, { hostStatus = "Room error: $it"; sessionStarting = false })
     }
 
-    private fun createAndPublishOffer(code: String) {
-        hostStatus = "Creating WebRTC offer..."
-        hostRtc.createOffer({ offer ->
-            firebase.saveOffer(code, offer, {
-                hostStatus = "Waiting for player"
-                firebase.listenForAnswer(code, { answer ->
-                    hostRtc.setRemoteAnswer(answer, { hostStatus = "Answer received - connecting..." }, { hostStatus = "Answer error: $it" })
-                }, { hostStatus = "Answer listen error: $it" })
-            }, { hostStatus = "Offer save failed: $it" })
-        }, { hostStatus = "Offer error: $it"; sessionStarting = false })
+    private fun publishInitialHostOffers(code: String, generation: Long) {
+        if (!isCurrentSession(generation, code)) return staleSessionCallback("initial host offers", generation)
+        publishHostOffer(code, RemotePlayerSlots.PLAYER_2, hostRtc, generation)
+        prepareHostSlot(code, RemotePlayerSlots.PLAYER_3, generation)
     }
+
+    private fun prepareHostSlot(code: String, slot: Int, generation: Long) {
+        if (!isCurrentSession(generation, code) || !SessionSecurityPolicy.validRemoteSlot(slot)) return
+        val media = hostRtc.sharedHostMedia() ?: run {
+            hostStatus = "Shared host video is unavailable"
+            Log.e(TAG, "P$slot host media attach failed: capture track unavailable")
+            return
+        }
+        val rtc = if (slot == RemotePlayerSlots.PLAYER_2) hostRtc else WebRtcManager(this)
+        hostRtcBySlot[slot] = rtc
+        if (slot == RemotePlayerSlots.PLAYER_2) rtc.initialize()
+        else {
+            val sharedResources = hostRtc.sharedWebRtcResources() ?: run {
+                hostStatus = "Shared WebRTC resources are unavailable"
+                return
+            }
+            rtc.initialize(sharedResources)
+        }
+        configureHostPeer(slot, rtc, code, generation)
+        rtc.createPeerConnection(true, onSuccess = {
+            runOnUiThread {
+                if (!isCurrentHostPeer(slot, rtc, code, generation)) return@runOnUiThread staleSessionCallback("P$slot peer created", generation)
+                try {
+                    rtc.attachSharedHostMedia(media)
+                    listenForHostSlotIce(code, slot, rtc, generation)
+                    publishHostOffer(code, slot, rtc, generation)
+                    Log.d(TAG, "P$slot PeerConnection created with shared capture")
+                } catch (error: Throwable) {
+                    hostStatus = "Player $slot media error: ${error.message}"
+                    Log.e(TAG, "P$slot shared host media setup failed", error)
+                }
+            }
+        }, onError = { error -> runOnUiThread {
+            if (isCurrentSession(generation, code)) hostStatus = "Player $slot PeerConnection error: $error"
+        } })
+    }
+
+    private fun publishHostOffer(code: String, slot: Int, rtc: WebRtcManager, generation: Long) {
+        if (!isCurrentHostPeer(slot, rtc, code, generation)) return
+        hostStatus = "Preparing Player $slot..."
+        rtc.createOffer({ offer ->
+            if (!isCurrentHostPeer(slot, rtc, code, generation)) return@createOffer staleSessionCallback("P$slot offer", generation)
+            firebase.saveOffer(code, slot, offer, {
+                if (!isCurrentHostPeer(slot, rtc, code, generation)) return@saveOffer
+                hostStatus = if (hostConnectedSlots.isEmpty()) "Waiting for players" else hostStatus
+                firebase.listenForAnswer(code, slot, hostSlotOwner(slot, generation), { answer ->
+                    if (!isCurrentHostPeer(slot, rtc, code, generation)) return@listenForAnswer staleSessionCallback("P$slot answer", generation)
+                    rtc.setRemoteAnswer(answer, { Log.d(TAG, "P$slot answer applied; connecting") }, { hostStatus = "Player $slot answer error: $it" })
+                }, { hostStatus = "Player $slot answer listen error: $it" })
+            }, { hostStatus = "Player $slot offer save failed: $it" })
+        }, { hostStatus = "Player $slot offer error: $it" })
+    }
+
+    private fun configureHostPeer(slot: Int, rtc: WebRtcManager, code: String, generation: Long) {
+        rtc.onControlMessageReceived = { message -> handleControlMessage(slot, rtc, message) }
+        rtc.onAudioStatus = { status -> if (slot == RemotePlayerSlots.PLAYER_2) runOnUiThread { audioStatus = status } }
+        rtc.onDiagnostics = { update ->
+            hostDiagnosticsBySlot[slot] = update
+            if (slot == RemotePlayerSlots.PLAYER_2) runOnUiThread { betaDiagnostics = mergeControllerDiagnostics(update) }
+        }
+        rtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
+            if (!isCurrentHostPeer(slot, rtc, code, generation)) return@runOnUiThread
+            Log.d(TAG, "P$slot DataChannel $label $state")
+            if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) resetRemoteInput(slot, "DataChannel $state")
+        } }
+        rtc.onConnectionStateChanged = { state -> runOnUiThread {
+            if (!isCurrentHostPeer(slot, rtc, code, generation)) return@runOnUiThread staleSessionCallback("P$slot PeerConnection $state", generation)
+            hostPeerStates[slot] = state
+            if (slot == RemotePlayerSlots.PLAYER_2) hostPeerState = state
+            Log.d(TAG, "P$slot PeerConnection $state")
+            when (state) {
+                PeerConnection.PeerConnectionState.CONNECTED -> {
+                    cancelHostDisconnectGrace(slot)
+                    hostConnectedSlots = hostConnectedSlots + slot
+                    hostStatus = connectedPlayersStatus()
+                    sessionStarting = false
+                    updateSessionActive(true)
+                    uiFeedback(window.decorView, success = true)
+                }
+                PeerConnection.PeerConnectionState.DISCONNECTED -> {
+                    hostStatus = "Player $slot reconnecting..."
+                    scheduleHostDisconnectGrace(slot, rtc, code, generation)
+                }
+                PeerConnection.PeerConnectionState.FAILED, PeerConnection.PeerConnectionState.CLOSED -> {
+                    cancelHostDisconnectGrace(slot)
+                    hostConnectedSlots = hostConnectedSlots - slot
+                    resetRemoteInput(slot, "PeerConnection $state")
+                    refreshHostSessionState()
+                }
+                else -> if (hostConnectedSlots.isEmpty()) hostStatus = "Player $slot ${connectionText(state)}"
+            }
+        } }
+        rtc.onIceCandidateReady = { candidate ->
+            if (isCurrentHostPeer(slot, rtc, code, generation)) {
+                firebase.saveIceCandidate(code, slot, "host", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) {
+                    runOnUiThread { if (isCurrentHostPeer(slot, rtc, code, generation)) hostStatus = "Player $slot ICE save error: $it" }
+                }
+            }
+        }
+    }
+
+    private fun listenForHostSlotIce(code: String, slot: Int, rtc: WebRtcManager, generation: Long) {
+        firebase.listenForIceCandidates(
+            code, slot, "client", hostSlotOwner(slot, generation),
+            { candidate, mid, line -> if (isCurrentHostPeer(slot, rtc, code, generation)) rtc.addIceCandidate(candidate, mid, line) },
+            { error -> runOnUiThread { if (isCurrentHostPeer(slot, rtc, code, generation)) hostStatus = "Player $slot ICE listen error: $error" } }
+        )
+    }
+
+    private fun cleanupHostRemoteSlot(slot: Int, code: String, generation: Long, reason: String, rebuild: Boolean) {
+        val rtc = hostRtcBySlot[slot] ?: return
+        Log.d(TAG, "P$slot isolated cleanup started: reason=$reason")
+        cancelHostDisconnectGrace(slot)
+        if (hostRtc.sharedHostMedia() == null) {
+            resetRemoteInput(slot, reason)
+            hostPeerStates.remove(slot)
+            hostConnectedSlots = hostConnectedSlots - slot
+            Log.d(TAG, "P$slot cleanup deferred until initial host capture is ready")
+            refreshHostSessionState()
+            return
+        }
+        firebase.stopListening(hostSlotOwner(slot, generation))
+        resetRemoteInput(slot, reason)
+        hostPeerStates.remove(slot)
+        hostConnectedSlots = hostConnectedSlots - slot
+        if (slot == RemotePlayerSlots.PLAYER_2) rtc.closePeerConnectionPreservingLocalMedia()
+        else {
+            hostRtcBySlot.remove(slot)
+            rtc.release()
+        }
+        refreshHostSessionState()
+        firebase.clearSlotSignaling(code, slot) {
+            runOnUiThread {
+                if (rebuild && isCurrentSession(generation, code)) {
+                    prepareHostSlot(code, slot, generation)
+                    Log.d(TAG, "P$slot disconnected - isolated cleanup complete; slot prepared for reuse")
+                }
+            }
+        }
+    }
+
+    private fun scheduleHostDisconnectGrace(slot: Int, rtc: WebRtcManager, code: String, generation: Long) {
+        cancelHostDisconnectGrace(slot)
+        val runnable = Runnable {
+            if (isCurrentHostPeer(slot, rtc, code, generation) && hostPeerStates[slot] == PeerConnection.PeerConnectionState.DISCONNECTED) {
+                hostConnectedSlots = hostConnectedSlots - slot
+                resetRemoteInput(slot, "reconnect grace expired")
+                refreshHostSessionState()
+                Log.e(TAG, "P$slot reconnect grace expired; other remote players preserved")
+            }
+        }
+        hostDisconnectGraceRunnables[slot] = runnable
+        mainHandler.postDelayed(runnable, 15_000L)
+    }
+
+    private fun cancelHostDisconnectGrace(slot: Int) {
+        hostDisconnectGraceRunnables.remove(slot)?.let(mainHandler::removeCallbacks)
+    }
+
+    private fun refreshHostSessionState() {
+        if (mode != "host") return
+        val anyConnected = hostConnectedSlots.isNotEmpty()
+        sessionStarting = !anyConnected && hostRoomCode.isNotEmpty()
+        updateSessionActive(anyConnected)
+        hostStatus = if (anyConnected) connectedPlayersStatus() else "Waiting for players"
+    }
+
+    private fun connectedPlayersStatus() = hostConnectedSlots.sorted().joinToString(prefix = "Connected: ") { "P$it" }
+
+    private fun isCurrentHostPeer(slot: Int, rtc: WebRtcManager, code: String, generation: Long) =
+        isCurrentSession(generation, code) && hostRtcBySlot[slot] === rtc
+
+    private fun hostRoomOwner(generation: Long) = "host-room-$generation"
+    private fun hostSlotOwner(slot: Int, generation: Long) = "host-P$slot-$generation"
+    private fun joinSlotOwner(assignment: RemoteSlotAssignment, generation: Long) = "join-P${assignment.playerSlot}-${assignment.joinerId}-$generation"
 
     private fun startJoin(code: String) {
         if (code.length != 6) { clientStatus = "Enter a 6-digit room code"; return }
@@ -1146,22 +1321,32 @@ class MainActivity : ComponentActivity() {
         activeSessionId = code
         sessionStarting = true
         transitionJoinState(JoinSessionState.LookingForRoom, "join button pressed", "Looking for room...")
-        firebase.joinRoom(code, {
-            if (!isCurrentSession(generation, code)) { staleSessionCallback("join room success", generation); return@joinRoom }
-            transitionJoinState(JoinSessionState.Negotiating, "room found", "Loading WebRTC offer...")
-            firebase.getOffer(code, { offer -> if (isCurrentSession(generation, code)) prepareJoinPeer(code, offer, generation) else staleSessionCallback("offer loaded", generation) }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Offer load failed: $it") else staleSessionCallback("offer failure", generation) })
+        val joinerId = java.util.UUID.randomUUID().toString()
+        firebase.claimRemoteSlot(code, joinerId, { assignment ->
+            if (!isCurrentSession(generation, code)) {
+                firebase.releaseRemoteSlot(code, assignment)
+                staleSessionCallback("join slot claim", generation)
+                return@claimRemoteSlot
+            }
+            remoteSlotAssignment = assignment
+            transitionJoinState(JoinSessionState.Negotiating, "P${assignment.playerSlot} assigned", "Player ${assignment.playerSlot} assigned - waiting for host...")
+            firebase.listenForOffer(code, assignment.playerSlot, joinSlotOwner(assignment, generation), { offer ->
+                if (isCurrentSession(generation, code) && remoteSlotAssignment == assignment) prepareJoinPeer(code, offer, assignment, generation)
+                else staleSessionCallback("P${assignment.playerSlot} offer", generation)
+            }, { error -> if (isCurrentSession(generation, code)) transitionJoinFailure("Offer load failed: $error") })
         }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Join failed: $it") else staleSessionCallback("join failure", generation) })
     }
 
-    private fun prepareJoinPeer(code: String, offer: String, generation: Long) {
+    private fun prepareJoinPeer(code: String, offer: String, assignment: RemoteSlotAssignment, generation: Long) {
+        val slot = assignment.playerSlot
         audioStatus = "Waiting for remote game audio..."
         clientRtc.initialize()
         clientRtc.onAudioStatus = { status -> runOnUiThread { if (isCurrentSession(generation, code)) audioStatus = status else staleSessionCallback("game audio", generation) } }
-        clientRtc.onControlMessageReceived = ::handleControlMessage
+        clientRtc.onControlMessageReceived = { message -> handleControlMessage(null, clientRtc, message) }
         clientRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
             if (!isCurrentSession(generation, code)) { staleSessionCallback("data channel", generation); return@runOnUiThread }
             if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
-            if (state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) Log.w(TAG, "Client DataChannel closed: $label")
+            Log.d(TAG, "P$slot client DataChannel $label $state")
         } }
         clientRtc.onDiagnostics = { update -> runOnUiThread { if (isCurrentSession(generation, code)) betaDiagnostics = mergeControllerDiagnostics(update) else staleSessionCallback("stats diagnostics", generation) } }
         clientRtc.onRemoteVideoTrack = { track -> Log.d(TAG, "Remote video track stored for renderer"); runOnUiThread {
@@ -1203,17 +1388,17 @@ class MainActivity : ComponentActivity() {
                 else -> if (!joinSessionState.showsActiveSession) clientStatus = connectionText(state)
             }
         } }
-        clientRtc.onIceCandidateReady = { candidate -> if (isCurrentSession(generation, code)) firebase.saveIceCandidate(code, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE save error: $error" else Log.w(TAG, "Late ICE save error ignored after connection: $error") } } else staleSessionCallback("local ICE", generation) }
+        clientRtc.onIceCandidateReady = { candidate -> if (isCurrentSession(generation, code)) firebase.saveIceCandidate(code, slot, "client", candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex) { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE save error: $error" else Log.w(TAG, "Late P$slot ICE save error ignored after connection: $error") } } else staleSessionCallback("local ICE", generation) }
         transitionJoinState(JoinSessionState.Negotiating, "preparing PeerConnection", "Loading TURN credentials...")
         clientRtc.createPeerConnection(false, onSuccess = {
             if (!isCurrentSession(generation, code)) { staleSessionCallback("PeerConnection created", generation); return@createPeerConnection }
-            firebase.listenForIceCandidates(code, "host", { c, mid, line -> clientRtc.addIceCandidate(c, mid, line) }, { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE listen error: $error" else Log.w(TAG, "Late ICE listener error ignored after connection: $error") } })
+            firebase.listenForIceCandidates(code, slot, "host", joinSlotOwner(assignment, generation), { c, mid, line -> clientRtc.addIceCandidate(c, mid, line) }, { error -> runOnUiThread { if (!joinSessionState.showsActiveSession) clientStatus = "ICE listen error: $error" else Log.w(TAG, "Late P$slot ICE listener error ignored after connection: $error") } })
             clientRtc.setRemoteOffer(offer, {
                 if (!isCurrentSession(generation, code)) { staleSessionCallback("remote description", generation); return@setRemoteOffer }
                 transitionJoinState(JoinSessionState.Negotiating, "remote offer set", "Offer found; creating answer...")
                 clientRtc.createAnswer({ answer ->
                     Log.d(TAG, "Answer created")
-                    firebase.saveAnswer(code, answer, { transitionJoinState(JoinSessionState.Connecting, "local answer stored", "WebRTC answer sent - connecting...") }, { transitionJoinFailure("Answer save failed: $it") })
+                    firebase.saveAnswer(code, slot, answer, { transitionJoinState(JoinSessionState.Connecting, "P$slot local answer stored", "WebRTC answer sent - connecting as Player $slot...") }, { transitionJoinFailure("Answer save failed: $it") })
                 }, { transitionJoinFailure("Answer error: $it") })
             }, { transitionJoinFailure("Offer error: $it") })
         }, onError = { if (isCurrentSession(generation, code)) transitionJoinFailure("PeerConnection error: $it") else staleSessionCallback("PeerConnection error", generation) })
@@ -1247,7 +1432,15 @@ class MainActivity : ComponentActivity() {
         if (Looper.myLooper() != Looper.getMainLooper()) { runOnUiThread { transitionJoinFailure(message) }; return }
         sessionStarting = false
         if (joinSessionState.showsActiveSession) Log.w(TAG, "JOIN_SESSION_STATE: late signaling failure ignored after connection: $message")
-        else transitionJoinState(JoinSessionState.Failed, "signaling failure", message)
+        else {
+            remoteSlotAssignment?.let { assignment ->
+                firebase.stopListening(joinSlotOwner(assignment, sessionGeneration))
+                firebase.releaseRemoteSlot(activeSessionId, assignment)
+            }
+            remoteSlotAssignment = null
+            clientRtc.close()
+            transitionJoinState(JoinSessionState.Failed, "signaling failure", message)
+        }
     }
 
     private fun connectionText(state: PeerConnection.PeerConnectionState) = when (state) {
@@ -1259,20 +1452,24 @@ class MainActivity : ComponentActivity() {
         else -> "WebRTC: $state"
     }
 
-    private fun handleControlMessage(message: String) {
+    private fun handleControlMessage(playerSlot: Int?, replyRtc: WebRtcManager, message: String) {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
-        handleControlMessageInternal(message)
+        val input = playerSlot?.let { remoteInputSessions[it] ?: return }
+        if (input == null) handleControlMessageInternal(playerSlot, replyRtc, null, message)
+        else synchronized(input) { handleControlMessageInternal(playerSlot, replyRtc, input, message) }
         val elapsedMicros = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000L
-        if (++controlThreadLogCounter % 120 == 1) Log.d(TAG, "CONTROL_THREAD_SUMMARY: packets=$controlThreadLogCounter handlerMs=${elapsedMicros / 1000.0}")
+        if (++controlThreadLogCounter % 120 == 1) Log.d(TAG, "CONTROL_THREAD_SUMMARY: player=${playerSlot?.let { "P$it" } ?: "local"} packets=$controlThreadLogCounter handlerMs=${elapsedMicros / 1000.0}")
     }
 
-    private fun handleControlMessageInternal(message: String) {
+    private fun handleControlMessageInternal(playerSlot: Int?, replyRtc: WebRtcManager, input: RemoteInputSession?, message: String) {
         recordControllerPacket()
         val parts = message.split('|')
-        if (parts.firstOrNull() in setOf("KEY", "AXIS", "DPAD", "RESET")) {
-            lastRemoteInputPacketMs = android.os.SystemClock.elapsedRealtime()
+        val packetType = parts.firstOrNull()
+        if (packetType in setOf("KEY", "AXIS", "DPAD", "RESET")) {
+            if (input == null) return
+            input.lastPacketMs = android.os.SystemClock.elapsedRealtime()
         }
-        when (parts.firstOrNull()) {
+        when (packetType) {
             "ACK" -> {
                 val sentAt = parts.getOrNull(2)?.toLongOrNull() ?: return
                 val roundTrip = (android.os.SystemClock.elapsedRealtime() - sentAt).coerceAtLeast(0L)
@@ -1291,6 +1488,7 @@ class MainActivity : ComponentActivity() {
                 if (++controllerAckLogCounter % 20 == 1) Log.d(TAG, "CONTROL_LATENCY_SUMMARY: e2eMs=$estimatedEndToEnd packetAgeMs=$packetAge captureMs=$captureMs networkMs=${roundTrip / 2L} injectMs=$injectMs")
             }
             "KEY" -> {
+                val remote = input ?: return
                 val v3 = parts.size >= 10
                 val v2 = parts.size >= 9
                 val sequence = parts.getOrNull(if (v2) 4 else 1)?.toLongOrNull() ?: return
@@ -1300,47 +1498,53 @@ class MainActivity : ComponentActivity() {
                 val key = parts.getOrNull(if (v3) 8 else if (v2) 7 else 3)?.toIntOrNull() ?: return
                 val action = parts.getOrNull(if (v3) 9 else if (v2) 8 else 4) ?: return
                 val session = if (v2) parts[1] else activeSessionId
-                if (!acceptRemoteSequence("digital", session, sequence)) return
+                val declaredSlot = if (v2) parts.getOrNull(3)?.toIntOrNull() else playerSlot
+                if (!RemotePlayerSlots.packetMatches(remote.playerSlot, declaredSlot)) { Log.w(TAG, "P$playerSlot CONTROL_SLOT_MISMATCH_DROPPED: declared=$declaredSlot type=KEY"); return }
+                if (!acceptRemoteSequence(remote, "digital", session, sequence)) return
                 recordControllerPacketAge(ControllerTransportPolicy.estimatedPacketAgeMs(captureMs, senderRttMs))
                 val logical = ControllerMapping.logicalForAndroidKey(key)
                 if (logical != null) {
-                    updateLogicalButton(logical, action == "DOWN")
+                    updateLogicalButton(remote, logical, action == "DOWN")
                 }
                 val token = key
-                if (action == "DOWN" && !heldRemoteButtons.add(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
-                if (action == "UP" && !heldRemoteButtons.remove(token)) { recordDuplicateDrop(); Log.w(TAG, "CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
+                if (action == "DOWN" && !remote.heldButtons.add(token)) { recordDuplicateDrop(); Log.w(TAG, "P$playerSlot CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
+                if (action == "UP" && !remote.heldButtons.remove(token)) { recordDuplicateDrop(); Log.w(TAG, "P$playerSlot CONTROL_DUPLICATE_DROPPED: key=$key action=$action"); return }
                 val started = android.os.SystemClock.elapsedRealtime()
-                val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
-                if (controllerBackend is DolphinVirtualGamepadBackend) {
-                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON key=${KeyEvent.keyCodeToString(key)} action=$action sequence=$sequence")
+                val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", remote.playerSlot, sequence, sentAt)
+                val backend = controllerBackends[remote.playerSlot] ?: return
+                if (backend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_${playerSlot}_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=BUTTON key=${KeyEvent.keyCodeToString(key)} action=$action sequence=$sequence")
                 }
                 if (logical != null && isDpadControl(logical)) {
                     val legacyDpad = DpadState(
-                        x = (if (KeyEvent.KEYCODE_DPAD_RIGHT in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_LEFT in heldRemoteButtons) 1 else 0),
-                        y = (if (KeyEvent.KEYCODE_DPAD_DOWN in heldRemoteButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_UP in heldRemoteButtons) 1 else 0)
+                        x = (if (KeyEvent.KEYCODE_DPAD_RIGHT in remote.heldButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_LEFT in remote.heldButtons) 1 else 0),
+                        y = (if (KeyEvent.KEYCODE_DPAD_DOWN in remote.heldButtons) 1 else 0) - (if (KeyEvent.KEYCODE_DPAD_UP in remote.heldButtons) 1 else 0)
                     )
-                    val changed = hostDpadState.update(legacyDpad)
-                    val injected = !changed || controllerBackend.updateDpad(context, legacyDpad.x, legacyDpad.y)
-                    updateLogicalDpad(legacyDpad)
+                    val changed = remote.dpadState.update(legacyDpad)
+                    val injected = !changed || backend.updateDpad(context, legacyDpad.x, legacyDpad.y)
+                    updateLogicalDpad(remote, legacyDpad)
                     val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-                    hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
-                    Log.d(TAG, "DPAD_LOGICAL_STATE: side=host state=${legacyDpad.label} source=LEGACY_KEY sequence=$sequence changed=$changed")
+                    replyRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                    Log.d(TAG, "DPAD_LOGICAL_STATE: side=host player=$playerSlot state=${legacyDpad.label} source=LEGACY_KEY sequence=$sequence changed=$changed")
                     if (!injected) logBackendUnavailableOnce()
                     return
                 }
-                val injected = if (action == "DOWN") controllerBackend.keyDown(context, key) else if (action == "UP") controllerBackend.keyUp(context, key) else false
+                val injected = if (action == "DOWN") backend.keyDown(context, key) else if (action == "UP") backend.keyUp(context, key) else false
                 val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-                hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                replyRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
                 if (!injected) logBackendUnavailableOnce()
             }
             "AXIS" -> {
+                val remote = input ?: return
                 val v3 = parts.size >= 16
                 val v2 = parts.size >= 15
                 val sequence = parts.getOrNull(if (v2) 4 else 1)?.toLongOrNull() ?: return
                 val sentAt = parts.getOrNull(if (v2) 5 else 2)?.toLongOrNull() ?: return
                 val captureMs = if (v2) parts[6].toLongOrNull() ?: 0L else 0L
                 val session = if (v2) parts[1] else activeSessionId
-                if (!acceptRemoteSequence("analog", session, sequence)) return
+                val declaredSlot = if (v2) parts.getOrNull(3)?.toIntOrNull() else playerSlot
+                if (!RemotePlayerSlots.packetMatches(remote.playerSlot, declaredSlot)) { Log.w(TAG, "P$playerSlot CONTROL_SLOT_MISMATCH_DROPPED: declared=$declaredSlot type=AXIS"); return }
+                if (!acceptRemoteSequence(remote, "analog", session, sequence)) return
                 val senderRttMs = if (v3) parts[7].toLongOrNull() else null
                 val estimatedAgeMs = ControllerTransportPolicy.estimatedPacketAgeMs(captureMs, senderRttMs)
                 recordControllerPacketAge(estimatedAgeMs)
@@ -1353,16 +1557,17 @@ class MainActivity : ComponentActivity() {
                 val start = if (v3) 8 else if (v2) 7 else 3
                 if (parts.size >= start + 8) {
                     val axes = FloatArray(8) { index -> parts[start + index].toFloatOrNull() ?: 0f }
-                    updateLogicalAxes(axes)
+                    updateLogicalAxes(remote, axes)
                     val started = android.os.SystemClock.elapsedRealtime()
-                    val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", if (v2) parts[3].toIntOrNull() ?: 2 else 2, sequence, sentAt)
-                    if (controllerBackend is DolphinVirtualGamepadBackend && sequence % 120L == 1L) {
-                        Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS main=${axes[0]},${axes[1]} c=${axes[2]},${axes[3]} triggers=${axes[4]},${axes[5]} sequence=$sequence")
+                    val context = ControllerEventContext(session, if (v2) parts[2] else "legacy", remote.playerSlot, sequence, sentAt)
+                    val backend = controllerBackends[remote.playerSlot] ?: return
+                    if (backend is DolphinVirtualGamepadBackend && sequence % 120L == 1L) {
+                        Log.d(TAG, "PLAYER_${playerSlot}_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=AXIS main=${axes[0]},${axes[1]} c=${axes[2]},${axes[3]} triggers=${axes[4]},${axes[5]} sequence=$sequence")
                     }
-                    val injected = controllerBackend.updateAxes(context, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7])
+                    val injected = backend.updateAxes(context, axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6], axes[7])
                     val injectMs = (android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-                    if (++axisAckCounter % 20 == 1) hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
-                    if (injected && axisAckCounter % 20 == 1) {
+                    if (++remote.axisAckCounter % 20 == 1) replyRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                    if (injected && remote.axisAckCounter % 20 == 1) {
                         Log.d(TAG, "LOGICAL_CONTROL_EVENT: control=AXES lx=${axes[0]} ly=${axes[1]} rx=${axes[2]} ry=${axes[3]} lt=${axes[4]} rt=${axes[5]} dpad=${axes[6]},${axes[7]}")
                         Log.d(TAG, "CONTROL_AXIS_STATE: sequence=$sequence lx=${axes[0]} ly=${axes[1]} rx=${axes[2]} ry=${axes[3]} lt=${axes[4]} rt=${axes[5]} dpadX=${axes[6]} dpadY=${axes[7]}")
                         Log.d(TAG, "CONTROL_RECEIVE_TO_INJECT_MS: $injectMs")
@@ -1370,6 +1575,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             "DPAD" -> {
+                val remote = input ?: return
                 if (parts.size < 11) return
                 val session = parts[1]
                 val sequence = parts[4].toLongOrNull() ?: return
@@ -1378,33 +1584,38 @@ class MainActivity : ComponentActivity() {
                 val x = parts[8].toIntOrNull()?.coerceIn(-1, 1) ?: return
                 val y = parts[9].toIntOrNull()?.coerceIn(-1, 1) ?: return
                 val source = parts[10]
-                if (!acceptRemoteSequence("digital", session, sequence)) return
+                val declaredSlot = parts[3].toIntOrNull()
+                if (!RemotePlayerSlots.packetMatches(remote.playerSlot, declaredSlot)) { Log.w(TAG, "P$playerSlot CONTROL_SLOT_MISMATCH_DROPPED: declared=$declaredSlot type=DPAD"); return }
+                if (!acceptRemoteSequence(remote, "digital", session, sequence)) return
                 val next = DpadState(x, y)
-                if (!hostDpadState.update(next)) {
+                if (!remote.dpadState.update(next)) {
                     dpadDuplicateDrops++
                     Log.d(TAG, "DPAD_DUPLICATE_DROPPED: side=host state=${next.label} sequence=$sequence total=$dpadDuplicateDrops")
                     return
                 }
-                val context = ControllerEventContext(session, parts[2], parts[3].toIntOrNull() ?: 2, sequence, sentAt)
-                if (controllerBackend is DolphinVirtualGamepadBackend) {
-                    Log.d(TAG, "PLAYER_2_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${next.label} source=$source sequence=$sequence")
+                val context = ControllerEventContext(session, parts[2], remote.playerSlot, sequence, sentAt)
+                val backend = controllerBackends[remote.playerSlot] ?: return
+                if (backend is DolphinVirtualGamepadBackend) {
+                    Log.d(TAG, "PLAYER_${playerSlot}_PACKET_RECEIVED: player=${context.playerSlot} controller=${context.controllerId} type=DPAD state=${next.label} source=$source sequence=$sequence")
                 }
                 val started = android.os.SystemClock.elapsedRealtimeNanos()
-                val injected = controllerBackend.updateDpad(context, x, y)
+                val injected = backend.updateDpad(context, x, y)
                 val injectMs = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L
-                updateLogicalDpad(next)
-                hostRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
-                Log.d(TAG, "DPAD_LOGICAL_STATE: side=host state=${next.label} source=$source sequence=$sequence")
+                updateLogicalDpad(remote, next)
+                replyRtc.sendControlMessage("ACK|$sequence|$sentAt|$injectMs|$captureMs")
+                Log.d(TAG, "DPAD_LOGICAL_STATE: side=host player=$playerSlot state=${next.label} source=$source sequence=$sequence")
                 if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=host sequence=$sequence")
                 if (!injected) logBackendUnavailableOnce()
             }
-            "RESET" -> if (parts.getOrNull(1) == activeSessionId) resetRemoteInput(parts.getOrNull(6) ?: "remote reset")
+            "RESET" -> if (parts.getOrNull(1) == activeSessionId && parts.getOrNull(3)?.toIntOrNull() == playerSlot) {
+                resetRemoteInput(playerSlot ?: return, parts.getOrNull(6) ?: "remote reset")
+            }
         }
     }
 
-    private fun acceptRemoteSequence(stream: String, session: String, sequence: Long): Boolean {
+    private fun acceptRemoteSequence(input: RemoteInputSession, stream: String, session: String, sequence: Long): Boolean {
         if (session != activeSessionId) { Log.w(TAG, "CONTROL_STALE_SESSION_DROPPED: packet=$session active=$activeSessionId stream=$stream"); return false }
-        val previous = lastRemoteSequences[stream] ?: 0L
+        val previous = input.lastSequences[stream] ?: 0L
         if (sequence <= previous) {
             outOfOrderControlPacketsDropped++
             updateControllerDiagnostics { copy(outOfOrderControlPacketsDropped = outOfOrderControlPacketsDropped) }
@@ -1412,26 +1623,31 @@ class MainActivity : ComponentActivity() {
             return false
         }
         if (previous > 0L && sequence > previous + 1L) Log.w(TAG, "CONTROL_SEQUENCE_GAP: stream=$stream expected=${previous + 1L} received=$sequence")
-        lastRemoteSequences[stream] = sequence
+        input.lastSequences[stream] = sequence
         return true
     }
 
-    private fun resetRemoteInput(reason: String) {
-        if (heldRemoteButtons.isNotEmpty()) Log.w(TAG, "CONTROL_STUCK_INPUT_RECOVERY: reason=$reason held=${heldRemoteButtons.joinToString()}")
-        heldRemoteButtons.clear(); lastRemoteSequences.clear(); axisAckCounter = 0
-        hostDpadState.reset()
-        logicalControllerState = ControllerInputState()
-        if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
-        controllerBackend.resetNeutral(reason)
-        Log.d(TAG, "CONTROL_REMOTE_STATE_CLEARED: $reason")
+    private fun resetRemoteInput(playerSlot: Int, reason: String) {
+        val input = remoteInputSessions.getOrPut(playerSlot) { RemoteInputSession(playerSlot) }
+        synchronized(input) {
+            if (input.heldButtons.isNotEmpty()) Log.w(TAG, "P$playerSlot CONTROL_STUCK_INPUT_RECOVERY: reason=$reason held=${input.heldButtons.joinToString()}")
+            input.heldButtons.clear(); input.lastSequences.clear(); input.axisAckCounter = 0
+            input.dpadState.reset()
+            input.logicalState = ControllerInputState()
+            logicalControllerState = input.logicalState
+            if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
+            controllerBackends[playerSlot]?.resetNeutral("P$playerSlot $reason")
+        }
+        Log.d(TAG, "P$playerSlot CONTROL_REMOTE_STATE_CLEARED: $reason")
     }
 
     private fun sendNeutralReset(reason: String) {
         if (activeSessionId == "none") return
+        val slot = remoteSlotAssignment?.playerSlot ?: return
         val sentAt = android.os.SystemClock.elapsedRealtime()
-        clientRtc.sendControlMessage("RESET|$activeSessionId|device-$lastControllerDeviceId|2|${++digitalSequence}|$sentAt|$reason")
+        clientRtc.sendControlMessage("RESET|$activeSessionId|device-$lastControllerDeviceId|$slot|${++digitalSequence}|$sentAt|$reason")
         lastAxes.fill(Float.NaN)
-        Log.d(TAG, "CONTROL_NEUTRAL_RESET_SENT: $reason")
+        Log.d(TAG, "P$slot CONTROL_NEUTRAL_RESET_SENT: $reason")
     }
 
     private fun logBackendUnavailableOnce() {
@@ -1440,7 +1656,7 @@ class MainActivity : ComponentActivity() {
         Log.w(TAG, "CONTROL BACKEND UNAVAILABLE: transport works; system-wide injection requires privileged backend")
     }
 
-    private fun recordDuplicateDrop() {
+    @Synchronized private fun recordDuplicateDrop() {
         duplicateControlPacketsDropped++
         updateControllerDiagnostics { copy(duplicateControlPacketsDropped = duplicateControlPacketsDropped) }
     }
@@ -1531,7 +1747,7 @@ class MainActivity : ComponentActivity() {
         else Log.w(TAG, "DOLPHIN_HOTPLUG_WARNING: classification=$classification expected=GAMEPAD/JOYSTICK")
     }
 
-    private fun recordControllerPacket() {
+    @Synchronized private fun recordControllerPacket() {
         controllerWindowPackets++
         val now = android.os.SystemClock.elapsedRealtime()
         val elapsed = now - controllerWindowStart
@@ -1559,22 +1775,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun recordControllerPacketAge(ageMs: Long) {
+    @Synchronized private fun recordControllerPacketAge(ageMs: Long) {
         latestControllerPacketAgeMs = ageMs
         controllerPacketAgeTotalMs += ageMs
         controllerPacketAgeSamples++
     }
 
-    private fun updateLogicalButton(control: LogicalControl, down: Boolean) {
-        logicalControllerState = logicalControllerState.withButton(control, down)
+    private fun updateLogicalButton(input: RemoteInputSession, control: LogicalControl, down: Boolean) {
+        input.logicalState = input.logicalState.withButton(control, down)
+        logicalControllerState = input.logicalState
         if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
     }
 
-    private fun updateLogicalAxes(axes: FloatArray) {
-        logicalControllerState = logicalControllerState.copy(
+    private fun updateLogicalAxes(input: RemoteInputSession, axes: FloatArray) {
+        input.logicalState = input.logicalState.copy(
             leftX = axes[0], leftY = axes[1], rightX = axes[2], rightY = axes[3],
             leftTrigger = axes[4], rightTrigger = axes[5]
         )
+        logicalControllerState = input.logicalState
         val now = android.os.SystemClock.elapsedRealtime()
         if (controllerInputTestOpen && now - lastControllerTestUiMs >= 50L) {
             lastControllerTestUiMs = now
@@ -1582,8 +1800,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun updateLogicalDpad(state: DpadState) {
-        logicalControllerState = logicalControllerState.copy(dpadX = state.x.toFloat(), dpadY = state.y.toFloat())
+    private fun updateLogicalDpad(input: RemoteInputSession, state: DpadState) {
+        input.logicalState = input.logicalState.copy(dpadX = state.x.toFloat(), dpadY = state.y.toFloat())
+        logicalControllerState = input.logicalState
         if (controllerInputTestOpen) runOnUiThread { controllerTestDisplayState = logicalControllerState }
     }
 
@@ -1651,30 +1870,42 @@ class MainActivity : ComponentActivity() {
         mainHandler.removeCallbacks(controllerHealthRunnable)
         Log.d(TAG, "CONTROLLER_CLEANUP_TRIGGERED: reason=session cleanup deleteHostRoom=$deleteHostRoom session=$activeSessionId")
         sendNeutralReset("session cleanup")
-        resetRemoteInput("session cleanup")
+        remoteInputSessions.keys.toList().forEach { slot -> resetRemoteInput(slot, "session cleanup") }
+        remoteSlotAssignment?.let { assignment ->
+            if (activeSessionId != "none") firebase.releaseRemoteSlot(activeSessionId, assignment)
+        }
         firebase.stopListening()
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
+        hostDisconnectGraceRunnables.values.forEach(mainHandler::removeCallbacks)
+        hostDisconnectGraceRunnables.clear()
         mainHandler.removeCallbacksAndMessages(null)
         // Remove the renderer sink while its receiver-owned VideoTrack and PeerConnection are still valid.
         detachRenderer(); remoteTrack = null
+        hostRtcBySlot.filterKeys { it != RemotePlayerSlots.PLAYER_2 }.values.toSet().forEach(WebRtcManager::release)
+        hostRtcBySlot.clear()
         hostRtc.close(); clientRtc.close()
         stopService(Intent(this, ScreenCaptureService::class.java))
-        controllerBackend.close(); controllerBackend = TransportOnlyBackend()
+        controllerBackends.forEach { (slot, backend) ->
+            remoteInputSessions[slot]?.let { input -> synchronized(input) { backend.close() } } ?: backend.close()
+        }
+        controllerBackends.clear(); remoteInputSessions.clear()
+        controllerBackend = TransportOnlyBackend()
         clientControlActive = false; controlChannelOpen = false
         if (joinSessionState != JoinSessionState.Idle) Log.d(TAG, "JOIN_SESSION_DISPOSED: previousState=$joinSessionState")
         joinSessionState = JoinSessionState.Idle
-        clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; sessionStarting = false
+        clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerStates.clear(); hostDiagnosticsBySlot.clear(); sessionStarting = false
+        hostClaimedSlots = emptySet(); hostConnectedSlots = emptySet(); remoteSlotAssignment = null
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
-        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; controllerAxisLayouts.clear(); backendUnavailableLogged = false; axisAckCounter = 0
+        lastAxes.fill(Float.NaN); digitalSequence = 0L; analogSequence = 0L; lastControllerDeviceId = -1; controllerAxisLayouts.clear(); backendUnavailableLogged = false
         lastControlRoundTripMs = null; controllerLatencyTotalMs = 0L; controllerLatencySamples = 0L; controllerLatencyMaxMs = 0L
         latestControllerLatencyMs = null; latestControllerPacketAgeMs = null; controllerPacketAgeTotalMs = 0L; controllerPacketAgeSamples = 0L
         recentControllerLatencies.clear(); controlThreadLogCounter = 0; controllerAckLogCounter = 0
         duplicateControlPacketsDropped = 0L; outOfOrderControlPacketsDropped = 0L; staleAnalogPacketsDropped = 0L; player2Classification = "Unknown"
-        lastRemoteInputPacketMs = 0L; watchdogNeutralResets = 0L; controllerHealthTicks = 0
+        watchdogNeutralResets = 0L; controllerHealthTicks = 0
         logicalControllerState = ControllerInputState(); controllerTestDisplayState = ControllerInputState(); lastControllerTestUiMs = 0L
-        resetLocalDpadState("session cleanup"); hostDpadState.reset(); dpadDuplicateDrops = 0L
+        resetLocalDpadState("session cleanup"); dpadDuplicateDrops = 0L
         controllerWindowPackets = 0; controllerWindowStart = android.os.SystemClock.elapsedRealtime(); betaDiagnostics = BetaDiagnostics()
         updateSessionActive(false)
         Log.d(TAG, "Session cleanup complete")
@@ -1715,10 +1946,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendKey(keyCode: Int, action: String, event: KeyEvent) {
+        val slot = remoteSlotAssignment?.playerSlot ?: return
         val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
-        val message = "KEY|$activeSessionId|device-$lastControllerDeviceId|2|${++digitalSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|$keyCode|$action"
+        val message = "KEY|$activeSessionId|device-$lastControllerDeviceId|$slot|${++digitalSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|$keyCode|$action"
         recordControllerPacket()
-        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=BUTTON key=${KeyEvent.keyCodeToString(keyCode)} action=$action")
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=$slot deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=BUTTON key=${KeyEvent.keyCodeToString(keyCode)} action=$action")
         clientRtc.sendControlMessage(message)
     }
 
@@ -1766,6 +1998,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendDpadIfChanged(next: DpadState, eventTime: Long, deviceId: Int, source: DpadSource) {
+        val slot = remoteSlotAssignment?.playerSlot ?: return
         if (!joinerDpadState.update(next)) {
             dpadDuplicateDrops++
             if (dpadDuplicateDrops % 120L == 1L) Log.d(TAG, "DPAD_DUPLICATE_DROPPED: side=joiner source=$source state=${next.label} total=$dpadDuplicateDrops")
@@ -1773,10 +2006,10 @@ class MainActivity : ComponentActivity() {
         }
         val captureMs = (android.os.SystemClock.uptimeMillis() - eventTime).coerceAtLeast(0L)
         val sentAt = android.os.SystemClock.elapsedRealtime()
-        val message = "DPAD|$activeSessionId|device-$deviceId|2|${++digitalSequence}|$sentAt|$captureMs|${lastControlRoundTripMs ?: 0L}|${next.x}|${next.y}|$source"
+        val message = "DPAD|$activeSessionId|device-$deviceId|$slot|${++digitalSequence}|$sentAt|$captureMs|${lastControlRoundTripMs ?: 0L}|${next.x}|${next.y}|$source"
         recordControllerPacket()
         clientRtc.sendControlMessage(message)
-        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=$deviceId type=DPAD state=${next.label} source=$source")
+        Log.d(TAG, "JOINER_INPUT_RECEIVED: player=$slot deviceId=$deviceId type=DPAD state=${next.label} source=$source")
         Log.d(TAG, "DPAD_LOGICAL_STATE: side=joiner state=${next.label} source=$source sequence=$digitalSequence")
         if (next == DpadState()) Log.d(TAG, "DPAD_NEUTRAL_SENT: side=joiner sequence=$digitalSequence")
     }
@@ -1790,6 +2023,7 @@ class MainActivity : ComponentActivity() {
         val joystickEvent = event.source and InputDevice.SOURCE_CLASS_JOYSTICK != 0 ||
             (event.device?.sources ?: 0) and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
         if (clientControlActive && joystickEvent && event.actionMasked == MotionEvent.ACTION_MOVE) {
+            val slot = remoteSlotAssignment?.playerSlot ?: return false
             noteController(event.deviceId, event.device?.name)
             val axisState = controllerAxisLayouts.getOrPut(event.deviceId) {
                 val available = ControllerAxisCompatibility.candidateAxes.filterTo(mutableSetOf()) { axis ->
@@ -1800,7 +2034,7 @@ class MainActivity : ComponentActivity() {
                     val range = controllerMotionRange(event.device, axis)
                     "${MotionEvent.axisToString(axis)}=${range?.min}..${range?.max} flat=${range?.flat}"
                 }
-                Log.d(TAG, "JOINER_AXIS_LAYOUT: player=2 deviceId=${event.deviceId} resolved=[${layout.description()}] available=[$ranges]")
+                Log.d(TAG, "JOINER_AXIS_LAYOUT: player=$slot deviceId=${event.deviceId} resolved=[${layout.description()}] available=[$ranges]")
                 ControllerDeviceAxisState(layout)
             }
             val layout = axisState.layout
@@ -1838,10 +2072,10 @@ class MainActivity : ComponentActivity() {
             val captureDelayMs = (android.os.SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0L)
             if (analogSequence % 120L == 0L) {
                 Log.d(TAG, "RAW_AXIS_EVENT: device=${event.deviceId} x=${values[0]} y=${values[1]} z=${values[2]} rz=${values[3]} lt=${values[4]} rt=${values[5]} hat=${rawDpad.x},${rawDpad.y}")
-                Log.d(TAG, "JOINER_INPUT_RECEIVED: player=2 deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=AXIS main=${values[0]},${values[1]} c=${values[2]},${values[3]} triggers=${values[4]},${values[5]}")
+                Log.d(TAG, "JOINER_INPUT_RECEIVED: player=$slot deviceId=${event.deviceId} device=${event.device?.name ?: "unknown"} type=AXIS main=${values[0]},${values[1]} c=${values[2]},${values[3]} triggers=${values[4]},${values[5]}")
                 Log.d(TAG, "CONTROL_CAPTURE_MS: $captureDelayMs type=AXIS")
             }
-            val message = "AXIS|$activeSessionId|device-$lastControllerDeviceId|2|${++analogSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|${values.joinToString("|")}"
+            val message = "AXIS|$activeSessionId|device-$lastControllerDeviceId|$slot|${++analogSequence}|${android.os.SystemClock.elapsedRealtime()}|$captureDelayMs|${lastControlRoundTripMs ?: 0L}|${values.joinToString("|")}"
             recordControllerPacket()
             clientRtc.sendControlMessage(message, realtimeAnalog = true); return true
         }

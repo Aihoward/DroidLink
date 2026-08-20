@@ -11,6 +11,7 @@ object SessionSecurityPolicy {
 
     fun validRoomCode(code: String) = roomCodePattern.matches(code)
     fun validSide(side: String) = sidePattern.matches(side)
+    fun validRemoteSlot(slot: Int) = RemotePlayerSlots.isActiveRemote(slot)
 
     fun validSdp(sdp: String): Boolean {
         val size = sdp.toByteArray(Charsets.UTF_8).size
