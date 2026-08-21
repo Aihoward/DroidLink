@@ -9,6 +9,15 @@ import android.util.Log
 import org.webrtc.*
 import java.nio.ByteBuffer
 
+data class SharedHostMedia(
+    val videoTrack: VideoTrack,
+    val audioTrack: AudioTrack?,
+    val profile: String,
+    val fps: Int
+)
+
+data class SharedWebRtcResources(val factory: PeerConnectionFactory)
+
 class WebRtcManager(private val context: Context) {
     companion object {
         private const val TAG = "DroidLink"
@@ -31,6 +40,7 @@ class WebRtcManager(private val context: Context) {
     private val audioStreaming = AudioStreamingManager(context)
     private var audioDeviceModule: org.webrtc.audio.JavaAudioDeviceModule? = null
     private var factory: PeerConnectionFactory? = null
+    private var ownsFactory = true
     private var peer: PeerConnection? = null
     private var dataChannel: DataChannel? = null
     private var axisDataChannel: DataChannel? = null
@@ -122,11 +132,29 @@ class WebRtcManager(private val context: Context) {
                 .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
                 .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
                 .createPeerConnectionFactory()
+            ownsFactory = true
         }
         Log.d(TAG, "WebRTC factory initialized")
     }
 
+    fun initialize(sharedResources: SharedWebRtcResources) {
+        synchronized(lock) {
+            if (factory != null) return
+            closed = false
+            factory = sharedResources.factory
+            ownsFactory = false
+        }
+        Log.d(TAG, "WebRTC manager initialized with shared host factory")
+    }
+
     fun eglContext(): EglBase.Context = eglBase.eglBaseContext
+
+    fun sharedWebRtcResources(): SharedWebRtcResources? = factory?.let(::SharedWebRtcResources)
+
+    fun sharedHostMedia(): SharedHostMedia? {
+        val video = screenTrack ?: return null
+        return SharedHostMedia(video, localAudioTrack, adaptiveProfile, baseCaptureFps)
+    }
 
     fun createPeerConnection(createControlChannel: Boolean, onSuccess: () -> Unit, onError: (String) -> Unit) {
         ownsControllerChannels = createControlChannel
@@ -167,6 +195,25 @@ class WebRtcManager(private val context: Context) {
             startStatsCollector()
             onSuccess()
         }
+    }
+
+    fun attachSharedHostMedia(media: SharedHostMedia) {
+        val currentPeer = peer ?: error("PeerConnection has not been created")
+        val sender = currentPeer.addTrack(media.videoTrack, listOf(VIDEO_STREAM_ID))
+        check(sender != null) { "Failed to attach shared host video track" }
+        videoSender = sender
+        adaptiveProfile = media.profile
+        baseCaptureFps = media.fps
+        configureVideoSender(sender, media.profile, media.fps)
+        preferH264WithFallback()
+        media.audioTrack?.let { audio ->
+            val audioSender = currentPeer.addTrack(audio, listOf(AUDIO_STREAM_ID))
+            check(audioSender != null) { "Failed to attach shared host audio track" }
+            currentPeer.setAudioRecording(true)
+            Log.d(TAG, "Shared host audio track attached: trackId=${audio.id()} sender=${audioSender.id()}")
+        }
+        Log.d(TAG, "Shared host media attached: videoTrack=${media.videoTrack.id()} audioTrack=${media.audioTrack?.id() ?: "none"}")
+        logVideoTransceivers("shared host tracks attached before offer")
     }
 
     private fun observer() = object : PeerConnection.Observer {
@@ -869,6 +916,41 @@ class WebRtcManager(private val context: Context) {
         Log.d(TAG, "GAME_AUDIO_VOLUME: ${(volume.coerceIn(0f, 1f) * 100).toInt()}")
     }
 
+    fun closePeerConnectionPreservingLocalMedia() {
+        Log.d(TAG, "Closing PeerConnection while preserving shared host capture")
+        onControlMessageReceived = null
+        onConnectionStateChanged = null
+        onRemoteVideoTrack = null
+        onIceCandidateReady = null
+        onDiagnostics = null
+        onAudioStatus = null
+        onDataChannelStateChanged = null
+        statsHandler?.removeCallbacksAndMessages(null)
+        statsThread?.quitSafely()
+        statsHandler = null
+        statsThread = null
+        try { dataChannel?.unregisterObserver(); dataChannel?.close(); dataChannel?.dispose() } catch (_: Exception) {}
+        try { axisDataChannel?.unregisterObserver(); axisDataChannel?.close(); axisDataChannel?.dispose() } catch (_: Exception) {}
+        try { peer?.close(); peer?.dispose() } catch (_: Exception) {}
+        dataChannel = null
+        axisDataChannel = null
+        peer = null
+        videoSender = null
+        remoteVideoTrack = null
+        remoteGameAudioTrack = null
+        ownsControllerChannels = false
+        lastChannelRecoveryMs = 0L
+        controlSendFailures = 0L
+        axisSendFailures = 0L
+        synchronized(lock) {
+            pendingCandidates.clear()
+            pendingLatestAnalogMessage = null
+            remoteDescriptionSet = false
+        }
+        diagnostics = BetaDiagnostics()
+        Log.d(TAG, "PeerConnection cleanup complete; local capture retained=${screenTrack != null}")
+    }
+
     fun close() {
         if (closed) return
         closed = true; Log.d(TAG, "Closing WebRTC session")
@@ -894,11 +976,11 @@ class WebRtcManager(private val context: Context) {
         try { dataChannel?.unregisterObserver(); dataChannel?.close(); dataChannel?.dispose() } catch (_: Exception) {}
         try { axisDataChannel?.unregisterObserver(); axisDataChannel?.close(); axisDataChannel?.dispose() } catch (_: Exception) {}
         try { peer?.close(); peer?.dispose() } catch (_: Exception) {}
-        try { factory?.dispose() } catch (_: Exception) {}
-        try { audioDeviceModule?.release() } catch (_: Exception) {}
+        if (ownsFactory) try { factory?.dispose() } catch (_: Exception) {}
+        if (ownsFactory) try { audioDeviceModule?.release() } catch (_: Exception) {}
         screenCapturer = null; textureHelper = null; screenTrack = null; screenSource = null; videoSender = null
         remoteVideoTrack = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
-        audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null
+        audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null; ownsFactory = true
         ownsControllerChannels = false; lastChannelRecoveryMs = 0L; controlSendFailures = 0L; axisSendFailures = 0L
         synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
         diagnostics = BetaDiagnostics()

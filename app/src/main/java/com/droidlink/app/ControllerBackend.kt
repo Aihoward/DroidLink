@@ -39,13 +39,14 @@ class TransportOnlyBackend(
 }
 
 object ControllerBackendSelector {
-    fun select(profile: ControllerProfile = ControllerProfile.PC_WINLATOR): ControllerBackend {
+    fun select(profile: ControllerProfile = ControllerProfile.PC_WINLATOR, playerSlot: Int = RemotePlayerSlots.PLAYER_2): ControllerBackend {
+        require(SessionSecurityPolicy.validRemoteSlot(playerSlot)) { "Unsupported remote player slot: $playerSlot" }
         Log.d("DroidLink", "UINPUT_AVAILABLE: ${File("/dev/uinput").exists()}")
-        Log.d("DroidLink", "CONTROLLER_PROFILE_SELECTED: ${profile.label}")
+        Log.d("DroidLink", "CONTROLLER_PROFILE_SELECTED: P$playerSlot ${profile.label}")
         return try {
             when (profile) {
-                ControllerProfile.GAMECUBE_DOLPHIN -> DolphinVirtualGamepadBackend()
-                ControllerProfile.PC_WINLATOR, ControllerProfile.PS2 -> UinputVirtualGamepadBackend()
+                ControllerProfile.GAMECUBE_DOLPHIN -> DolphinVirtualGamepadBackend(playerSlot)
+                ControllerProfile.PC_WINLATOR, ControllerProfile.PS2 -> UinputVirtualGamepadBackend(playerSlot)
             }
         } catch (error: Throwable) {
             val rootPresent = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su").any { File(it).exists() }
@@ -56,10 +57,9 @@ object ControllerBackendSelector {
     }
 }
 
-class DolphinVirtualGamepadBackend : ControllerBackend {
+class DolphinVirtualGamepadBackend(private val playerSlot: Int = RemotePlayerSlots.PLAYER_2) : ControllerBackend {
     companion object {
         private const val TAG = "DroidLink"
-        private const val DEVICE_NAME = GameCubeMapping.DOLPHIN_DEVICE_NAME
         private val activeInstances = AtomicInteger(0)
 
         init { System.loadLibrary("droidlink_native") }
@@ -72,9 +72,10 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
         @JvmStatic private external fun nativeDestroy(handle: Long)
     }
 
+    private val deviceName = RemotePlayerSlots.controllerDeviceName(playerSlot)
     override val status = ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE
-    override val capabilityDescription = DEVICE_NAME
-    private val handle = nativeCreate(DEVICE_NAME).also { check(it >= 0) { "native Dolphin uinput create failed errno=${-it}" } }
+    override val capabilityDescription = deviceName
+    private val handle = nativeCreate(deviceName).also { check(it >= 0) { "native Dolphin uinput create failed errno=${-it}" } }
     private val stateLock = Any()
     private var state = GameCubeControllerState()
     private var stateUpdates = 0L
@@ -89,14 +90,14 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
     init {
         val instances = activeInstances.incrementAndGet()
         Log.d(TAG, "GAMECUBE_PROFILE_ACTIVATED: mapping=${GameCubeMapping.TABLE_VERSION}")
-        Log.d(TAG, "DOLPHIN_CONTROLLER_CREATED: name=$DEVICE_NAME handle=$handle compatibleWithSavedDolphinSelection=true")
+        Log.d(TAG, "DOLPHIN_CONTROLLER_CREATED: player=$playerSlot name=$deviceName handle=$handle compatibleWithSavedDolphinSelection=${playerSlot == RemotePlayerSlots.PLAYER_2}")
         Log.d(TAG, "DOLPHIN_CONTROLLER_REGISTERED: true")
-        Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: name=$DEVICE_NAME vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
+        Log.d(TAG, "DOLPHIN_DEVICE_IDENTITY: player=$playerSlot name=$deviceName vidPid=045e:028e bus=USB identity=${System.identityHashCode(this)}")
         Log.d(TAG, "DOLPHIN_BUTTON_MAPPING: physical A/B/X/Y->GameCube A/B/X/Y; Start->Start; R1->Z")
         Log.d(TAG, "DOLPHIN_TRIGGER_MAPPING: L2/R2 analog->Analog L/R; threshold=${GameCubeMapping.DIGITAL_TRIGGER_THRESHOLD}; L1/L2 button->Digital L; R2 button->Digital R")
         Log.d(TAG, "DOLPHIN_ANDROID_CONTROLS: Z=Button R2; Digital L=Button L1; Digital R=Button R1; Analog L/R=Axis LTRIGGER/RTRIGGER")
         Log.d(TAG, "DOLPHIN_AXIS_MAPPING: left stick->Main Stick; right stick->C-Stick; direct Android polarity")
-        if (instances > 1) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
+        if (instances > RemotePlayerSlots.MAX_REMOTE_PLAYERS) Log.e(TAG, "DOLPHIN_UNEXPECTED_DEVICE_RECREATION: activeInstances=$instances")
     }
 
     override fun keyDown(context: ControllerEventContext, keyCode: Int) = updateKey(context, keyCode, true)
@@ -225,9 +226,9 @@ class DolphinVirtualGamepadBackend : ControllerBackend {
     }
 }
 
-class UinputVirtualGamepadBackend : ControllerBackend {
+class UinputVirtualGamepadBackend(private val playerSlot: Int = RemotePlayerSlots.PLAYER_2) : ControllerBackend {
     companion object {
-        private const val TAG = "DroidLink"; private const val DEVICE_NAME = "DroidLink Player 2"
+        private const val TAG = "DroidLink"
         init { System.loadLibrary("droidlink_native") }
         @JvmStatic private external fun nativeCreate(name: String): Long
         @JvmStatic private external fun nativeKey(handle: Long, code: Int, pressed: Boolean): Boolean
@@ -236,9 +237,10 @@ class UinputVirtualGamepadBackend : ControllerBackend {
         @JvmStatic private external fun nativeReset(handle: Long): Boolean
         @JvmStatic private external fun nativeDestroy(handle: Long)
     }
+    private val deviceName = RemotePlayerSlots.controllerDeviceName(playerSlot)
     override val status = ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE
-    override val capabilityDescription = DEVICE_NAME
-    private val handle: Long = nativeCreate(DEVICE_NAME).also { check(it >= 0) { "native uinput create failed errno=${-it}" } }
+    override val capabilityDescription = deviceName
+    private val handle: Long = nativeCreate(deviceName).also { check(it >= 0) { "native uinput create failed errno=${-it}" } }
     private var digitalWriteCounter = 0
     private var failedDigitalWrites = 0L
     private var failedAxisWrites = 0L
@@ -250,8 +252,8 @@ class UinputVirtualGamepadBackend : ControllerBackend {
     init {
         Log.d(TAG, "UINPUT_PERMISSION: granted")
         Log.d(TAG, "VIRTUAL_GAMEPAD_CREATED")
-        Log.d(TAG, "VIRTUAL_GAMEPAD_DEVICE_NAME: $DEVICE_NAME")
-        Log.d(TAG, "PLAYER_SLOT_ASSIGNED: 2")
+        Log.d(TAG, "VIRTUAL_GAMEPAD_DEVICE_NAME: $deviceName")
+        Log.d(TAG, "PLAYER_SLOT_ASSIGNED: $playerSlot")
         Log.d(TAG, "CONTROL_BACKEND_SELECTED: ${status.label}")
         Log.d(TAG, "GAMEPAD_DEVICE_REGISTERED: true")
         Log.d(TAG, "GAMEPAD_DESCRIPTOR_READY: true")
