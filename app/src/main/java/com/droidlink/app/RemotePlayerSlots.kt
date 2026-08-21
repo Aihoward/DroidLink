@@ -9,6 +9,8 @@ object RemotePlayerSlots {
     const val MAX_REMOTE_PLAYERS = 3
 
     val activeRemoteSlots = listOf(PLAYER_2, PLAYER_3, PLAYER_4)
+    // Keep the proven P2/P3 device set until a third joiner actually claims P4.
+    val controllerSlotsAtHostStart = listOf(PLAYER_2, PLAYER_3)
 
     fun isActiveRemote(slot: Int) = slot in activeRemoteSlots
 

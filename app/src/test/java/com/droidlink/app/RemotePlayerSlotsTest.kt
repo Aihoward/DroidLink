@@ -18,6 +18,15 @@ class RemotePlayerSlotsTest {
         assertEquals(3, RemotePlayerSlots.MAX_REMOTE_PLAYERS)
     }
 
+    @Test fun preservesPlayer3ControllerSetUntilPlayer4IsClaimed() {
+        assertEquals(
+            listOf(RemotePlayerSlots.PLAYER_2, RemotePlayerSlots.PLAYER_3),
+            RemotePlayerSlots.controllerSlotsAtHostStart
+        )
+        assertFalse(RemotePlayerSlots.PLAYER_4 in RemotePlayerSlots.controllerSlotsAtHostStart)
+        assertTrue(RemotePlayerSlots.PLAYER_4 in RemotePlayerSlots.activeRemoteSlots)
+    }
+
     @Test fun player3IsNotCompactedWhenPlayer2Leaves() {
         val claimedAfterPlayer2Leaves = setOf(RemotePlayerSlots.PLAYER_3, RemotePlayerSlots.PLAYER_4)
         assertTrue(RemotePlayerSlots.PLAYER_3 in claimedAfterPlayer2Leaves)

@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
         val dpadState = DpadStateMachine()
         var lastPacketMs = 0L
         var axisAckCounter = 0
+        var routeLogged = false
     }
 
     private val firebase = FirebaseRoomManager()
@@ -1097,9 +1098,8 @@ class MainActivity : ComponentActivity() {
             player2Classification = "Unknown"
             controllerBackends.values.forEach(ControllerBackend::close)
             controllerBackends.clear()
-            RemotePlayerSlots.activeRemoteSlots.forEach { slot ->
-                controllerBackends[slot] = ControllerBackendSelector.select(selectedControllerProfile, slot)
-                remoteInputSessions[slot] = RemoteInputSession(slot)
+            RemotePlayerSlots.controllerSlotsAtHostStart.forEach { slot ->
+                ensureRemoteControllerSlot(slot, "host startup")
             }
             controllerBackend = controllerBackends.getValue(RemotePlayerSlots.PLAYER_2)
             updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
@@ -1112,6 +1112,7 @@ class MainActivity : ComponentActivity() {
                 hostRoomOwner(generation),
                 { slot, _ -> runOnUiThread {
                     if (!isCurrentSession(generation, code)) return@runOnUiThread staleSessionCallback("P$slot claim joined", generation)
+                    ensureRemoteControllerSlot(slot, "remote slot claimed")
                     hostClaimedSlots = hostClaimedSlots + slot
                     Log.d(TAG, "P$slot joined room; stable slot assigned")
                 } },
@@ -1457,6 +1458,8 @@ class MainActivity : ComponentActivity() {
 
     private fun handleControlMessage(playerSlot: Int?, replyRtc: WebRtcManager, message: String) {
         val started = android.os.SystemClock.elapsedRealtimeNanos()
+        playerSlot?.takeIf { remoteInputSessions[it] == null || controllerBackends[it] == null }
+            ?.let { ensureRemoteControllerSlot(it, "first control message") }
         val input = playerSlot?.let { remoteInputSessions[it] ?: return }
         if (input == null) handleControlMessageInternal(playerSlot, replyRtc, null, message)
         else synchronized(input) { handleControlMessageInternal(playerSlot, replyRtc, input, message) }
@@ -1470,6 +1473,10 @@ class MainActivity : ComponentActivity() {
         val packetType = parts.firstOrNull()
         if (packetType in setOf("KEY", "AXIS", "DPAD", "RESET")) {
             if (input == null) return
+            if (!input.routeLogged) {
+                input.routeLogged = true
+                Log.d(TAG, "REMOTE_INPUT_ROUTE_VERIFIED: receivedFrom=P${input.playerSlot} routedTo=P${input.playerSlot} virtualController=${RemotePlayerSlots.controllerDeviceName(input.playerSlot)}")
+            }
             input.lastPacketMs = android.os.SystemClock.elapsedRealtime()
         }
         when (packetType) {
@@ -1635,6 +1642,7 @@ class MainActivity : ComponentActivity() {
         synchronized(input) {
             if (input.heldButtons.isNotEmpty()) Log.w(TAG, "P$playerSlot CONTROL_STUCK_INPUT_RECOVERY: reason=$reason held=${input.heldButtons.joinToString()}")
             input.heldButtons.clear(); input.lastSequences.clear(); input.axisAckCounter = 0
+            input.routeLogged = false
             input.dpadState.reset()
             input.logicalState = ControllerInputState()
             logicalControllerState = input.logicalState
@@ -1642,6 +1650,16 @@ class MainActivity : ComponentActivity() {
             controllerBackends[playerSlot]?.resetNeutral("P$playerSlot $reason")
         }
         Log.d(TAG, "P$playerSlot CONTROL_REMOTE_STATE_CLEARED: $reason")
+    }
+
+    private fun ensureRemoteControllerSlot(playerSlot: Int, reason: String) {
+        if (!SessionSecurityPolicy.validRemoteSlot(playerSlot)) return
+        remoteInputSessions.computeIfAbsent(playerSlot) { RemoteInputSession(it) }
+        controllerBackends.computeIfAbsent(playerSlot) { slot ->
+            ControllerBackendSelector.select(selectedControllerProfile, slot).also { backend ->
+                Log.d(TAG, "REMOTE_CONTROLLER_REGISTERED: assignedSlot=P$slot virtualController=${RemotePlayerSlots.controllerDeviceName(slot)} reason=$reason status=${backend.status.label}")
+            }
+        }
     }
 
     private fun sendNeutralReset(reason: String) {
