@@ -520,6 +520,7 @@ class MainActivity : ComponentActivity() {
         PlayerSlot("PLAYER 1", "Player 1", "HOST • READY", true)
         PlayerSlot("PLAYER 2", "Player 2", hostSlotStatus(RemotePlayerSlots.PLAYER_2), RemotePlayerSlots.PLAYER_2 in hostConnectedSlots)
         PlayerSlot("PLAYER 3", "Player 3", hostSlotStatus(RemotePlayerSlots.PLAYER_3), RemotePlayerSlots.PLAYER_3 in hostConnectedSlots)
+        PlayerSlot("PLAYER 4", "Player 4", hostSlotStatus(RemotePlayerSlots.PLAYER_4), RemotePlayerSlots.PLAYER_4 in hostConnectedSlots)
         Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         if (isFailureStatus(hostStatus)) ErrorActions("CONNECTION FAILED", friendlyStatus(hostStatus), onRetry = onStart, onBack = onBack)
@@ -1013,7 +1014,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun friendlyStatus(status: String): String = when {
-        status.contains("session is full", true) -> "This session already has a Host, Player 2, and Player 3."
+        status.contains("session is full", true) -> "This session already has a Host, Player 2, Player 3, and Player 4."
         status.contains("room not found", true) -> "Check the room code and try again."
         status.contains("no WebRTC offer", true) -> "The host room exists but is not ready yet. Try again shortly."
         status.contains("screen capture permission denied", true) -> "Screen capture permission is required to host a game."
@@ -1135,7 +1136,9 @@ class MainActivity : ComponentActivity() {
     private fun publishInitialHostOffers(code: String, generation: Long) {
         if (!isCurrentSession(generation, code)) return staleSessionCallback("initial host offers", generation)
         publishHostOffer(code, RemotePlayerSlots.PLAYER_2, hostRtc, generation)
-        prepareHostSlot(code, RemotePlayerSlots.PLAYER_3, generation)
+        RemotePlayerSlots.activeRemoteSlots.drop(1).forEach { slot ->
+            prepareHostSlot(code, slot, generation)
+        }
     }
 
     private fun prepareHostSlot(code: String, slot: Int, generation: Long) {

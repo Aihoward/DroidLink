@@ -79,7 +79,7 @@ class FirebaseRoomManager {
                 val slot = assignedSlot
                 when {
                     error != null -> onError(error.message)
-                    !committed || slot == null -> onError("Session is full (Host + Player 2 + Player 3)")
+                    !committed || slot == null -> onError("Session is full (Host + Player 2 + Player 3 + Player 4)")
                     else -> {
                         val claimRef = claims.child(slot.toString())
                         val disconnect = claimRef.onDisconnect()

@@ -4,11 +4,11 @@ object RemotePlayerSlots {
     const val HOST = 1
     const val PLAYER_2 = 2
     const val PLAYER_3 = 3
-    const val RESERVED_PLAYER_4 = 4
-    const val MAX_TOTAL_PLAYERS = 3
-    const val MAX_REMOTE_PLAYERS = 2
+    const val PLAYER_4 = 4
+    const val MAX_TOTAL_PLAYERS = 4
+    const val MAX_REMOTE_PLAYERS = 3
 
-    val activeRemoteSlots = listOf(PLAYER_2, PLAYER_3)
+    val activeRemoteSlots = listOf(PLAYER_2, PLAYER_3, PLAYER_4)
 
     fun isActiveRemote(slot: Int) = slot in activeRemoteSlots
 
