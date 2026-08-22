@@ -2,6 +2,7 @@
   'use strict';
   const OWNER = 'Aihoward';
   const REPO = 'DroidLink';
+  const SUPPORTED_TAG = 'v3.6';
   const RELEASES_URL = `https://github.com/${OWNER}/${REPO}/releases`;
   const LOCAL_RELEASES_URL = 'releases.json';
   const API_URL = `https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=30`;
@@ -34,16 +35,20 @@
     if (href.startsWith('https://')) { node.target = '_blank'; node.rel = 'noopener noreferrer'; }
     return node;
   };
-  const statusBadge = (release, latest = false) => el('span', `badge${release.prerelease ? ' beta' : ''}`, release.prerelease ? 'BETA / EXPERIMENTAL' : (latest ? 'LATEST STABLE' : 'STABLE'));
+  const isSupported = (release) => release.tag_name === SUPPORTED_TAG && !release.prerelease;
+  const statusBadge = (release, latest = false) => {
+    if (!isSupported(release)) return el('span', 'badge unsupported', 'UNSUPPORTED / DO NOT INSTALL');
+    return el('span', 'badge', latest ? 'ONLY SUPPORTED STABLE' : 'SUPPORTED');
+  };
 
   function setLatest(release) {
     const apk = apkFor(release);
     $('hero-version').textContent = release.name || release.tag_name;
-    $('hero-status').textContent = release.prerelease ? 'Beta' : 'Stable';
+    $('hero-status').textContent = 'Only supported stable';
     $('hero-date').textContent = formatDate(release.published_at);
     $('hero-size').textContent = apk ? formatSize(apk.size) : 'No APK';
     document.querySelectorAll('.latest-download').forEach((button) => {
-      button.textContent = apk ? 'Download latest APK' : 'View latest release';
+      button.textContent = apk ? 'Download DroidLink 3.6' : 'View DroidLink 3.6';
       button.href = apk ? apk.browser_download_url : release.html_url;
       button.classList.remove('disabled');
       button.removeAttribute('aria-disabled');
@@ -69,8 +74,8 @@
     const info = el('div');
     info.append(statusBadge(release), el('h3', '', release.name || release.tag_name), el('p', '', `${formatDate(release.published_at)} · ${release.tag_name}${apk ? ` · ${apk.name} · ${formatSize(apk.size)}` : ' · No APK attached'}`));
     const actions = el('div', 'release-links');
-    if (apk) actions.append(link('Download APK', apk.browser_download_url, 'primary'));
-    actions.append(link('View on GitHub', release.html_url));
+    if (isSupported(release) && apk) actions.append(link('Download v3.6 APK', apk.browser_download_url, 'primary'));
+    actions.append(link(isSupported(release) ? 'View on GitHub' : 'View history', release.html_url));
     head.append(info, actions);
     card.append(head);
     if (release.body) {
@@ -118,15 +123,9 @@
     .then((releases) => {
       state.releases = releases.filter((release) => !release.draft)
         .sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
-      const latest = state.releases.find((release) => apkFor(release));
-      const beta = state.releases.find((release) => release.prerelease && apkFor(release));
-      if (!latest) return failGracefully('No GitHub release with an APK is currently available.');
+      const latest = state.releases.find((release) => isSupported(release) && apkFor(release));
+      if (!latest) return failGracefully('DroidLink v3.6 could not be loaded right now. Use GitHub Releases and install only v3.6.');
       setLatest(latest);
-      if (beta && beta !== latest) {
-        const box = $('beta-release');
-        box.hidden = false;
-        box.replaceChildren(el('strong', '', 'Beta / Experimental: '), link(beta.name || beta.tag_name, beta.html_url), document.createTextNode(' — clearly marked for testing.'));
-      }
       renderReleases();
     })
     .catch(() => failGracefully('GitHub release information could not be loaded right now.'));

@@ -1,0 +1,36 @@
+.support-alert {
+  max-width: 650px;
+  margin: 22px 0 0;
+  padding: 16px 18px;
+  border: 1px solid rgba(255, 107, 107, 0.48);
+  border-radius: 15px;
+  background: rgba(255, 107, 107, 0.08);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.18);
+}
+
+.support-alert strong {
+  display: block;
+  color: #ff8a8a;
+  font-size: 0.92rem;
+  letter-spacing: 0.02em;
+}
+
+.support-alert p {
+  margin: 6px 0 0;
+  color: #d7c5c5;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.badge.unsupported {
+  border-color: rgba(255, 107, 107, 0.35);
+  background: rgba(255, 107, 107, 0.1);
+  color: #ff8a8a;
+}
+
+@media (max-width: 900px) {
+  .support-alert {
+    margin-inline: auto;
+    text-align: left;
+  }
+}
