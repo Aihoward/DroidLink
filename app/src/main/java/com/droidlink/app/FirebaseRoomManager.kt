@@ -8,13 +8,19 @@ data class RemoteSlotAssignment(val playerSlot: Int, val joinerId: String)
 data class RemoteParticipantClaim(val playerSlot: Int, val joinerId: String, val displayName: String)
 
 class FirebaseRoomManager {
-    companion object { private const val TAG = "DroidLink" }
+    companion object {
+        private const val TAG = "DroidLink"
+        private const val DATABASE_URL =
+            "https://droidlink-4142e-default-rtdb.firebaseio.com"
+    }
 
     private data class ValueRegistration(val owner: String, val query: Query, val listener: ValueEventListener)
     private data class ChildRegistration(val owner: String, val query: Query, val listener: ChildEventListener)
 
     private val secureRandom = SecureRandom()
-    private val rooms = FirebaseDatabase.getInstance().getReference("rooms")
+    // Use the explicit instance URL so signaling does not depend on
+    // google-services.json having been downloaded after RTDB was provisioned.
+    private val rooms = FirebaseDatabase.getInstance(DATABASE_URL).getReference("rooms")
     private val valueListeners = mutableListOf<ValueRegistration>()
     private val childListeners = mutableListOf<ChildRegistration>()
     private val claimDisconnects = mutableMapOf<String, OnDisconnect>()
