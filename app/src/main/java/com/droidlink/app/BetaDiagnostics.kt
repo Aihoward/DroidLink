@@ -9,7 +9,9 @@ data class BetaDiagnostics(
     val resolution: String = "—",
     val fps: Double? = null,
     val videoBitrateBps: Long? = null,
+    val targetVideoBitrateBps: Long? = null,
     val packetLoss: Long = 0L,
+    val recentPacketLossPercent: Double? = null,
     val jitterMs: Double? = null,
     val framesEncoded: Long = 0L,
     val framesReceived: Long = 0L,
@@ -25,6 +27,15 @@ data class BetaDiagnostics(
     val decodeFps: Double? = null,
     val renderFps: Double? = null,
     val availableOutgoingBitrateBps: Long? = null,
+    val packetSendDelayMs: Double? = null,
+    val keyFramesEncoded: Long = 0L,
+    val keyFramesDecoded: Long = 0L,
+    val retransmittedPacketsSent: Long = 0L,
+    val nackCount: Long = 0L,
+    val pliCount: Long = 0L,
+    val firCount: Long = 0L,
+    val qualityLimitationReason: String = "Unavailable",
+    val qualityLimitationDurations: String = "Unavailable",
     val averageEncodeTimeMs: Double? = null,
     val averageDecodeTimeMs: Double? = null,
     val captureLatencyMs: Double? = null,
@@ -85,6 +96,12 @@ object VideoStatsPolicy {
         val countDelta = currentCount - previousCount
         val delayDelta = currentSeconds - previousSeconds
         return if (countDelta <= 0L || delayDelta < 0.0) null else delayDelta * 1_000.0 / countDelta
+    }
+
+    fun intervalPacketLossPercent(currentLost: Long, previousLost: Long, currentSent: Long, previousSent: Long): Double? {
+        val lostDelta = currentLost - previousLost
+        val sentDelta = currentSent - previousSent
+        return if (lostDelta < 0L || sentDelta <= 0L) null else lostDelta * 100.0 / sentDelta
     }
 
     fun trend(currentMs: Double?, previousMs: Double?, thresholdMs: Double = 10.0): String = when {

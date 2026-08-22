@@ -29,4 +29,22 @@ class VideoStatsPolicyTest {
         assertEquals("STABLE", VideoStatsPolicy.trend(65.0, 60.0))
         assertEquals("WARMING UP", VideoStatsPolicy.trend(65.0, null))
     }
+
+    @Test fun packetLossUsesRecentIntervalInsteadOfLifetimeAverage() {
+        assertEquals(
+            2.0,
+            VideoStatsPolicy.intervalPacketLossPercent(
+                currentLost = 12L,
+                previousLost = 10L,
+                currentSent = 1_100L,
+                previousSent = 1_000L
+            )!!,
+            0.001
+        )
+    }
+
+    @Test fun packetLossRejectsCounterResetsAndEmptyIntervals() {
+        assertNull(VideoStatsPolicy.intervalPacketLossPercent(5L, 10L, 1_100L, 1_000L))
+        assertNull(VideoStatsPolicy.intervalPacketLossPercent(10L, 10L, 1_000L, 1_000L))
+    }
 }

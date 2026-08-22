@@ -800,6 +800,9 @@ class MainActivity : ComponentActivity() {
                 diagnosticLine("Resolution", d.resolution)
                 val fps = d.renderFps ?: d.receiveFps ?: d.captureFps ?: d.encodeFps
                 diagnosticLine("FPS", fps?.let { "%.1f".format(it) } ?: "—")
+                diagnosticLine("Bitrate", d.videoBitrateBps?.let { "%.2f Mbps".format(it / 1_000_000.0) } ?: "—")
+                diagnosticLine("Packet loss", d.recentPacketLossPercent?.let { "%.2f%%".format(it) } ?: "—")
+                diagnosticLine("Bottleneck", d.videoBottleneck)
             }
             if (showBack) NeonTextButton("RETURN TO GAME") { sessionStatsOpen = false; sessionMenuOpen = false }
         }
@@ -1136,10 +1139,11 @@ class MainActivity : ComponentActivity() {
         if (!d.connectionState.contains("CONNECTED", true)) return "OFFLINE"
         val rtt = d.rttMs ?: 0.0
         val jitter = d.jitterMs ?: 0.0
+        val lossPercent = d.recentPacketLossPercent ?: 0.0
         return when {
-            rtt >= 220 || jitter >= 55 || d.packetLoss >= 20 -> "POOR"
-            rtt >= 140 || jitter >= 35 || d.packetLoss >= 10 -> "FAIR"
-            rtt >= 75 || jitter >= 20 || d.packetLoss >= 3 -> "GOOD"
+            rtt >= 220 || jitter >= 55 || lossPercent >= 5.0 -> "POOR"
+            rtt >= 140 || jitter >= 35 || lossPercent >= 2.0 -> "FAIR"
+            rtt >= 75 || jitter >= 20 || lossPercent >= 0.5 -> "GOOD"
             else -> "EXCELLENT"
         }
     }
@@ -1338,6 +1342,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun configureHostPeer(slot: Int, rtc: WebRtcManager, code: String, generation: Long) {
+        rtc.setDiagnosticPeerLabel("P$slot-host")
         rtc.onControlMessageReceived = { message -> handleControlMessage(slot, rtc, message) }
         rtc.onAudioStatus = { status -> if (slot == RemotePlayerSlots.PLAYER_2) runOnUiThread { audioStatus = status } }
         rtc.onDiagnostics = { update ->
@@ -1487,6 +1492,7 @@ class MainActivity : ComponentActivity() {
     private fun prepareJoinPeer(code: String, offer: String, assignment: RemoteSlotAssignment, generation: Long) {
         val slot = assignment.playerSlot
         audioStatus = "Waiting for remote game audio..."
+        clientRtc.setDiagnosticPeerLabel("P$slot-joiner")
         clientRtc.initialize()
         clientRtc.onAudioStatus = { status -> runOnUiThread { if (isCurrentSession(generation, code)) audioStatus = status else staleSessionCallback("game audio", generation) } }
         clientRtc.onControlMessageReceived = { message -> handleControlMessage(null, clientRtc, message) }
