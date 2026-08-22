@@ -8,10 +8,20 @@ object SessionSecurityPolicy {
     const val MAX_SIGNAL_AGE_MS = 2 * 60 * 60 * 1_000L
     private val roomCodePattern = Regex("^[0-9]{6}$")
     private val sidePattern = Regex("^(host|client)$")
+    private val appVersionPattern = Regex("^[A-Za-z0-9._+-]{1,32}$")
 
     fun validRoomCode(code: String) = roomCodePattern.matches(code)
     fun validSide(side: String) = sidePattern.matches(side)
     fun validRemoteSlot(slot: Int) = RemotePlayerSlots.isActiveRemote(slot)
+    fun validAppVersion(version: String) = appVersionPattern.matches(version)
+    fun validProtocolVersion(version: Int) = version in 1..1_000
+    fun validDisplayName(name: String) =
+        name.isNotBlank() && name.length <= ProfilePolicy.MAX_DISPLAY_NAME_LENGTH && name.none(Char::isISOControl)
+
+    fun validParticipantMetadata(metadata: MultiplayerParticipantMetadata) =
+        validAppVersion(metadata.appVersion) &&
+            validProtocolVersion(metadata.protocolVersion) &&
+            validDisplayName(metadata.displayName)
 
     fun validSdp(sdp: String): Boolean {
         val size = sdp.toByteArray(Charsets.UTF_8).size

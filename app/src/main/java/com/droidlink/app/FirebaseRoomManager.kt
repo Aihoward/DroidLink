@@ -5,6 +5,7 @@ import com.google.firebase.database.*
 import java.security.SecureRandom
 
 data class RemoteSlotAssignment(val playerSlot: Int, val joinerId: String)
+data class RemoteParticipantClaim(val playerSlot: Int, val joinerId: String, val displayName: String)
 
 class FirebaseRoomManager {
     companion object { private const val TAG = "DroidLink" }
@@ -18,10 +19,12 @@ class FirebaseRoomManager {
     private val childListeners = mutableListOf<ChildRegistration>()
     private val claimDisconnects = mutableMapOf<String, OnDisconnect>()
 
-    fun createRoom(onSuccess: (String) -> Unit, onError: (String) -> Unit) =
-        createRoomAttempt(0, onSuccess, onError)
+    fun createRoom(metadata: MultiplayerParticipantMetadata, onSuccess: (String) -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validParticipantMetadata(metadata)) return onError("Invalid session metadata")
+        createRoomAttempt(0, metadata, onSuccess, onError)
+    }
 
-    private fun createRoomAttempt(attempt: Int, onSuccess: (String) -> Unit, onError: (String) -> Unit) {
+    private fun createRoomAttempt(attempt: Int, metadata: MultiplayerParticipantMetadata, onSuccess: (String) -> Unit, onError: (String) -> Unit) {
         val code = secureRandom.nextInt(900_000).plus(100_000).toString()
         rooms.child(code).runTransaction(object : Transaction.Handler {
             override fun doTransaction(data: MutableData): Transaction.Result {
@@ -29,7 +32,10 @@ class FirebaseRoomManager {
                 data.value = mapOf(
                     "status" to "waiting",
                     "createdAt" to ServerValue.TIMESTAMP,
-                    "maxRemotePlayers" to RemotePlayerSlots.MAX_REMOTE_PLAYERS
+                    "maxRemotePlayers" to RemotePlayerSlots.MAX_REMOTE_PLAYERS,
+                    "appVersion" to metadata.appVersion,
+                    "protocolVersion" to metadata.protocolVersion,
+                    "hostDisplayName" to metadata.displayName
                 )
                 return Transaction.success(data)
             }
@@ -38,15 +44,17 @@ class FirebaseRoomManager {
                 when {
                     error != null -> onError(error.message)
                     committed -> { Log.d(TAG, "Firebase room created: $code maxPlayers=${RemotePlayerSlots.MAX_TOTAL_PLAYERS}"); onSuccess(code) }
-                    attempt < 4 -> createRoomAttempt(attempt + 1, onSuccess, onError)
+                    attempt < 4 -> createRoomAttempt(attempt + 1, metadata, onSuccess, onError)
                     else -> onError("Could not allocate a unique room code")
                 }
             }
         })
     }
 
-    fun claimRemoteSlot(code: String, joinerId: String, onSuccess: (RemoteSlotAssignment) -> Unit, onError: (String) -> Unit) {
-        if (!SessionSecurityPolicy.validRoomCode(code) || joinerId.isBlank()) return onError("Invalid join request")
+    fun claimRemoteSlot(code: String, joinerId: String, metadata: MultiplayerParticipantMetadata, onSuccess: (RemoteSlotAssignment) -> Unit, onError: (String) -> Unit) {
+        if (!SessionSecurityPolicy.validRoomCode(code) || joinerId.isBlank() || !SessionSecurityPolicy.validParticipantMetadata(metadata)) {
+            return onError("Invalid join request")
+        }
         rooms.child(code).get().addOnSuccessListener { room ->
             if (!room.exists()) return@addOnSuccessListener onError("Room not found")
             val createdAt = room.child("createdAt").getValue(Long::class.java) ?: 0L
@@ -54,11 +62,21 @@ class FirebaseRoomManager {
             if (room.child("status").getValue(String::class.java) !in setOf("waiting", "connected")) {
                 return@addOnSuccessListener onError("Room is unavailable")
             }
-            claimAvailableSlot(code, joinerId, onSuccess, onError)
+            val compatibility = MultiplayerCompatibility.evaluate(
+                localAppVersion = metadata.appVersion,
+                localProtocolVersion = metadata.protocolVersion,
+                remoteAppVersion = room.child("appVersion").getValue(String::class.java),
+                remoteProtocolVersion = room.child("protocolVersion").getValue(Long::class.java)?.toInt()
+            )
+            if (compatibility != CompatibilityResult.COMPATIBLE) {
+                Log.w(TAG, "MULTIPLAYER_VERSION_REJECTED: reason=$compatibility")
+                return@addOnSuccessListener onError("Version Mismatch")
+            }
+            claimAvailableSlot(code, joinerId, metadata, onSuccess, onError)
         }.addOnFailureListener { onError(it.message ?: "Firebase lookup failed") }
     }
 
-    private fun claimAvailableSlot(code: String, joinerId: String, onSuccess: (RemoteSlotAssignment) -> Unit, onError: (String) -> Unit) {
+    private fun claimAvailableSlot(code: String, joinerId: String, metadata: MultiplayerParticipantMetadata, onSuccess: (RemoteSlotAssignment) -> Unit, onError: (String) -> Unit) {
         val claims = rooms.child(code).child("claims")
         var assignedSlot: Int? = null
         var retainedExistingAssignment = false
@@ -75,7 +93,13 @@ class FirebaseRoomManager {
                 val slot = RemotePlayerSlots.authoritativeSlotFor(joinerId, claimedBySlot) ?: return Transaction.abort()
                 retainedExistingAssignment = claimedBySlot[slot] == joinerId
                 if (!retainedExistingAssignment) {
-                    data.child(slot.toString()).value = mapOf("joinerId" to joinerId, "claimedAt" to System.currentTimeMillis())
+                    data.child(slot.toString()).value = mapOf(
+                        "joinerId" to joinerId,
+                        "claimedAt" to System.currentTimeMillis(),
+                        "appVersion" to metadata.appVersion,
+                        "protocolVersion" to metadata.protocolVersion,
+                        "displayName" to metadata.displayName
+                    )
                 }
                 assignedSlot = slot
                 return Transaction.success(data)
@@ -126,31 +150,40 @@ class FirebaseRoomManager {
         })
     }
 
-    fun listenForRemoteClaims(code: String, owner: String, onJoined: (Int, String) -> Unit, onLeft: (Int, String) -> Unit, onError: (String) -> Unit) {
+    fun listenForRemoteClaims(code: String, owner: String, onJoined: (RemoteParticipantClaim) -> Unit, onLeft: (RemoteParticipantClaim) -> Unit, onError: (String) -> Unit) {
         if (!SessionSecurityPolicy.validRoomCode(code)) return onError("Invalid room code")
         val query = rooms.child(code).child("claims")
-        val known = mutableMapOf<Int, String>()
+        val known = mutableMapOf<Int, RemoteParticipantClaim>()
         val listener = object : ChildEventListener {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) = updateClaim(snapshot)
             override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) = updateClaim(snapshot)
             override fun onChildRemoved(snapshot: DataSnapshot) {
                 val slot = snapshot.key?.toIntOrNull()?.takeIf(SessionSecurityPolicy::validRemoteSlot) ?: return
-                val joinerId = known.remove(slot) ?: snapshot.child("joinerId").getValue(String::class.java) ?: "unknown"
+                val removed = known.remove(slot) ?: claimFromSnapshot(slot, snapshot) ?: return
                 Log.d(TAG, "P$slot claim removed: room=$code")
-                onLeft(slot, joinerId)
+                onLeft(removed)
             }
             override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) = Unit
             override fun onCancelled(error: DatabaseError) = onError(error.message)
 
             private fun updateClaim(snapshot: DataSnapshot) {
                 val slot = snapshot.key?.toIntOrNull()?.takeIf(SessionSecurityPolicy::validRemoteSlot) ?: return
-                val joinerId = snapshot.child("joinerId").getValue(String::class.java) ?: return
-                val previous = known.put(slot, joinerId)
-                if (previous != null && previous != joinerId) onLeft(slot, previous)
-                if (previous != joinerId) {
+                val claim = claimFromSnapshot(slot, snapshot) ?: return
+                val previous = known.put(slot, claim)
+                if (previous != null && previous.joinerId != claim.joinerId) onLeft(previous)
+                if (previous != claim) {
                     Log.d(TAG, "P$slot claim observed: room=$code")
-                    onJoined(slot, joinerId)
+                    onJoined(claim)
                 }
+            }
+
+            private fun claimFromSnapshot(slot: Int, snapshot: DataSnapshot): RemoteParticipantClaim? {
+                val joinerId = snapshot.child("joinerId").getValue(String::class.java) ?: return null
+                val displayName = ProfilePolicy.normalizeDisplayName(
+                    snapshot.child("displayName").getValue(String::class.java),
+                    "Player $slot"
+                )
+                return RemoteParticipantClaim(slot, joinerId, displayName)
             }
         }
         query.addChildEventListener(listener)

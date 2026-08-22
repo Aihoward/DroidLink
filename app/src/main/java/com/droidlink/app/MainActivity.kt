@@ -29,6 +29,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.verticalScroll
@@ -45,6 +46,9 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.res.painterResource
@@ -63,6 +67,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.droidlink.app.ui.theme.DroidLinkTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.webrtc.*
 
@@ -92,6 +97,7 @@ class MainActivity : ComponentActivity() {
     private val remoteInputSessions = java.util.concurrent.ConcurrentHashMap<Int, RemoteInputSession>()
     private val controllerBackends = java.util.concurrent.ConcurrentHashMap<Int, ControllerBackend>()
     private lateinit var menuMusicController: MenuMusicController
+    private lateinit var profileStore: LocalProfileStore
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -99,6 +105,7 @@ class MainActivity : ComponentActivity() {
     private var hostStatus by mutableStateOf("")
     private var hostClaimedSlots by mutableStateOf(emptySet<Int>())
     private var hostConnectedSlots by mutableStateOf(emptySet<Int>())
+    private var hostDisplayNames by mutableStateOf(emptyMap<Int, String>())
     private var captureStatus by mutableStateOf("DroidLink is ready")
     private var clientStatus by mutableStateOf("Not connected")
     private var joinSessionState by mutableStateOf(JoinSessionState.Idle)
@@ -123,6 +130,9 @@ class MainActivity : ComponentActivity() {
     private var menuMusicEnabled by mutableStateOf(true)
     private var accentName by mutableStateOf("Green")
     private var selectedControllerProfile by mutableStateOf(ControllerProfile.PC_WINLATOR)
+    private var localDisplayName by mutableStateOf(ProfilePolicy.DEFAULT_DISPLAY_NAME)
+    private var profileAvatar by mutableStateOf<ImageBitmap?>(null)
+    private var profileStatus by mutableStateOf("")
     private var onboardingVisible by mutableStateOf(false)
     private var onboardingPage by mutableIntStateOf(0)
     private var readinessVisible by mutableStateOf(false)
@@ -294,9 +304,30 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "AUDIO_UNAVAILABLE_REASON: RECORD_AUDIO permission denied")
         }
     }
+    private val profileImageLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri ?: return@registerForActivityResult
+        profileStatus = "Updating picture..."
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = profileStore.importAvatar(uri)
+            val avatar = result.getOrNull()?.let { profileStore.loadAvatarBitmap()?.asImageBitmap() }
+            runOnUiThread {
+                if (result.isSuccess && avatar != null) {
+                    profileAvatar = avatar
+                    profileStatus = "Picture updated"
+                } else {
+                    profileStatus = result.exceptionOrNull()?.message ?: "Picture could not be loaded"
+                }
+            }
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         menuMusicController = MenuMusicController(this)
+        profileStore = LocalProfileStore(this)
+        profileStore.loadProfile().let { profile ->
+            localDisplayName = profile.displayName
+            if (profile.hasCustomAvatar) profileAvatar = profileStore.loadAvatarBitmap()?.asImageBitmap()
+        }
         enableImmersiveMode()
         ContextCompat.registerReceiver(this, projectionReadyReceiver, IntentFilter(ScreenCaptureService.ACTION_READY), ContextCompat.RECEIVER_NOT_EXPORTED)
         receiverRegistered = true
@@ -371,6 +402,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        logControllerLifecycle("activity paused")
         menuMusicController.onBackground()
         super.onPause()
     }
@@ -426,7 +458,7 @@ class MainActivity : ComponentActivity() {
             val subtitle: String
             val detail: String
             when (onboardingPage) {
-                1 -> { title = "HOST"; subtitle = "Start the game."; detail = "Create a room, allow screen capture, and share the six-digit code with up to two players." }
+                1 -> { title = "HOST"; subtitle = "Start the game."; detail = "Create a room, allow screen capture, and share the six-digit code with up to three players." }
                 2 -> { title = "JOIN"; subtitle = "Play together."; detail = "Enter the room code on another Android device and play using your physical controller." }
                 else -> { title = "DROID LINK"; subtitle = "Play Together. Anywhere."; detail = "Low-latency Android-to-Android game streaming and remote multiplayer." }
             }
@@ -446,7 +478,9 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable private fun MainShell() = Column(Modifier.fillMaxSize().background(Color(0xA8050705)).windowInsetsPadding(WindowInsets.safeDrawing).padding(20.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            ProfileSummary { mainPage = "profile" }
+            Spacer(Modifier.weight(1f))
             val view = LocalView.current
             IconButton(
                 onClick = { uiFeedback(view); mainPage = "settings" },
@@ -462,6 +496,7 @@ class MainActivity : ComponentActivity() {
         }
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             when (mainPage) {
+                "profile" -> ProfileScreen()
                 "settings" -> SettingsScreen(inSession = false)
                 "stats" -> ConnectionStatsSummary(showBack = false)
                 "about" -> AboutScreen()
@@ -472,6 +507,81 @@ class MainActivity : ComponentActivity() {
             NavButton("HOME", mainPage == "home") { mainPage = "home" }
             NavButton("STATS", mainPage == "stats") { mainPage = "stats" }
             NavButton("ABOUT", mainPage == "about") { mainPage = "about" }
+        }
+    }
+
+    @Composable private fun ProfileSummary(onClick: () -> Unit) {
+        val view = LocalView.current
+        Row(
+            Modifier.clickable { uiFeedback(view); onClick() }.padding(vertical = 4.dp, horizontal = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            ProfileAvatar(42.dp)
+            Column {
+                Text(localDisplayName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text("PROFILE", color = mutedText, fontSize = 10.sp)
+            }
+        }
+    }
+
+    @Composable private fun ProfileAvatar(size: androidx.compose.ui.unit.Dp) {
+        val avatar = profileAvatar
+        if (avatar != null) {
+            androidx.compose.foundation.Image(
+                bitmap = avatar,
+                contentDescription = "Profile picture",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.size(size).clip(CircleShape).border(1.dp, neonGreen.copy(alpha = 0.7f), CircleShape)
+            )
+        } else {
+            Box(Modifier.size(size).clip(CircleShape).background(neonGreen), contentAlignment = Alignment.Center) {
+                Text(
+                    ProfilePolicy.normalizeDisplayName(localDisplayName).first().uppercaseChar().toString(),
+                    color = Color.Black,
+                    fontWeight = FontWeight.Black,
+                    fontSize = if (size >= 72.dp) 30.sp else 17.sp
+                )
+            }
+        }
+    }
+
+    @Composable private fun ProfileScreen() {
+        var draftName by remember(localDisplayName) { mutableStateOf(localDisplayName) }
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text("PROFILE", color = Color.White, fontWeight = FontWeight.Black, fontSize = 26.sp)
+            ProfileAvatar(96.dp)
+            OutlinedTextField(
+                value = draftName,
+                onValueChange = { draftName = it.take(ProfilePolicy.MAX_DISPLAY_NAME_LENGTH) },
+                label = { Text("Display name") },
+                singleLine = true,
+                supportingText = { Text("${draftName.length} / ${ProfilePolicy.MAX_DISPLAY_NAME_LENGTH}") },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = neonGreen,
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White
+                ),
+                modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth()
+            )
+            NeonButton("SAVE NAME") {
+                localDisplayName = profileStore.saveDisplayName(draftName)
+                draftName = localDisplayName
+                profileStatus = "Name saved"
+            }
+            NeonButton("CHOOSE PICTURE", filled = false) { profileImageLauncher.launch(arrayOf("image/*")) }
+            if (profileAvatar != null) NeonTextButton("REMOVE PICTURE", compact = true) {
+                if (profileStore.removeAvatar()) {
+                    profileAvatar = null
+                    profileStatus = "Picture removed"
+                } else profileStatus = "Picture could not be removed"
+            }
+            if (profileStatus.isNotBlank()) Text(profileStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+            NeonButton("SETTINGS", filled = false) { mainPage = "settings" }
         }
     }
 
@@ -495,7 +605,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun AboutScreen() = Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         androidx.compose.foundation.Image(painterResource(R.drawable.droidlink_logo), "Droid Link", Modifier.size(128.dp))
         Text("DROID LINK", color = Color.White, fontWeight = FontWeight.Black, fontSize = 28.sp, letterSpacing = 3.sp)
-        Text("3.0", color = neonGreen, fontWeight = FontWeight.Bold)
+        Text(BuildConfig.VERSION_NAME, color = neonGreen, fontWeight = FontWeight.Bold)
         Text("Android-to-Android low-latency game streaming and remote multiplayer.", color = mutedText, textAlign = TextAlign.Center)
         Text("Menu Music: Prod. By S.P.L. BEATS", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         NeonButton("GITHUB", filled = false) { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Aihoward/DroidLink"))) }
@@ -518,10 +628,10 @@ class MainActivity : ComponentActivity() {
             Text(friendlyStatus(hostStatus.ifEmpty { "Ready to start" }), color = Color.White, textAlign = TextAlign.Center)
         }
         NeonButton(if (sessionStarting) "STARTING…" else "START HOST", enabled = !sessionStarting, onClick = onStart)
-        PlayerSlot("PLAYER 1", "Player 1", "HOST • READY", true)
-        PlayerSlot("PLAYER 2", "Player 2", hostSlotStatus(RemotePlayerSlots.PLAYER_2), RemotePlayerSlots.PLAYER_2 in hostConnectedSlots)
-        PlayerSlot("PLAYER 3", "Player 3", hostSlotStatus(RemotePlayerSlots.PLAYER_3), RemotePlayerSlots.PLAYER_3 in hostConnectedSlots)
-        PlayerSlot("PLAYER 4", "Player 4", hostSlotStatus(RemotePlayerSlots.PLAYER_4), RemotePlayerSlots.PLAYER_4 in hostConnectedSlots)
+        PlayerSlot("PLAYER 1", localDisplayName, "HOST • READY", true)
+        PlayerSlot("PLAYER 2", hostDisplayNames[RemotePlayerSlots.PLAYER_2] ?: "Player 2", hostSlotStatus(RemotePlayerSlots.PLAYER_2), RemotePlayerSlots.PLAYER_2 in hostConnectedSlots)
+        PlayerSlot("PLAYER 3", hostDisplayNames[RemotePlayerSlots.PLAYER_3] ?: "Player 3", hostSlotStatus(RemotePlayerSlots.PLAYER_3), RemotePlayerSlots.PLAYER_3 in hostConnectedSlots)
+        PlayerSlot("PLAYER 4", hostDisplayNames[RemotePlayerSlots.PLAYER_4] ?: "Player 4", hostSlotStatus(RemotePlayerSlots.PLAYER_4), RemotePlayerSlots.PLAYER_4 in hostConnectedSlots)
         Text(captureStatus, color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         if (isFailureStatus(hostStatus)) ErrorActions("CONNECTION FAILED", friendlyStatus(hostStatus), onRetry = onStart, onBack = onBack)
@@ -544,7 +654,16 @@ class MainActivity : ComponentActivity() {
             Text(friendlyStatus(clientStatus), color = Color.White, textAlign = TextAlign.Center)
             Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
         }
-        if (isFailureStatus(clientStatus)) ErrorActions(if (clientStatus.contains("room", true)) "ROOM NOT FOUND" else "CONNECTION FAILED", friendlyStatus(clientStatus), onRetry = onConnect, onBack = onBack)
+        if (isFailureStatus(clientStatus)) ErrorActions(
+            when {
+                clientStatus.contains("version mismatch", true) -> "VERSION MISMATCH"
+                clientStatus.contains("room", true) -> "ROOM NOT FOUND"
+                else -> "CONNECTION FAILED"
+            },
+            friendlyStatus(clientStatus),
+            onRetry = onConnect,
+            onBack = onBack
+        )
     }
 
     @Composable private fun VideoScreen() {
@@ -825,7 +944,7 @@ class MainActivity : ComponentActivity() {
                 if (!inSession) NeonTextButton("SHOW FIRST-RUN GUIDE AGAIN") { onboardingPage = 0; onboardingVisible = true }
                 if (!inSession) NeonTextButton("RESET SETTINGS") { resetUiSettings() }
                 SettingInfo("Theme", "Droid Link Neon")
-                SettingInfo("Version", "DroidLink 3.0")
+                SettingInfo("Version", "DroidLink ${BuildConfig.VERSION_NAME}")
             }
             if (inSession) NeonButton("BACK TO SESSION MENU", filled = false) { sessionSettingsOpen = false; sessionMenuOpen = true }
         }
@@ -966,7 +1085,20 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         menuMusicController.onForeground()
         syncMenuMusic()
-        window.decorView.post { enableImmersiveMode() }
+        window.decorView.post {
+            enableImmersiveMode()
+            requestUnbufferedControllerDispatch()
+            hostRtcBySlot.forEach { (slot, rtc) -> rtc.recoverControllerChannels("P$slot activity resumed") }
+            logControllerLifecycle("activity resumed")
+        }
+    }
+
+    private fun logControllerLifecycle(reason: String) {
+        if (!sessionActive && !sessionStarting) return
+        Log.d(TAG, "CONTROLLER_LIFECYCLE: reason=$reason mode=$mode sessionActive=$sessionActive sessionStarting=$sessionStarting clientCapture=$clientControlActive peerClient=$clientPeerState hostPeers=$hostPeerStates")
+        hostRtcBySlot.forEach { (slot, rtc) -> rtc.logControllerTransportHealth("P$slot $reason") }
+        if (mode == "client") clientRtc.logControllerTransportHealth("P${remoteSlotAssignment?.playerSlot ?: 2} $reason")
+        controllerBackends.forEach { (slot, backend) -> backend.logHealth("P$slot $reason") }
     }
 
     private fun beginSessionGeneration(role: String): Long {
@@ -974,6 +1106,12 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "SESSION_${role.uppercase()}_STARTED: generation=$sessionGeneration")
         return sessionGeneration
     }
+
+    private fun localParticipantMetadata() = MultiplayerParticipantMetadata(
+        appVersion = BuildConfig.VERSION_NAME,
+        protocolVersion = MultiplayerCompatibility.PROTOCOL_VERSION,
+        displayName = ProfilePolicy.normalizeDisplayName(localDisplayName)
+    )
 
     private fun isCurrentSession(generation: Long, code: String): Boolean = generation == sessionGeneration && activeSessionId == code
 
@@ -1006,7 +1144,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun isFailureStatus(status: String) = status.contains("failed", true) || status.contains("error", true) || status.contains("not found", true) || status.contains("denied", true)
+    private fun isFailureStatus(status: String) = status.contains("failed", true) || status.contains("error", true) || status.contains("not found", true) || status.contains("denied", true) || status.contains("version mismatch", true)
 
     private fun hostSlotStatus(slot: Int) = when (slot) {
         in hostConnectedSlots -> "CONNECTED"
@@ -1015,6 +1153,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun friendlyStatus(status: String): String = when {
+        status.contains("version mismatch", true) -> "Both players must use the same DroidLink version to connect."
         status.contains("session is full", true) -> "This session already has a Host, Player 2, Player 3, and Player 4."
         status.contains("room not found", true) -> "Check the room code and try again."
         status.contains("no WebRTC offer", true) -> "The host room exists but is not ready yet. Try again shortly."
@@ -1091,7 +1230,7 @@ class MainActivity : ComponentActivity() {
         val generation = beginSessionGeneration("host")
         sessionStarting = true; hostStatus = "Creating room..."
         audioStatus = "Preparing playback audio capture..."
-        firebase.createRoom({ code ->
+        firebase.createRoom(localParticipantMetadata(), { code ->
             if (generation != sessionGeneration) { staleSessionCallback("create room", generation); return@createRoom }
             activeSessionId = code
             hostRoomCode = code; hostStatus = "Loading TURN credentials..."
@@ -1110,15 +1249,19 @@ class MainActivity : ComponentActivity() {
             firebase.listenForRemoteClaims(
                 code,
                 hostRoomOwner(generation),
-                { slot, _ -> runOnUiThread {
+                { claim -> runOnUiThread {
+                    val slot = claim.playerSlot
                     if (!isCurrentSession(generation, code)) return@runOnUiThread staleSessionCallback("P$slot claim joined", generation)
                     ensureRemoteControllerSlot(slot, "remote slot claimed")
                     hostClaimedSlots = hostClaimedSlots + slot
+                    hostDisplayNames = hostDisplayNames + (slot to claim.displayName)
                     Log.d(TAG, "P$slot joined room; stable slot assigned")
                 } },
-                { slot, _ -> runOnUiThread {
+                { claim -> runOnUiThread {
+                    val slot = claim.playerSlot
                     if (!isCurrentSession(generation, code)) return@runOnUiThread staleSessionCallback("P$slot claim left", generation)
                     hostClaimedSlots = hostClaimedSlots - slot
+                    hostDisplayNames = hostDisplayNames - slot
                     cleanupHostRemoteSlot(slot, code, generation, "remote claim removed", rebuild = true)
                 } },
                 { error -> runOnUiThread { if (isCurrentSession(generation, code)) hostStatus = "Player listener error: $error" } }
@@ -1326,7 +1469,7 @@ class MainActivity : ComponentActivity() {
         sessionStarting = true
         transitionJoinState(JoinSessionState.LookingForRoom, "join button pressed", "Looking for room...")
         val joinerId = java.util.UUID.randomUUID().toString()
-        firebase.claimRemoteSlot(code, joinerId, { assignment ->
+        firebase.claimRemoteSlot(code, joinerId, localParticipantMetadata(), { assignment ->
             if (!isCurrentSession(generation, code)) {
                 firebase.releaseRemoteSlot(code, assignment)
                 staleSessionCallback("join slot claim", generation)
@@ -1915,7 +2058,7 @@ class MainActivity : ComponentActivity() {
         if (joinSessionState != JoinSessionState.Idle) Log.d(TAG, "JOIN_SESSION_DISPOSED: previousState=$joinSessionState")
         joinSessionState = JoinSessionState.Idle
         clientPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerState = PeerConnection.PeerConnectionState.NEW; hostPeerStates.clear(); hostDiagnosticsBySlot.clear(); sessionStarting = false
-        hostClaimedSlots = emptySet(); hostConnectedSlots = emptySet(); remoteSlotAssignment = null
+        hostClaimedSlots = emptySet(); hostConnectedSlots = emptySet(); hostDisplayNames = emptyMap(); remoteSlotAssignment = null
         readinessVisible = false; readinessShownForSession = false
         gameAudioEnabled = true; gameAudioVolume = 1f
         pendingCaptureIntent = null; pendingOffer = null; hostRoomCode = ""; activeSessionId = "none"
