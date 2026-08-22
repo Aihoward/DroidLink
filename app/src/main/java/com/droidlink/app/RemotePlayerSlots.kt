@@ -22,6 +22,13 @@ object RemotePlayerSlots {
     fun packetMatches(authoritativeSlot: Int, declaredSlot: Int?) =
         isActiveRemote(authoritativeSlot) && declaredSlot == authoritativeSlot
 
+    fun authoritativeSlotFor(participantId: String, claimedBySlot: Map<Int, String?>): Int? {
+        if (participantId.isBlank()) return null
+        val activeClaims = claimedBySlot.filterKeys(::isActiveRemote)
+        return activeRemoteSlots.firstOrNull { activeClaims[it] == participantId }
+            ?: firstAvailable(activeClaims.keys)
+    }
+
     fun firstAvailable(claimedSlots: Set<Int>): Int? =
         activeRemoteSlots.firstOrNull { it !in claimedSlots }
 }

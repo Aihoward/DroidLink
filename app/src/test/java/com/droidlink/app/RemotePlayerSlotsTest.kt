@@ -27,6 +27,55 @@ class RemotePlayerSlotsTest {
         assertTrue(RemotePlayerSlots.PLAYER_4 in RemotePlayerSlots.activeRemoteSlots)
     }
 
+    @Test fun authoritativeFreshJoinOrderIsPlayer2Then3Then4() {
+        var claims = emptyMap<Int, String?>()
+        val player2 = RemotePlayerSlots.authoritativeSlotFor("first", claims)
+        claims = claims + (player2!! to "first")
+        val player3 = RemotePlayerSlots.authoritativeSlotFor("second", claims)
+        claims = claims + (player3!! to "second")
+        val player4 = RemotePlayerSlots.authoritativeSlotFor("third", claims)
+
+        assertEquals(RemotePlayerSlots.PLAYER_2, player2)
+        assertEquals(RemotePlayerSlots.PLAYER_3, player3)
+        assertEquals(RemotePlayerSlots.PLAYER_4, player4)
+    }
+
+    @Test fun existingParticipantKeepsItsSlotBeforeLowerVacancyIsReused() {
+        val claims = mapOf<Int, String?>(
+            RemotePlayerSlots.PLAYER_3 to "second",
+            RemotePlayerSlots.PLAYER_4 to "third"
+        )
+
+        assertEquals(RemotePlayerSlots.PLAYER_3, RemotePlayerSlots.authoritativeSlotFor("second", claims))
+        assertEquals(RemotePlayerSlots.PLAYER_4, RemotePlayerSlots.authoritativeSlotFor("third", claims))
+        assertEquals(RemotePlayerSlots.PLAYER_2, RemotePlayerSlots.authoritativeSlotFor("replacement", claims))
+    }
+
+    @Test fun eachVacatedSlotIsReusedWithoutRenumberingRemainingParticipants() {
+        val full = mapOf<Int, String?>(2 to "p2", 3 to "p3", 4 to "p4")
+
+        val withoutP2 = full - RemotePlayerSlots.PLAYER_2
+        assertEquals(3, RemotePlayerSlots.authoritativeSlotFor("p3", withoutP2))
+        assertEquals(4, RemotePlayerSlots.authoritativeSlotFor("p4", withoutP2))
+        assertEquals(2, RemotePlayerSlots.authoritativeSlotFor("new", withoutP2))
+
+        val withoutP3 = full - RemotePlayerSlots.PLAYER_3
+        assertEquals(2, RemotePlayerSlots.authoritativeSlotFor("p2", withoutP3))
+        assertEquals(4, RemotePlayerSlots.authoritativeSlotFor("p4", withoutP3))
+        assertEquals(3, RemotePlayerSlots.authoritativeSlotFor("new", withoutP3))
+
+        val withoutP4 = full - RemotePlayerSlots.PLAYER_4
+        assertEquals(2, RemotePlayerSlots.authoritativeSlotFor("p2", withoutP4))
+        assertEquals(3, RemotePlayerSlots.authoritativeSlotFor("p3", withoutP4))
+        assertEquals(4, RemotePlayerSlots.authoritativeSlotFor("new", withoutP4))
+    }
+
+    @Test fun fullOrMalformedClaimsCannotBeOverwritten() {
+        assertNull(RemotePlayerSlots.authoritativeSlotFor("fourth", mapOf(2 to "p2", 3 to "p3", 4 to "p4")))
+        assertEquals(3, RemotePlayerSlots.authoritativeSlotFor("new", mapOf(2 to null)))
+        assertNull(RemotePlayerSlots.authoritativeSlotFor("", emptyMap()))
+    }
+
     @Test fun player3IsNotCompactedWhenPlayer2Leaves() {
         val claimedAfterPlayer2Leaves = setOf(RemotePlayerSlots.PLAYER_3, RemotePlayerSlots.PLAYER_4)
         assertTrue(RemotePlayerSlots.PLAYER_3 in claimedAfterPlayer2Leaves)

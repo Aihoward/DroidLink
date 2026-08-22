@@ -61,16 +61,22 @@ class FirebaseRoomManager {
     private fun claimAvailableSlot(code: String, joinerId: String, onSuccess: (RemoteSlotAssignment) -> Unit, onError: (String) -> Unit) {
         val claims = rooms.child(code).child("claims")
         var assignedSlot: Int? = null
+        var retainedExistingAssignment = false
         claims.runTransaction(object : Transaction.Handler {
             override fun doTransaction(data: MutableData): Transaction.Result {
                 assignedSlot = null
-                val alreadyAssigned = RemotePlayerSlots.activeRemoteSlots.firstOrNull { slot ->
-                    data.child(slot.toString()).child("joinerId").getValue(String::class.java) == joinerId
+                retainedExistingAssignment = false
+                val claimedBySlot = buildMap<Int, String?> {
+                    RemotePlayerSlots.activeRemoteSlots.forEach { slot ->
+                        val claim = data.child(slot.toString())
+                        if (claim.value != null) put(slot, claim.child("joinerId").getValue(String::class.java))
+                    }
                 }
-                val slot = alreadyAssigned ?: RemotePlayerSlots.firstAvailable(
-                    RemotePlayerSlots.activeRemoteSlots.filterTo(mutableSetOf()) { data.child(it.toString()).value != null }
-                ) ?: return Transaction.abort()
-                data.child(slot.toString()).value = mapOf("joinerId" to joinerId, "claimedAt" to System.currentTimeMillis())
+                val slot = RemotePlayerSlots.authoritativeSlotFor(joinerId, claimedBySlot) ?: return Transaction.abort()
+                retainedExistingAssignment = claimedBySlot[slot] == joinerId
+                if (!retainedExistingAssignment) {
+                    data.child(slot.toString()).value = mapOf("joinerId" to joinerId, "claimedAt" to System.currentTimeMillis())
+                }
                 assignedSlot = slot
                 return Transaction.success(data)
             }
@@ -87,7 +93,8 @@ class FirebaseRoomManager {
                             .addOnSuccessListener {
                                 claimDisconnects[joinerId] = disconnect
                                 rooms.child(code).child("status").setValue("connected")
-                                Log.d(TAG, "P$slot remote slot claimed: room=$code joiner=$joinerId")
+                                val ownership = if (retainedExistingAssignment) "retained" else "new-lowest-available"
+                                Log.d(TAG, "REMOTE_SLOT_ASSIGNED: slot=P$slot ownership=$ownership")
                                 onSuccess(RemoteSlotAssignment(slot, joinerId))
                             }
                             .addOnFailureListener { failure ->
@@ -114,7 +121,7 @@ class FirebaseRoomManager {
 
             override fun onComplete(error: DatabaseError?, committed: Boolean, snapshot: DataSnapshot?) {
                 if (error != null) Log.w(TAG, "P${assignment.playerSlot} slot release failed: ${error.message}")
-                else Log.d(TAG, "P${assignment.playerSlot} slot release committed=$committed")
+                else Log.d(TAG, "REMOTE_SLOT_RELEASED: slot=P${assignment.playerSlot} committed=$committed")
             }
         })
     }
