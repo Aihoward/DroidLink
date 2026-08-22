@@ -14,8 +14,8 @@ android {
         applicationId = "com.droidlink.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 35
-        versionName = "3.0"
+        versionCode = 36
+        versionName = "3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild { ndkBuild { arguments += "NDK_APPLICATION_MK:=src/main/jni/Application.mk" } }
@@ -33,6 +33,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
     buildFeatures {
+        buildConfig = true
         compose = true
     }
     ndkVersion = "27.0.12077973"
@@ -45,6 +46,7 @@ dependencies {
     implementation("io.github.webrtc-sdk:android:144.7559.12")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.fragment)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)

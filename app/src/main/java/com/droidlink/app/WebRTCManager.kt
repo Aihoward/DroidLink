@@ -48,6 +48,7 @@ class WebRtcManager(private val context: Context) {
     private var lastChannelRecoveryMs = 0L
     private var controlSendFailures = 0L
     private var axisSendFailures = 0L
+    private var controlDispatchFailures = 0L
     private var screenCapturer: ScreenCapturerAndroid? = null
     private var textureHelper: SurfaceTextureHelper? = null
     private var screenSource: VideoSource? = null
@@ -312,7 +313,12 @@ class WebRtcManager(private val context: Context) {
                     controlPacketsReceived++
                     lastControlReceivedMs = android.os.SystemClock.elapsedRealtime()
                     if (++axisReceiveLogCounter % 120 == 1) Log.d(TAG, "CONTROL_RECEIVE_SUMMARY: packets=$axisReceiveLogCounter channel=${channel.label()} type=${it.substringBefore('|')}")
-                    onControlMessageReceived?.invoke(it)
+                    try {
+                        onControlMessageReceived?.invoke(it)
+                    } catch (error: Exception) {
+                        controlDispatchFailures++
+                        Log.e(TAG, "CONTROL_DISPATCH_FAILED: failures=$controlDispatchFailures channel=${channel.label()} type=${it.substringBefore('|')}", error)
+                    }
                 }
             }
             override fun onBufferedAmountChange(previousAmount: Long) {
@@ -737,7 +743,7 @@ class WebRtcManager(private val context: Context) {
         val now = android.os.SystemClock.elapsedRealtime()
         fun age(timestamp: Long) = if (timestamp == 0L) "never" else "${now - timestamp}ms"
         val pendingAnalog = synchronized(lock) { pendingLatestAnalogMessage != null }
-        Log.d(TAG, "CONTROLLER_TRANSPORT_HEALTH: reason=$reason sent=$controlPacketsSent received=$controlPacketsReceived buttonSendFailures=$controlSendFailures axisSendFailures=$axisSendFailures lastSentAge=${age(lastControlSentMs)} lastReceivedAge=${age(lastControlReceivedMs)} controlState=${dataChannel?.state()} axisState=${axisDataChannel?.state()} controlBuffered=${dataChannel?.bufferedAmount() ?: 0L} axisBuffered=${axisDataChannel?.bufferedAmount() ?: 0L} pendingLatestAnalog=$pendingAnalog ownsChannels=$ownsControllerChannels closed=$closed")
+        Log.d(TAG, "CONTROLLER_TRANSPORT_HEALTH: reason=$reason sent=$controlPacketsSent received=$controlPacketsReceived buttonSendFailures=$controlSendFailures axisSendFailures=$axisSendFailures dispatchFailures=$controlDispatchFailures lastSentAge=${age(lastControlSentMs)} lastReceivedAge=${age(lastControlReceivedMs)} controlState=${dataChannel?.state()} axisState=${axisDataChannel?.state()} controlBuffered=${dataChannel?.bufferedAmount() ?: 0L} axisBuffered=${axisDataChannel?.bufferedAmount() ?: 0L} pendingLatestAnalog=$pendingAnalog ownsChannels=$ownsControllerChannels closed=$closed")
     }
 
     fun recoverControllerChannels(reason: String): Boolean {
