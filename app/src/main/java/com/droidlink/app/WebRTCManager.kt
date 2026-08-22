@@ -57,6 +57,10 @@ class WebRtcManager(private val context: Context) {
     private var peerLabel = "unassigned"
     private var adaptiveProfile = "Auto"
     private var baseCaptureFps = 60
+    private var adaptationLevel = 0
+    private var constrainedVideoSamples = 0
+    private var healthyVideoSamples = 0
+    private var lastAdaptationMs = 0L
     private var lastPacketsLost = 0L
     private var lastVideoPacketsSent = 0L
     private var lastVideoPacketsReceived = 0L
@@ -573,6 +577,18 @@ class WebRtcManager(private val context: Context) {
         if (codec != "unknown") Log.d(TAG, "SELECTED VIDEO CODEC: $codec encoder=${encoderImplementation ?: "unknown"} decoder=${decoderImplementation ?: "unknown"}")
         Log.d(TAG, "VIDEO_ENCODER_IMPLEMENTATION: ${encoderImplementation ?: "unknown"} type=${codecImplementationType(encoderImplementation)}")
         Log.d(TAG, "VIDEO_DECODER_IMPLEMENTATION: ${decoderImplementation ?: "unknown"} type=${codecImplementationType(decoderImplementation)}")
+        if (hasOutboundVideo) {
+            adaptVideoForLatency(
+                now = now,
+                encodedFps = encodedFps,
+                rttMs = rttMs,
+                jitterMs = jitterMs,
+                recentLossPercent = recentPacketLossPercent,
+                availableSendBps = availableSendBps,
+                sendBitrateBps = sendBitrate ?: 0L,
+                packetSendDelayMs = packetSendDelayMs
+            )
+        }
         val bitrate = if (hasInboundVideo) receiveBitrate else sendBitrate
         val priorEncoder = diagnostics.encoderImplementation.takeUnless { it == "Unavailable" || it == "Unknown" }
         val priorDecoder = diagnostics.decoderImplementation.takeUnless { it == "Unavailable" || it == "Unknown" }
@@ -895,6 +911,10 @@ class WebRtcManager(private val context: Context) {
         val lowLatency = profile == "Low Latency"
         val startBitrate = if (lowLatency) 2_500_000 else 4_000_000
         val maxBitrate = if (lowLatency) 3_500_000 else 8_000_000
+        adaptationLevel = 0
+        constrainedVideoSamples = 0
+        healthyVideoSamples = 0
+        lastAdaptationMs = android.os.SystemClock.elapsedRealtime()
         val parameters = sender.parameters
         parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
         parameters.encodings.forEach { encoding ->
@@ -902,11 +922,73 @@ class WebRtcManager(private val context: Context) {
             encoding.minBitrateBps = 150_000
             encoding.maxBitrateBps = maxBitrate
             encoding.maxFramerate = fps
+            encoding.scaleResolutionDownBy = 1.0
             encoding.bitratePriority = 2.0
         }
         val parametersSet = sender.setParameters(parameters)
         val bitrateSet = peer?.setBitrate(150_000, startBitrate, maxBitrate) == true
-        Log.d(TAG, "VIDEO_LOW_LATENCY_SENDER: peer=$peerLabel profile=$profile parametersSet=$parametersSet bitrateSet=$bitrateSet startBitrate=$startBitrate maxBitrate=$maxBitrate fps=$fps degradation=MAINTAIN_FRAMERATE adaptation=native-per-peer")
+        Log.d(TAG, "VIDEO_LOW_LATENCY_SENDER: peer=$peerLabel profile=$profile parametersSet=$parametersSet bitrateSet=$bitrateSet startBitrate=$startBitrate maxBitrate=$maxBitrate fps=$fps degradation=MAINTAIN_FRAMERATE adaptation=native+latency-guard-per-peer")
+    }
+
+    private fun adaptVideoForLatency(
+        now: Long,
+        encodedFps: Double?,
+        rttMs: Double?,
+        jitterMs: Double?,
+        recentLossPercent: Double?,
+        availableSendBps: Double?,
+        sendBitrateBps: Long,
+        packetSendDelayMs: Double?
+    ) {
+        if (!VideoAdaptationPolicy.manages(adaptiveProfile)) return
+        val lowLatency = adaptiveProfile == "Low Latency"
+        val currentTarget = VideoAdaptationPolicy.target(adaptiveProfile, baseCaptureFps, adaptationLevel)
+        val constrained = (rttMs ?: 0.0) >= (if (lowLatency) 120.0 else 170.0) ||
+            (jitterMs ?: 0.0) >= (if (lowLatency) 25.0 else 40.0) ||
+            (recentLossPercent ?: 0.0) >= (if (lowLatency) 2.0 else 4.0) ||
+            (packetSendDelayMs ?: 0.0) >= (if (lowLatency) 50.0 else 80.0) ||
+            (availableSendBps != null && sendBitrateBps > 500_000L && availableSendBps < sendBitrateBps * 0.95) ||
+            (encodedFps != null && encodedFps in 1.0..(currentTarget.maxFps * 0.70))
+        val recoveryBandwidth = VideoAdaptationPolicy.recoveryBandwidthBps(adaptiveProfile, baseCaptureFps, adaptationLevel)
+        val healthy = !constrained &&
+            (rttMs ?: 999.0) < 80.0 &&
+            (jitterMs ?: 999.0) < 20.0 &&
+            (recentLossPercent ?: 999.0) < 1.0 &&
+            (packetSendDelayMs == null || packetSendDelayMs < 25.0) &&
+            (availableSendBps == null || availableSendBps >= recoveryBandwidth) &&
+            (encodedFps == null || encodedFps >= currentTarget.maxFps * 0.80)
+        constrainedVideoSamples = if (constrained) constrainedVideoSamples + 1 else 0
+        healthyVideoSamples = if (healthy) healthyVideoSamples + 1 else 0
+        when (VideoAdaptationPolicy.action(adaptiveProfile, adaptationLevel, constrainedVideoSamples, healthyVideoSamples, now - lastAdaptationMs)) {
+            VideoAdaptationAction.DEGRADE -> applyVideoAdaptation(adaptationLevel + 1, now, "latency pressure")
+            VideoAdaptationAction.RECOVER -> applyVideoAdaptation(adaptationLevel - 1, now, "sustained recovery")
+            VideoAdaptationAction.HOLD -> Unit
+        }
+    }
+
+    private fun applyVideoAdaptation(level: Int, now: Long, reason: String) {
+        val sender = videoSender ?: return
+        val targetLevel = level.coerceIn(0, VideoAdaptationPolicy.MAX_LEVEL)
+        val target = VideoAdaptationPolicy.target(adaptiveProfile, baseCaptureFps, targetLevel)
+        val parameters = sender.parameters
+        parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+        parameters.encodings.forEach { encoding ->
+            encoding.maxBitrateBps = target.maxBitrateBps
+            encoding.maxFramerate = target.maxFps
+            encoding.scaleResolutionDownBy = target.scaleResolutionDownBy
+        }
+        val parametersSet = sender.setParameters(parameters)
+        if (parametersSet) {
+            adaptationLevel = targetLevel
+            lastAdaptationMs = now
+            constrainedVideoSamples = 0
+            healthyVideoSamples = 0
+            updateDiagnostics { copy(videoAdaptationLevel = adaptationLevel) }
+        }
+        Log.w(
+            TAG,
+            "VIDEO_ADAPTATION: peer=$peerLabel profile=$adaptiveProfile level=$targetLevel maxBitrate=${target.maxBitrateBps} maxFps=${target.maxFps} scale=${target.scaleResolutionDownBy} reason=$reason parametersSet=$parametersSet sharedCaptureChanged=false"
+        )
     }
 
     private fun preferH264WithFallback() {
@@ -1013,7 +1095,8 @@ class WebRtcManager(private val context: Context) {
         lastAudioBytesSent = 0L; lastAudioBytesReceived = 0L; captureWindowStartMs = 0L; captureWindowFrames = 0
         gameAudioSendConfirmed = false; gameAudioReceiveConfirmed = false
         lastPacketsLost = 0L; lastVideoPacketsSent = 0L; lastVideoPacketsReceived = 0L; lastTotalPacketSendDelaySeconds = 0.0
-        peerLabel = "unassigned"; adaptiveProfile = "Auto"; baseCaptureFps = 60
+        peerLabel = "unassigned"; adaptiveProfile = "Auto"; baseCaptureFps = 60; adaptationLevel = 0
+        constrainedVideoSamples = 0; healthyVideoSamples = 0; lastAdaptationMs = 0L
         axisSendLogCounter = 0; axisReceiveLogCounter = 0
         controlPacketsSent = 0L; controlPacketsReceived = 0L; lastControlSentMs = 0L; lastControlReceivedMs = 0L
         droppedAnalogPackets = 0L

@@ -112,6 +112,65 @@ object VideoStatsPolicy {
     }
 }
 
+data class VideoAdaptationTarget(
+    val maxBitrateBps: Int,
+    val maxFps: Int,
+    val scaleResolutionDownBy: Double
+)
+
+enum class VideoAdaptationAction { HOLD, DEGRADE, RECOVER }
+
+object VideoAdaptationPolicy {
+    const val MAX_LEVEL = 3
+
+    fun manages(profile: String) = profile == "Auto" || profile == "Low Latency"
+
+    fun target(profile: String, baseFps: Int, level: Int): VideoAdaptationTarget {
+        val safeLevel = level.coerceIn(0, MAX_LEVEL)
+        val lowLatency = profile == "Low Latency"
+        val maxBitrate = when (safeLevel) {
+            0 -> if (lowLatency) 3_500_000 else 8_000_000
+            1 -> 2_500_000
+            2 -> 1_500_000
+            else -> 800_000
+        }
+        val maxFps = when (safeLevel) {
+            0, 1 -> baseFps
+            2 -> minOf(baseFps, 45)
+            else -> minOf(baseFps, 30)
+        }
+        val scale = when (safeLevel) {
+            0, 1 -> 1.0
+            2 -> 4.0 / 3.0
+            else -> 2.0
+        }
+        return VideoAdaptationTarget(maxBitrate, maxFps, scale)
+    }
+
+    fun action(
+        profile: String,
+        level: Int,
+        constrainedSamples: Int,
+        healthySamples: Int,
+        millisecondsSinceChange: Long
+    ): VideoAdaptationAction {
+        if (!manages(profile)) return VideoAdaptationAction.HOLD
+        val degradeSamples = if (profile == "Low Latency") 1 else 2
+        val degradeIntervalMs = if (profile == "Low Latency") 5_000L else 10_000L
+        return when {
+            level < MAX_LEVEL && constrainedSamples >= degradeSamples && millisecondsSinceChange >= degradeIntervalMs -> VideoAdaptationAction.DEGRADE
+            level > 0 && healthySamples >= 3 && millisecondsSinceChange >= 15_000L -> VideoAdaptationAction.RECOVER
+            else -> VideoAdaptationAction.HOLD
+        }
+    }
+
+    fun recoveryBandwidthBps(profile: String, baseFps: Int, currentLevel: Int): Double {
+        if (currentLevel <= 0) return 0.0
+        val nextTarget = target(profile, baseFps, currentLevel - 1)
+        return minOf(nextTarget.maxBitrateBps * 1.15, 3_000_000.0)
+    }
+}
+
 object StreamingLatencyPolicy {
     const val RECEIVE_PLAYOUT_MAX_MS = 60
     const val RECEIVE_MIN_DECODE_PACING_MS = 4
