@@ -118,11 +118,11 @@
     .then((releases) => {
       state.releases = releases.filter((release) => !release.draft)
         .sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
-      const stable = state.releases.find((release) => !release.prerelease && apkFor(release));
+      const latest = state.releases.find((release) => apkFor(release));
       const beta = state.releases.find((release) => release.prerelease && apkFor(release));
-      if (!stable) return failGracefully('No stable GitHub release with an APK is currently available.');
-      setLatest(stable);
-      if (beta) {
+      if (!latest) return failGracefully('No GitHub release with an APK is currently available.');
+      setLatest(latest);
+      if (beta && beta !== latest) {
         const box = $('beta-release');
         box.hidden = false;
         box.replaceChildren(el('strong', '', 'Beta / Experimental: '), link(beta.name || beta.tag_name, beta.html_url), document.createTextNode(' — clearly marked for testing.'));
