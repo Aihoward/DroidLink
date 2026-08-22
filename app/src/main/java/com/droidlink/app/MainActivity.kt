@@ -677,7 +677,13 @@ class MainActivity : ComponentActivity() {
                         setZOrderMediaOverlay(false); setZOrderOnTop(false)
                         init(clientRtc.eglContext(), object : RendererCommon.RendererEvents {
                             override fun onFirstFrameRendered() { Log.d(TAG, "FIRST REMOTE FRAME RENDERED"); runOnUiThread { clientStatus = "Connected - video playing" } }
-                            override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) { Log.d(TAG, "Remote video frame size: ${width}x$height rotation=$rotation") }
+                            override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) {
+                                Log.d(TAG, "Remote video frame size: ${width}x$height rotation=$rotation")
+                                runOnUiThread {
+                                    val rendered = "${width}×${height}"
+                                    betaDiagnostics = betaDiagnostics.copy(resolution = rendered, renderedResolution = rendered)
+                                }
+                            }
                         })
                         setEnableHardwareScaler(true); disableFpsReduction(); setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT); setMirror(false)
                         renderer = this
@@ -713,7 +719,8 @@ class MainActivity : ComponentActivity() {
                 ReadinessLine("CONTROLLER", if (controllerReady) "READY" else if (host && controllerBackend.status != ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) "UNAVAILABLE" else "CHECKING", controllerReady)
                 ReadinessLine("CONNECTION", connectionQuality(), betaDiagnostics.connectionState.contains("CONNECTED", true))
                 ReadinessLine("PING", betaDiagnostics.rttMs?.let { "${it.toInt()} ms" } ?: "CHECKING", betaDiagnostics.rttMs != null)
-                ReadinessLine("PACKET LOSS", betaDiagnostics.packetLoss.toString(), betaDiagnostics.packetLoss < 10)
+                val recentLoss = betaDiagnostics.recentPacketLossPercent
+                ReadinessLine("PACKET LOSS", recentLoss?.let { "%.2f%%".format(it) } ?: "CHECKING", recentLoss == null || recentLoss < 3.0)
                 if (!controllerReady) Text(if (host) friendlyControllerStatus() else "Connect or move the Player ${remoteSlotAssignment?.playerSlot ?: 2} controller to verify input.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 if (!audioReady && !audioStatus.contains("waiting", true)) Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 NeonButton("START PLAYING") { readinessVisible = false }
@@ -800,6 +807,9 @@ class MainActivity : ComponentActivity() {
                 diagnosticLine("Resolution", d.resolution)
                 val fps = d.renderFps ?: d.receiveFps ?: d.captureFps ?: d.encodeFps
                 diagnosticLine("FPS", fps?.let { "%.1f".format(it) } ?: "—")
+                diagnosticLine("Bitrate", d.videoBitrateBps?.let { "%.2f Mbps".format(it / 1_000_000.0) } ?: "—")
+                diagnosticLine("Packet loss", d.recentPacketLossPercent?.let { "%.2f%%".format(it) } ?: "—")
+                diagnosticLine("Bottleneck", d.videoBottleneck)
             }
             if (showBack) NeonTextButton("RETURN TO GAME") { sessionStatsOpen = false; sessionMenuOpen = false }
         }
@@ -1136,10 +1146,11 @@ class MainActivity : ComponentActivity() {
         if (!d.connectionState.contains("CONNECTED", true)) return "OFFLINE"
         val rtt = d.rttMs ?: 0.0
         val jitter = d.jitterMs ?: 0.0
+        val recentLoss = d.recentPacketLossPercent ?: 0.0
         return when {
-            rtt >= 220 || jitter >= 55 || d.packetLoss >= 20 -> "POOR"
-            rtt >= 140 || jitter >= 35 || d.packetLoss >= 10 -> "FAIR"
-            rtt >= 75 || jitter >= 20 || d.packetLoss >= 3 -> "GOOD"
+            rtt >= 220 || jitter >= 55 || recentLoss >= 8.0 -> "POOR"
+            rtt >= 140 || jitter >= 35 || recentLoss >= 3.0 -> "FAIR"
+            rtt >= 75 || jitter >= 20 || recentLoss >= 1.0 -> "GOOD"
             else -> "EXCELLENT"
         }
     }
