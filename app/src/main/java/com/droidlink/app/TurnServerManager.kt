@@ -11,17 +11,19 @@ object TurnServerManager {
 
     private const val MAX_RESPONSE_BYTES = 64 * 1024
     private const val MAX_ICE_SERVERS = 12
+    private const val MAX_ATTEMPTS = 3
 
     private const val WORKER_URL =
-        "https://droidlink-turnn.camperkins30.workers.dev/"
+        "https://droidlink-turrn.camperkins30.workers.dev/"
 
     fun fetchIceServers(
         onResult: (Result<List<PeerConnection.IceServer>>) -> Unit
     ) {
 
         Thread {
-
-            try {
+            var lastError: Exception? = null
+            repeat(MAX_ATTEMPTS) { attempt ->
+                try {
 
                 Log.d(
                     "DroidLink",
@@ -164,30 +166,18 @@ object TurnServerManager {
                     "TURN READY: ${servers.size} ICE server entries"
                 )
 
-                onResult(
-                    Result.success(
-                        servers
-                    )
-                )
-
-                connection.disconnect()
-
-            } catch (
-                error: Exception
-            ) {
-
-                Log.e(
-                    "DroidLink",
-                    "TURN ERROR",
-                    error
-                )
-
-                onResult(
-                    Result.failure(
-                        error
-                    )
-                )
+                    onResult(Result.success(servers))
+                    connection.disconnect()
+                    return@Thread
+                } catch (error: Exception) {
+                    lastError = error
+                    Log.w("DroidLink", "TURN attempt ${attempt + 1}/$MAX_ATTEMPTS failed", error)
+                    if (attempt + 1 < MAX_ATTEMPTS) Thread.sleep(500L shl attempt)
+                }
             }
+            val failure = lastError ?: IOException("TURN credential request failed")
+            Log.e("DroidLink", "TURN ERROR after $MAX_ATTEMPTS attempts", failure)
+            onResult(Result.failure(failure))
         }.start()
     }
 }

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Firebase Android API keys identify a project; authorization is enforced by RTDB rules. -->
+    <string name="google_app_id" translatable="false">1:457714375877:android:037c3ec22169338913e4ac</string>
+    <string name="gcm_defaultSenderId" translatable="false">457714375877</string>
+    <string name="project_id" translatable="false">droidlink-4142e</string>
+    <string name="google_api_key" translatable="false">AIzaSyAzzmysfaVBrzKl4sm26IVjQH5pofQKhiw</string>
+    <string name="google_storage_bucket" translatable="false">droidlink-4142e.firebasestorage.app</string>
+    <string name="firebase_database_url" translatable="false">https://droidlink-4142e-default-rtdb.firebaseio.com</string>
+</resources>

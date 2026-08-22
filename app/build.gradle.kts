@@ -1,7 +1,6 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
-    id("com.google.gms.google-services")
 }
 
 android {
@@ -14,15 +13,29 @@ android {
         applicationId = "com.droidlink.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 38
-        versionName = "3.5.1-test"
+        versionCode = 39
+        versionName = "3.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild { ndkBuild { arguments += "NDK_APPLICATION_MK:=src/main/jni/Application.mk" } }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystorePath = providers.environmentVariable("DROIDLINK_KEYSTORE_PATH").orNull
+            val keystorePassword = providers.environmentVariable("DROIDLINK_KEYSTORE_PASSWORD").orNull
+            if (!keystorePath.isNullOrBlank() && !keystorePassword.isNullOrBlank()) {
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                keyAlias = "droidlink"
+                keyPassword = keystorePassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             optimization {
                 enable = false
             }

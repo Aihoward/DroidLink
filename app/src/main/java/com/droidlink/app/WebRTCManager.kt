@@ -181,7 +181,11 @@ class WebRtcManager(private val context: Context) {
             if (closed) return@fetchIceServers
             val servers = result.getOrElse { error ->
                 Log.e(TAG, "TURN request failure; using STUN fallback", error)
-                listOf(PeerConnection.IceServer.builder("stun:stun.cloudflare.com:3478").createIceServer())
+                listOf(
+                    PeerConnection.IceServer.builder("stun:stun.cloudflare.com:3478").createIceServer(),
+                    PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+                    PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
+                )
             }
             if (result.isSuccess) Log.d(TAG, "TURN request success")
             Log.d(TAG, "ICE servers loaded: ${servers.size}")
