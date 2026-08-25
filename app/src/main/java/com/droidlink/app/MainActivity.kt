@@ -1,6 +1,7 @@
 package com.droidlink.app
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.*
 import android.media.projection.MediaProjectionManager
@@ -2289,6 +2290,7 @@ class MainActivity : ComponentActivity() {
         renderer?.let { releaseRenderer(it, "session detach") }
     }
 
+    @SuppressLint("RestrictedApi") // Activity-level controller interception intentionally delegates unhandled events.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (clientControlActive && isControllerEvent(event.source, event.device)) {
             val down = event.action == KeyEvent.ACTION_DOWN
