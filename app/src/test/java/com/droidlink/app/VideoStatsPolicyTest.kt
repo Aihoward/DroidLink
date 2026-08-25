@@ -81,4 +81,30 @@ class VideoStatsPolicyTest {
         )
         assertEquals(VideoPressure.HEALTHY, pressure)
     }
+
+    @Test fun lowLatencyFallbackNeverDropsTo360pScale() {
+        val finalTarget = VideoQualityPolicy.lowLatencyTarget(60, 3)
+        assertEquals(1.5, finalTarget.scaleResolutionDownBy, 0.001)
+        assertEquals(1_500_000, finalTarget.maxBitrateBps)
+        assertEquals(30, finalTarget.maxFps)
+    }
+
+    @Test fun lowLatencyRequiresThreeSustainedPressureSamples() {
+        assertEquals(VideoAdaptationAction.HOLD, VideoQualityPolicy.lowLatencyAction(0, 2, 0, 20_000L))
+        assertEquals(VideoAdaptationAction.DEGRADE, VideoQualityPolicy.lowLatencyAction(0, 3, 0, 20_000L))
+    }
+
+    @Test fun lowLatencyRecoveryRetainsHysteresis() {
+        assertEquals(VideoAdaptationAction.HOLD, VideoQualityPolicy.lowLatencyAction(2, 0, 8, 60_000L))
+        assertEquals(VideoAdaptationAction.RECOVER, VideoQualityPolicy.lowLatencyAction(2, 0, 9, 60_000L))
+    }
+
+    @Test fun removedHighQualityPreferenceMigratesToAuto() {
+        assertEquals("Auto", StreamingPresetPolicy.normalize("High Quality"))
+        assertEquals("Auto", StreamingPresetPolicy.normalize(null))
+    }
+
+    @Test fun supportedStreamingPreferencesRemainUnchanged() {
+        StreamingPresetPolicy.supported.forEach { assertEquals(it, StreamingPresetPolicy.normalize(it)) }
+    }
 }

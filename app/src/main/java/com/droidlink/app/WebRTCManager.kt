@@ -37,6 +37,7 @@ class WebRtcManager(private val context: Context) {
     var onDiagnostics: ((BetaDiagnostics) -> Unit)? = null
     var onAudioStatus: ((String) -> Unit)? = null
     var onDataChannelStateChanged: ((String, DataChannel.State) -> Unit)? = null
+    var onIceGatheringStateChanged: ((PeerConnection.IceGatheringState) -> Unit)? = null
 
     private val lock = Any()
     private val eglBase = EglBase.create()
@@ -123,6 +124,8 @@ class WebRtcManager(private val context: Context) {
     private var remoteDescriptionSet = false
     private val pendingCandidates = mutableListOf<IceCandidate>()
     @Volatile private var closed = false
+    @Volatile private var iceRestartInProgress = false
+    private var relayCandidatesGathered = 0
 
     fun initialize() {
         synchronized(lock) {
@@ -238,12 +241,16 @@ class WebRtcManager(private val context: Context) {
     private fun observer() = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate?) {
             candidate ?: return
-            Log.d(TAG, "ICE candidate generated: mid=${candidate.sdpMid} mLine=${candidate.sdpMLineIndex} type=${candidateType(candidate.sdp)}")
+            val type = candidateType(candidate.sdp)
+            if (type == "relay") relayCandidatesGathered++
+            updateDiagnostics { copy(relayCandidatesGathered = relayCandidatesGathered) }
+            Log.d(TAG, "ICE candidate generated: mid=${candidate.sdpMid} mLine=${candidate.sdpMLineIndex} type=$type relayCount=$relayCandidatesGathered")
             onIceCandidateReady?.invoke(candidate)
         }
         override fun onIceCandidateError(event: IceCandidateErrorEvent?) {
             event ?: return
-            Log.e(TAG, "ICE CANDIDATE ERROR: url=${event.url} address=${event.address}:${event.port} code=${event.errorCode} text=${event.errorText}")
+            val serverType = if (event.url.startsWith("turn", ignoreCase = true)) "relay" else "stun"
+            Log.e(TAG, "ICE_CANDIDATE_ERROR: serverType=$serverType code=${event.errorCode}")
         }
         override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent?) {
             event ?: return
@@ -257,7 +264,10 @@ class WebRtcManager(private val context: Context) {
             Log.d(TAG, "ICE connection state: $state")
             state?.let { updateDiagnostics { copy(iceState = it.name) } }
         }
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) { Log.d(TAG, "ICE gathering state: $state") }
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+            Log.d(TAG, "ICE gathering state: $state relayCandidates=$relayCandidatesGathered")
+            state?.let { onIceGatheringStateChanged?.invoke(it) }
+        }
         override fun onSignalingChange(state: PeerConnection.SignalingState?) { Log.d(TAG, "Signaling state: $state") }
         override fun onDataChannel(channel: DataChannel?) { registerDataChannel(channel, "remote") }
         override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
@@ -514,7 +524,6 @@ class WebRtcManager(private val context: Context) {
             observedJitterBufferMinMs = minOf(observedJitterBufferMinMs ?: it, it)
             observedJitterBufferMaxMs = maxOf(observedJitterBufferMaxMs ?: it, it)
         }
-        val recentPacketsLost = (packetsLost - lastPacketsLost).coerceAtLeast(0L)
         val currentVideoPackets = if (hasInboundVideo) packetsReceived else packetsSent
         val recentPacketLossPercent = if (lastStatsTimestampMs == 0L) null else VideoStatsPolicy.intervalPacketLossPercent(
             packetsLost,
@@ -591,7 +600,7 @@ class WebRtcManager(private val context: Context) {
         if (codec != "unknown") Log.d(TAG, "SELECTED VIDEO CODEC: $codec encoder=${encoderImplementation ?: "unknown"} decoder=${decoderImplementation ?: "unknown"}")
         Log.d(TAG, "VIDEO_ENCODER_IMPLEMENTATION: ${encoderImplementation ?: "unknown"} type=${codecImplementationType(encoderImplementation)}")
         Log.d(TAG, "VIDEO_DECODER_IMPLEMENTATION: ${decoderImplementation ?: "unknown"} type=${codecImplementationType(decoderImplementation)}")
-        if (hasOutboundVideo) adaptVideoIfNeeded(now, encodedFps, encodeTimeMs, qualityLimitationReason, rttMs, jitterMs, recentPacketsLost, recentPacketLossPercent, availableSendBps, sendBitrate ?: 0L, encoderPressure)
+        if (hasOutboundVideo) adaptVideoIfNeeded(now, encodedFps, encodeTimeMs, qualityLimitationReason, rttMs, jitterMs, recentLossPercent = recentPacketLossPercent, availableSendBps = availableSendBps)
         val bitrate = if (hasInboundVideo) receiveBitrate else sendBitrate
         val encodedResolution = if (encodedWidth != null && encodedHeight != null) "${encodedWidth}×${encodedHeight}" else null
         val decodedResolution = if (decodedWidth != null && decodedHeight != null) "${decodedWidth}×${decodedHeight}" else null
@@ -731,6 +740,25 @@ class WebRtcManager(private val context: Context) {
     fun createOffer(onReady: (String) -> Unit, onError: (String) -> Unit) = createDescription(true, onReady, onError)
     fun createAnswer(onReady: (String) -> Unit, onError: (String) -> Unit) = createDescription(false, onReady, onError)
 
+    fun hasPeerConnection(): Boolean = peer != null && !closed
+
+    fun restartIceAndCreateOffer(onReady: (String) -> Unit, onError: (String) -> Unit) {
+        val current = peer ?: return onError("PeerConnection has not been created")
+        synchronized(lock) {
+            if (iceRestartInProgress) return onError("ICE restart is already in progress")
+            iceRestartInProgress = true
+        }
+        Log.w(TAG, "ICE_RESTART_STARTED: signalingState=${current.signalingState()} connectionState=${current.connectionState()}")
+        current.restartIce()
+        createDescription(true, { offer ->
+            iceRestartInProgress = false
+            onReady(offer)
+        }, { error ->
+            iceRestartInProgress = false
+            onError(error)
+        })
+    }
+
     private fun createDescription(isOffer: Boolean, onReady: (String) -> Unit, onError: (String) -> Unit) {
         val current = peer ?: return onError("PeerConnection has not been created")
         val sdpObserver = object : SimpleSdpObserver() {
@@ -756,7 +784,8 @@ class WebRtcManager(private val context: Context) {
     private fun setRemote(type: SessionDescription.Type, sdp: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
         if (!SessionSecurityPolicy.validSdp(sdp)) return onError("Remote description failed validation")
         val current = peer ?: return onError("PeerConnection has not been created")
-        if (remoteDescriptionSet) { Log.w(TAG, "Duplicate remote description ignored: $type"); onSuccess(); return }
+        val prior = current.remoteDescription
+        if (prior?.type == type && prior.description == sdp) { Log.d(TAG, "Identical remote description ignored: $type"); onSuccess(); return }
         current.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
                 val queued = synchronized(lock) { remoteDescriptionSet = true; pendingCandidates.toList().also { pendingCandidates.clear() } }
@@ -932,7 +961,7 @@ class WebRtcManager(private val context: Context) {
 
     private fun configureVideoSender(sender: RtpSender, profile: String, fps: Int) {
         val lowLatency = profile == "Low Latency"
-        val startBitrate = when (profile) { "Low Latency" -> 2_500_000; "High Quality" -> 8_000_000; else -> 6_000_000 }
+        val startBitrate = if (lowLatency) 2_500_000 else 6_000_000
         val maxBitrate = if (lowLatency) 3_500_000 else 12_000_000
         val degradationPreference = if (lowLatency) {
             RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
@@ -971,11 +1000,8 @@ class WebRtcManager(private val context: Context) {
         qualityLimitationReason: String?,
         rttMs: Double?,
         jitterMs: Double?,
-        recentLoss: Long,
         recentLossPercent: Double?,
-        availableSendBps: Double?,
-        sendBitrate: Long,
-        encoderIntervalPressure: Int
+        availableSendBps: Double?
     ) {
         if (adaptiveProfile == "Auto") {
             val target = VideoQualityPolicy.autoTarget(baseCaptureFps, adaptationLevel)
@@ -1003,15 +1029,26 @@ class WebRtcManager(private val context: Context) {
             return
         }
         if (adaptiveProfile != "Low Latency") return
-        val since = now - lastAdaptationMs
-        val constrained = (rttMs ?: 0.0) >= 120.0 || (jitterMs ?: 0.0) >= 25.0 || recentLoss >= 3L ||
-            (availableSendBps != null && sendBitrate > 500_000L && availableSendBps < sendBitrate * 1.05) ||
-            (encodedFps != null && encodedFps in 1.0..42.0) || encoderIntervalPressure >= 3
-        val healthy = (rttMs ?: 999.0) < 80.0 && (jitterMs ?: 999.0) < 20.0 && recentLoss <= 1L &&
-            (availableSendBps == null || availableSendBps > 3_000_000.0) && (encodedFps == null || encodedFps >= 50.0) && encoderIntervalPressure == 0
-        when {
-            constrained && adaptationLevel < 3 && since >= 5_000L -> applyVideoAdaptation(adaptationLevel + 1, now, "low-latency freshness pressure interval=$encoderIntervalPressure")
-            healthy && adaptationLevel > 0 && since >= 45_000L -> applyVideoAdaptation(adaptationLevel - 1, now, "sustained recovery")
+        val target = VideoQualityPolicy.lowLatencyTarget(baseCaptureFps, adaptationLevel)
+        val pressure = VideoQualityPolicy.senderPressure(
+            target = target,
+            encodedFps = encodedFps,
+            captureFps = diagnostics.captureFps,
+            averageEncodeTimeMs = averageEncodeTimeMs,
+            qualityLimitationReason = qualityLimitationReason,
+            rttMs = rttMs,
+            jitterMs = jitterMs,
+            recentLossPercent = recentLossPercent,
+            availableSendBps = availableSendBps
+        )
+        constrainedVideoSamples = if (pressure == VideoPressure.ENCODER || pressure == VideoPressure.BANDWIDTH || pressure == VideoPressure.SEVERE) constrainedVideoSamples + 1 else 0
+        healthyVideoSamples = if (pressure == VideoPressure.HEALTHY) healthyVideoSamples + 1 else 0
+        val action = VideoQualityPolicy.lowLatencyAction(adaptationLevel, constrainedVideoSamples, healthyVideoSamples, now - lastAdaptationMs)
+        Log.d(TAG, "VIDEO_ADAPTATION_EVIDENCE: profile=LowLatency level=$adaptationLevel pressure=$pressure constrainedSamples=$constrainedVideoSamples healthySamples=$healthyVideoSamples action=$action qualityLimit=${qualityLimitationReason ?: "unavailable"} rawCaptureEncodeGapIgnored=true")
+        when (action) {
+            VideoAdaptationAction.DEGRADE -> applyVideoAdaptation(adaptationLevel + 1, now, "sustained ${pressure.name.lowercase()} pressure")
+            VideoAdaptationAction.RECOVER -> applyVideoAdaptation(adaptationLevel - 1, now, "45 seconds of healthy measurements")
+            VideoAdaptationAction.HOLD -> Unit
         }
     }
 
@@ -1032,14 +1069,25 @@ class WebRtcManager(private val context: Context) {
         }
         val parameters = sender.parameters
         parameters.degradationPreference = degradationPreference
+        // When this manager owns the source, adapt before encoding so obsolete frames are
+        // discarded by WebRTC's VideoSource adapter instead of reaching MediaCodec. Managers
+        // that attach shared host media do not own the source and retain the sender-side scale.
+        val adaptBeforeEncoder = screenSource != null
         parameters.encodings.forEach {
             it.maxBitrateBps = target.maxBitrateBps
             it.maxFramerate = target.maxFps
-            it.scaleResolutionDownBy = target.scaleResolutionDownBy
+            it.scaleResolutionDownBy = if (adaptBeforeEncoder) 1.0 else target.scaleResolutionDownBy
         }
         val set = sender.setParameters(parameters)
         val width = ((baseCaptureWidth / target.scaleResolutionDownBy).toInt() / 2 * 2).coerceAtLeast(320)
         val height = ((baseCaptureHeight / target.scaleResolutionDownBy).toInt() / 2 * 2).coerceAtLeast(240)
+        if (adaptBeforeEncoder) {
+            // adaptOutputFormat is non-buffering: it rate-limits and scales the capture stream
+            // before the encoder, preserving the newest eligible frame under overload. Avoid
+            // changeCaptureFormat here because resizing MediaProjection's VirtualDisplay can
+            // briefly interrupt an otherwise healthy session.
+            screenSource?.adaptOutputFormat(width, height, target.maxFps)
+        }
         configuredVideoMaxBitrateBps = target.maxBitrateBps
         degradationPreferenceName = degradationPreference.name
         videoAdaptationReason = reason
@@ -1048,10 +1096,12 @@ class WebRtcManager(private val context: Context) {
                 videoAdaptationLevel = adaptationLevel,
                 targetVideoBitrateBps = target.maxBitrateBps.toLong(),
                 videoAdaptationReason = reason,
-                degradationPreference = degradationPreferenceName
+                degradationPreference = degradationPreferenceName,
+                captureResolution = if (adaptBeforeEncoder) "${width}×${height}" else captureResolution,
+                requestedCaptureFps = if (adaptBeforeEncoder) target.maxFps else requestedCaptureFps
             )
         }
-        Log.w(TAG, "VIDEO_ADAPTATION: profile=$adaptiveProfile level=$adaptationLevel senderTarget=${width}x$height@${target.maxFps} sourcePreserved=${baseCaptureWidth}x${baseCaptureHeight} maxBitrate=${target.maxBitrateBps} scale=${target.scaleResolutionDownBy} degradation=$degradationPreferenceName reason=$reason parametersSet=$set")
+        Log.w(TAG, "VIDEO_ADAPTATION: profile=$adaptiveProfile level=$adaptationLevel target=${width}x$height@${target.maxFps} preEncoder=$adaptBeforeEncoder maxBitrate=${target.maxBitrateBps} senderScale=${if (adaptBeforeEncoder) 1.0 else target.scaleResolutionDownBy} degradation=$degradationPreferenceName reason=$reason parametersSet=$set staleFramePolicy=drop_before_encode")
     }
 
     private fun resetVideoAdaptationEvidence() {
@@ -1097,6 +1147,7 @@ class WebRtcManager(private val context: Context) {
         onDiagnostics = null
         onAudioStatus = null
         onDataChannelStateChanged = null
+        onIceGatheringStateChanged = null
         statsHandler?.removeCallbacksAndMessages(null)
         statsThread?.quitSafely()
         statsHandler = null
@@ -1118,6 +1169,8 @@ class WebRtcManager(private val context: Context) {
             pendingCandidates.clear()
             pendingLatestAnalogMessage = null
             remoteDescriptionSet = false
+            iceRestartInProgress = false
+            relayCandidatesGathered = 0
         }
         diagnostics = BetaDiagnostics()
         Log.d(TAG, "PeerConnection cleanup complete; local capture retained=${screenTrack != null}")
@@ -1134,6 +1187,7 @@ class WebRtcManager(private val context: Context) {
         onDiagnostics = null
         onAudioStatus = null
         onDataChannelStateChanged = null
+        onIceGatheringStateChanged = null
         statsHandler?.removeCallbacksAndMessages(null)
         statsThread?.quitSafely()
         statsHandler = null; statsThread = null
@@ -1154,7 +1208,13 @@ class WebRtcManager(private val context: Context) {
         remoteVideoTrack = null; remoteGameAudioTrack = null; localAudioTrack = null; localAudioSource = null
         audioDeviceModule = null; dataChannel = null; axisDataChannel = null; peer = null; factory = null; ownsFactory = true
         ownsControllerChannels = false; lastChannelRecoveryMs = 0L; controlSendFailures = 0L; axisSendFailures = 0L
-        synchronized(lock) { pendingCandidates.clear(); remoteDescriptionSet = false }
+        synchronized(lock) {
+            pendingCandidates.clear()
+            pendingLatestAnalogMessage = null
+            remoteDescriptionSet = false
+            iceRestartInProgress = false
+            relayCandidatesGathered = 0
+        }
         diagnostics = BetaDiagnostics()
         lastStatsTimestampMs = 0L; lastBytesSent = 0L; lastBytesReceived = 0L; lastFramesDecoded = 0L; lastFramesEncoded = 0L
         lastFramesCaptured = 0L; lastFramesReceived = 0L; lastFramesRendered = 0L; stagnantDecodeIntervals = 0
@@ -1170,7 +1230,6 @@ class WebRtcManager(private val context: Context) {
         controlPacketsSent = 0L; controlPacketsReceived = 0L; lastControlSentMs = 0L; lastControlReceivedMs = 0L
         droppedAnalogPackets = 0L
         controlBufferedBytes = 0L; digitalQueueDepth = 0; analogQueueDepth = 0; lastBufferedAmountLogMs = 0L
-        synchronized(lock) { pendingLatestAnalogMessage = null }
     }
 
     fun release() { close(); try { eglBase.release() } catch (_: Exception) {} }

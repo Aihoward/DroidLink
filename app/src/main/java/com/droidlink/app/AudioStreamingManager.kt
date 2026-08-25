@@ -1,10 +1,13 @@
 package com.droidlink.app
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.*
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import org.webrtc.audio.JavaAudioDeviceModule
 
 class AudioStreamingManager(private val context: Context) {
@@ -101,6 +104,9 @@ class AudioStreamingManager(private val context: Context) {
 
     fun start(mediaProjection: MediaProjection): Result<Unit> = runCatching {
         check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { "AudioPlaybackCapture requires Android 10+" }
+        check(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            "Audio playback capture permission is unavailable"
+        }
         stop()
         onStatus?.invoke("GAME_AUDIO_CAPTURE_STARTING")
         Log.d(TAG, "AUDIO_CAPTURE_PERMISSION_READY")

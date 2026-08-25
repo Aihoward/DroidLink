@@ -81,7 +81,15 @@ data class BetaDiagnostics(
     val duplicateControlPacketsDropped: Long = 0L,
     val outOfOrderControlPacketsDropped: Long = 0L,
     val player2Status: String = "Not active",
-    val player2Classification: String = "Unknown"
+    val player2Classification: String = "Unknown",
+    val localPhysicalControllerStatus: String = "Not detected",
+    val remoteControllerTransportStatus: String = "Not connected",
+    val hostVirtualControllerStatus: String = "Not evaluated"
+    ,val activeNetworkTransport: String = "Unknown"
+    ,val internetValidated: Boolean? = null
+    ,val networkRecoveryStatus: String = "Not needed"
+    ,val iceRestartAttempts: Int = 0
+    ,val relayCandidatesGathered: Int = 0
 )
 
 object VideoStatsPolicy {
@@ -154,9 +162,9 @@ object VideoQualityPolicy {
 
     fun lowLatencyTarget(baseFps: Int, level: Int): VideoAdaptationTarget = when (level.coerceIn(0, 3)) {
         0 -> VideoAdaptationTarget(3_500_000, baseFps, 1.0, 3_000_000.0)
-        1 -> VideoAdaptationTarget(2_500_000, baseFps, 1.0, 2_000_000.0)
-        2 -> VideoAdaptationTarget(1_500_000, minOf(baseFps, 45), 4.0 / 3.0, 1_200_000.0)
-        else -> VideoAdaptationTarget(800_000, minOf(baseFps, 30), 2.0, 650_000.0)
+        1 -> VideoAdaptationTarget(2_750_000, minOf(baseFps, 45), 1.0, 2_250_000.0)
+        2 -> VideoAdaptationTarget(2_000_000, minOf(baseFps, 40), 4.0 / 3.0, 1_600_000.0)
+        else -> VideoAdaptationTarget(1_500_000, minOf(baseFps, 30), 1.5, 1_100_000.0)
     }
 
     fun senderPressure(
@@ -208,6 +216,17 @@ object VideoQualityPolicy {
         level > 0 && healthySamples >= 9 && millisecondsSinceChange >= 45_000L -> VideoAdaptationAction.RECOVER
         else -> VideoAdaptationAction.HOLD
     }
+
+    fun lowLatencyAction(
+        level: Int,
+        constrainedSamples: Int,
+        healthySamples: Int,
+        millisecondsSinceChange: Long
+    ): VideoAdaptationAction = when {
+        level < 3 && constrainedSamples >= 3 && millisecondsSinceChange >= 15_000L -> VideoAdaptationAction.DEGRADE
+        level > 0 && healthySamples >= 9 && millisecondsSinceChange >= 45_000L -> VideoAdaptationAction.RECOVER
+        else -> VideoAdaptationAction.HOLD
+    }
 }
 
 object StreamingLatencyPolicy {
@@ -217,6 +236,12 @@ object StreamingLatencyPolicy {
     const val RECEIVE_FIELD_TRIALS =
         "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:60/" +
             "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:1/"
+}
+
+object StreamingPresetPolicy {
+    val supported = listOf("Auto", "Low Latency", "Balanced")
+
+    fun normalize(saved: String?): String = saved?.takeIf(supported::contains) ?: "Auto"
 }
 
 object ControllerTransportPolicy {

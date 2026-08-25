@@ -94,10 +94,14 @@ class MainActivity : ComponentActivity() {
     private val hostPeerStates = java.util.concurrent.ConcurrentHashMap<Int, PeerConnection.PeerConnectionState>()
     private val hostDiagnosticsBySlot = java.util.concurrent.ConcurrentHashMap<Int, BetaDiagnostics>()
     private val hostDisconnectGraceRunnables = mutableMapOf<Int, Runnable>()
+    private val hostIceRestartRunnables = mutableMapOf<Int, Runnable>()
+    private val hostIceRestartAttempts = mutableMapOf<Int, Int>()
+    private val hostLastIceRestartMs = mutableMapOf<Int, Long>()
     private val remoteInputSessions = java.util.concurrent.ConcurrentHashMap<Int, RemoteInputSession>()
     private val controllerBackends = java.util.concurrent.ConcurrentHashMap<Int, ControllerBackend>()
     private lateinit var menuMusicController: MenuMusicController
     private lateinit var profileStore: LocalProfileStore
+    private lateinit var networkMonitor: NetworkStateMonitor
     private var controllerBackend: ControllerBackend = TransportOnlyBackend()
 
     private var mode by mutableStateOf("menu")
@@ -138,6 +142,9 @@ class MainActivity : ComponentActivity() {
     private var readinessVisible by mutableStateOf(false)
     private var readinessShownForSession = false
     private var controlChannelOpen by mutableStateOf(false)
+    private var activeNetworkState by mutableStateOf(DroidLinkNetworkState(false, false, "NONE"))
+    private var localPhysicalControllerAvailable by mutableStateOf(false)
+    private var localPhysicalControllerSummary by mutableStateOf("Not detected")
     private var gameAudioEnabled by mutableStateOf(true)
     private var gameAudioVolume by mutableFloatStateOf(1f)
     private var controllerInputTestOpen by mutableStateOf(false)
@@ -175,7 +182,8 @@ class MainActivity : ComponentActivity() {
     private var remoteTrack by mutableStateOf<VideoTrack?>(null)
     private var renderer: SurfaceViewRenderer? = null
     private var rendererTrack: VideoTrack? = null
-    private val releasedRenderers = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<SurfaceViewRenderer, Boolean>())
+    // Weak keys retain the double-release guard without retaining every renderer from prior sessions.
+    private val releasedRenderers = java.util.Collections.newSetFromMap(java.util.WeakHashMap<SurfaceViewRenderer, Boolean>())
     private var pendingCaptureIntent: Intent? = null
     private var pendingOffer: (() -> Unit)? = null
     private var receiverRegistered = false
@@ -187,6 +195,7 @@ class MainActivity : ComponentActivity() {
     private var digitalSequence = 0L
     private var analogSequence = 0L
     private var lastControllerDeviceId = -1
+    private val localControllerDeviceIds = mutableSetOf<Int>()
     private val controllerAxisLayouts = mutableMapOf<Int, ControllerDeviceAxisState>()
     private val dpadSources = mutableMapOf<Int, DpadSource>()
     private val joinerDpadKeys = mutableSetOf<LogicalControl>()
@@ -250,9 +259,20 @@ class MainActivity : ComponentActivity() {
     private var hostPeerState = PeerConnection.PeerConnectionState.NEW
     private lateinit var sessionBackCallback: OnBackPressedCallback
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
-        override fun onInputDeviceAdded(deviceId: Int) { inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceChanged(deviceId: Int) { controllerAxisLayouts.remove(deviceId); inspectPlayer2Device(deviceId) }
-        override fun onInputDeviceRemoved(deviceId: Int) { controllerAxisLayouts.remove(deviceId); if (deviceId == lastControllerDeviceId) { Log.w(TAG, "Controller disconnected: $deviceId"); sendNeutralReset("controller disconnected"); resetLocalDpadState("controller disconnected") } }
+        override fun onInputDeviceAdded(deviceId: Int) { inspectLocalControllerDevice(deviceId); inspectPlayer2Device(deviceId) }
+        override fun onInputDeviceChanged(deviceId: Int) { controllerAxisLayouts.remove(deviceId); localControllerDeviceIds.remove(deviceId); inspectLocalControllerDevice(deviceId); inspectPlayer2Device(deviceId) }
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            controllerAxisLayouts.remove(deviceId)
+            localControllerDeviceIds.remove(deviceId)
+            if (deviceId == lastControllerDeviceId) {
+                Log.w(TAG, "LOCAL_CONTROLLER_DISCONNECTED: active=true")
+                sendNeutralReset("controller disconnected")
+                resetLocalDpadState("controller disconnected")
+                lastAxes.fill(Float.NaN)
+                lastControllerDeviceId = localControllerDeviceIds.firstOrNull() ?: -1
+            }
+            updateLocalControllerAvailability("removed")
+        }
     }
     private val disconnectGraceRunnable = Runnable {
         if (joinSessionState == JoinSessionState.Reconnecting) {
@@ -324,6 +344,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         menuMusicController = MenuMusicController(this)
         profileStore = LocalProfileStore(this)
+        networkMonitor = NetworkStateMonitor(this) { state, changed -> runOnUiThread { handleNetworkState(state, changed) } }
+        networkMonitor.start()
         profileStore.loadProfile().let { profile ->
             localDisplayName = profile.displayName
             if (profile.hasCustomAvatar) profileAvatar = profileStore.loadAvatarBitmap()?.asImageBitmap()
@@ -332,6 +354,7 @@ class MainActivity : ComponentActivity() {
         ContextCompat.registerReceiver(this, projectionReadyReceiver, IntentFilter(ScreenCaptureService.ACTION_READY), ContextCompat.RECEIVER_NOT_EXPORTED)
         receiverRegistered = true
         (getSystemService(Context.INPUT_SERVICE) as InputManager).registerInputDeviceListener(inputDeviceListener, mainHandler)
+        refreshLocalControllers("startup")
         sessionBackCallback = object : OnBackPressedCallback(false) {
             override fun handleOnBackPressed() {
                 when { controllerInputTestOpen -> controllerInputTestOpen = false
@@ -346,7 +369,10 @@ class MainActivity : ComponentActivity() {
         getSharedPreferences("droid_link_ui", MODE_PRIVATE).also { preferences ->
             showIntroAnimation = preferences.getBoolean("show_intro", true)
             keepScreenAwake = preferences.getBoolean("keep_awake", true)
-            qualityPreset = preferences.getString("quality", "Auto") ?: "Auto"
+            qualityPreset = StreamingPresetPolicy.normalize(preferences.getString("quality", "Auto"))
+            if (preferences.getString("quality", "Auto") != qualityPreset) {
+                preferences.edit().putString("quality", qualityPreset).apply()
+            }
             animatedBackground = preferences.getBoolean("animated_background", true)
             hapticFeedback = preferences.getBoolean("haptics", true)
             uiSoundEffects = preferences.getBoolean("ui_sounds", true)
@@ -710,18 +736,22 @@ class MainActivity : ComponentActivity() {
         val host = mode == "host"
         val videoReady = if (host) captureStatus.contains("started", true) else remoteTrack != null
         val audioReady = audioStatus.contains("active", true) || audioStatus.contains("streaming", true)
-        val controllerReady = if (host) controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE else controlChannelOpen && lastControllerDeviceId != -1
+        val transportReady = if (host) hostConnectedSlots.isNotEmpty() else controlChannelOpen
+        val virtualReady = controllerBackend.status == ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE
         Box(Modifier.fillMaxSize().background(Color(0xD9000000)).windowInsetsPadding(WindowInsets.safeDrawing), contentAlignment = Alignment.Center) {
             Column(Modifier.widthIn(max = 430.dp).fillMaxWidth().padding(24.dp).background(panelBlack, RoundedCornerShape(18.dp)).border(1.dp, neonGreen, RoundedCornerShape(18.dp)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("PLAYER ${if (host) hostConnectedSlots.minOrNull() ?: 2 else remoteSlotAssignment?.playerSlot ?: 2} READY", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 2.sp)
                 ReadinessLine("VIDEO", if (videoReady) "READY" else "CHECKING", videoReady)
                 ReadinessLine("AUDIO", if (audioReady) "READY" else if (audioStatus.contains("unavailable", true) || audioStatus.contains("denied", true)) "UNAVAILABLE" else "CHECKING", audioReady)
-                ReadinessLine("CONTROLLER", if (controllerReady) "READY" else if (host && controllerBackend.status != ControllerBackendStatus.VIRTUAL_GAMEPAD_ACTIVE) "UNAVAILABLE" else "CHECKING", controllerReady)
+                ReadinessLine("LOCAL CONTROLLER", if (localPhysicalControllerAvailable) "READY" else "NOT DETECTED", localPhysicalControllerAvailable)
+                ReadinessLine("CONTROLLER LINK", if (transportReady) "READY" else "CHECKING", transportReady)
+                if (host && hostConnectedSlots.isNotEmpty()) ReadinessLine("REMOTE GAMEPAD", if (virtualReady) "READY" else "UNAVAILABLE", virtualReady)
                 ReadinessLine("CONNECTION", connectionQuality(), betaDiagnostics.connectionState.contains("CONNECTED", true))
                 ReadinessLine("PING", betaDiagnostics.rttMs?.let { "${it.toInt()} ms" } ?: "CHECKING", betaDiagnostics.rttMs != null)
                 val recentLoss = betaDiagnostics.recentPacketLossPercent
                 ReadinessLine("PACKET LOSS", recentLoss?.let { "%.2f%%".format(it) } ?: "CHECKING", recentLoss == null || recentLoss < 3.0)
-                if (!controllerReady) Text(if (host) friendlyControllerStatus() else "Connect or move the Player ${remoteSlotAssignment?.playerSlot ?: 2} controller to verify input.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+                if (!localPhysicalControllerAvailable) Text("Connect an Android GAMEPAD or JOYSTICK controller. Bluetooth and USB controllers are supported when Android exposes standard gamepad capabilities.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
+                if (host && hostConnectedSlots.isNotEmpty() && !virtualReady) Text("${friendlyControllerStatus()}. Local Player 1 input is separate; remote players require the host virtual-gamepad backend.", color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 if (!audioReady && !audioStatus.contains("waiting", true)) Text(friendlyAudioStatus(), color = mutedText, fontSize = 12.sp, textAlign = TextAlign.Center)
                 NeonButton("START PLAYING") { readinessVisible = false }
                 NeonTextButton("CONNECTION STATS") { readinessVisible = false; sessionStatsOpen = true }
@@ -802,6 +832,11 @@ class MainActivity : ComponentActivity() {
             StatSection("CONNECTION") {
                 diagnosticLine("Quality", connectionQuality)
                 diagnosticLine("Ping", d.rttMs?.let { "%.1f ms".format(it) } ?: "—")
+                diagnosticLine("Network", d.activeNetworkTransport)
+                diagnosticLine("Internet", when (d.internetValidated) { true -> "Validated"; false -> "Not validated"; null -> "Unknown" })
+                diagnosticLine("Recovery", d.networkRecoveryStatus)
+                diagnosticLine("ICE restarts", d.iceRestartAttempts.toString())
+                diagnosticLine("Relay candidates", d.relayCandidatesGathered.toString())
             }
             StatSection("VIDEO") {
                 diagnosticLine("Resolution", d.resolution)
@@ -909,7 +944,7 @@ class MainActivity : ComponentActivity() {
             }
             SettingSection("STREAMING") {
                 Text("Quality preset", color = mutedText)
-                listOf(listOf("Auto", "Low Latency"), listOf("Balanced", "High Quality")).forEach { row ->
+                listOf(listOf("Auto", "Low Latency"), listOf("Balanced")).forEach { row ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         row.forEach { preset ->
                             FilterChip(selected = qualityPreset == preset, onClick = {
@@ -919,7 +954,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                SettingInfo("Resolution / FPS", when (qualityPreset) { "Low Latency" -> "720p / 60 FPS target"; "Balanced" -> "720p / Auto FPS"; "High Quality" -> "1080p / 30 FPS target"; else -> "Automatic (recommended)" })
+                SettingInfo("Resolution / FPS", when (qualityPreset) { "Low Latency" -> "720p / 60 FPS target"; "Balanced" -> "720p / Auto FPS"; else -> "Automatic (recommended)" })
                 SettingInfo("Bitrate", "Automatic WebRTC adaptation")
             }
             SettingSection("AUDIO") {
@@ -1097,6 +1132,7 @@ class MainActivity : ComponentActivity() {
         syncMenuMusic()
         window.decorView.post {
             enableImmersiveMode()
+            refreshLocalControllers("activity resumed")
             requestUnbufferedControllerDispatch()
             hostRtcBySlot.forEach { (slot, rtc) -> rtc.recoverControllerChannels("P$slot activity resumed") }
             logControllerLifecycle("activity resumed")
@@ -1252,7 +1288,7 @@ class MainActivity : ComponentActivity() {
                 ensureRemoteControllerSlot(slot, "host startup")
             }
             controllerBackend = controllerBackends.getValue(RemotePlayerSlots.PLAYER_2)
-            updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label) }
+            updateControllerDiagnostics { copy(player2Status = controllerBackend.status.label, hostVirtualControllerStatus = controllerBackend.status.label) }
             schedulePlayer2Inspection()
             hostRtcBySlot[RemotePlayerSlots.PLAYER_2] = hostRtc
             hostRtc.initialize()
@@ -1368,6 +1404,9 @@ class MainActivity : ComponentActivity() {
             when (state) {
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     cancelHostDisconnectGrace(slot)
+                    cancelHostIceRestart(slot)
+                    hostIceRestartAttempts.remove(slot)
+                    hostLastIceRestartMs.remove(slot)
                     hostConnectedSlots = hostConnectedSlots + slot
                     hostStatus = connectedPlayersStatus()
                     sessionStarting = false
@@ -1375,11 +1414,20 @@ class MainActivity : ComponentActivity() {
                     uiFeedback(window.decorView, success = true)
                 }
                 PeerConnection.PeerConnectionState.DISCONNECTED -> {
-                    hostStatus = "Player $slot reconnecting..."
+                    hostStatus = if (activeNetworkState.available) "Player $slot connection lost — retrying" else "No internet connection"
                     scheduleHostDisconnectGrace(slot, rtc, code, generation)
+                    scheduleHostIceRestart(slot, rtc, code, generation, "PeerConnection disconnected")
                 }
-                PeerConnection.PeerConnectionState.FAILED, PeerConnection.PeerConnectionState.CLOSED -> {
+                PeerConnection.PeerConnectionState.FAILED -> {
+                    hostConnectedSlots = hostConnectedSlots - slot
+                    resetRemoteInput(slot, "PeerConnection FAILED")
+                    scheduleHostDisconnectGrace(slot, rtc, code, generation)
+                    scheduleHostIceRestart(slot, rtc, code, generation, "PeerConnection failed")
+                    hostStatus = if (activeNetworkState.available) "Player $slot connection failed — retrying" else "No internet connection"
+                }
+                PeerConnection.PeerConnectionState.CLOSED -> {
                     cancelHostDisconnectGrace(slot)
+                    cancelHostIceRestart(slot)
                     hostConnectedSlots = hostConnectedSlots - slot
                     resetRemoteInput(slot, "PeerConnection $state")
                     refreshHostSessionState()
@@ -1408,6 +1456,7 @@ class MainActivity : ComponentActivity() {
         val rtc = hostRtcBySlot[slot] ?: return
         Log.d(TAG, "P$slot isolated cleanup started: reason=$reason")
         cancelHostDisconnectGrace(slot)
+        cancelHostIceRestart(slot)
         if (hostRtc.sharedHostMedia() == null) {
             resetRemoteInput(slot, reason)
             hostPeerStates.remove(slot)
@@ -1439,19 +1488,68 @@ class MainActivity : ComponentActivity() {
     private fun scheduleHostDisconnectGrace(slot: Int, rtc: WebRtcManager, code: String, generation: Long) {
         cancelHostDisconnectGrace(slot)
         val runnable = Runnable {
-            if (isCurrentHostPeer(slot, rtc, code, generation) && hostPeerStates[slot] == PeerConnection.PeerConnectionState.DISCONNECTED) {
-                hostConnectedSlots = hostConnectedSlots - slot
-                resetRemoteInput(slot, "reconnect grace expired")
-                refreshHostSessionState()
+            val state = hostPeerStates[slot]
+            if (isCurrentHostPeer(slot, rtc, code, generation) &&
+                (state == PeerConnection.PeerConnectionState.DISCONNECTED || state == PeerConnection.PeerConnectionState.FAILED)) {
                 Log.e(TAG, "P$slot reconnect grace expired; other remote players preserved")
+                cleanupHostRemoteSlot(slot, code, generation, "network recovery expired", rebuild = true)
             }
         }
         hostDisconnectGraceRunnables[slot] = runnable
-        mainHandler.postDelayed(runnable, 15_000L)
+        mainHandler.postDelayed(runnable, NetworkRecoveryPolicy.FAILED_SESSION_GRACE_MS)
     }
 
     private fun cancelHostDisconnectGrace(slot: Int) {
         hostDisconnectGraceRunnables.remove(slot)?.let(mainHandler::removeCallbacks)
+    }
+
+    private fun scheduleHostIceRestart(slot: Int, rtc: WebRtcManager, code: String, generation: Long, reason: String) {
+        if (!isCurrentHostPeer(slot, rtc, code, generation)) return
+        cancelHostIceRestart(slot)
+        val runnable = Runnable { performHostIceRestart(slot, rtc, code, generation, reason) }
+        hostIceRestartRunnables[slot] = runnable
+        mainHandler.postDelayed(runnable, NetworkRecoveryPolicy.NORMAL_RECOVERY_GRACE_MS)
+        Log.w(TAG, "ICE_RESTART_SCHEDULED: player=$slot delayMs=${NetworkRecoveryPolicy.NORMAL_RECOVERY_GRACE_MS} reason=$reason")
+    }
+
+    private fun performHostIceRestart(slot: Int, rtc: WebRtcManager, code: String, generation: Long, reason: String) {
+        hostIceRestartRunnables.remove(slot)
+        if (!isCurrentHostPeer(slot, rtc, code, generation)) return
+        val state = hostPeerStates[slot]
+        if (state != PeerConnection.PeerConnectionState.DISCONNECTED && state != PeerConnection.PeerConnectionState.FAILED) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val attempts = hostIceRestartAttempts[slot] ?: 0
+        val since = now - (hostLastIceRestartMs[slot] ?: (now - NetworkRecoveryPolicy.RESTART_COOLDOWN_MS))
+        if (!NetworkRecoveryPolicy.canRestart(attempts, since, activeNetworkState.available)) {
+            val cooldownRemaining = (NetworkRecoveryPolicy.RESTART_COOLDOWN_MS - since).coerceAtLeast(0L)
+            Log.w(TAG, "ICE_RESTART_SKIPPED: player=$slot attempts=$attempts networkAvailable=${activeNetworkState.available} cooldownRemainingMs=$cooldownRemaining")
+            if (activeNetworkState.available && attempts < NetworkRecoveryPolicy.MAX_ICE_RESTARTS_PER_DISCONNECT && cooldownRemaining > 0L) {
+                val runnable = Runnable { performHostIceRestart(slot, rtc, code, generation, reason) }
+                hostIceRestartRunnables[slot] = runnable
+                mainHandler.postDelayed(runnable, cooldownRemaining)
+            }
+            return
+        }
+        hostIceRestartAttempts[slot] = attempts + 1
+        hostLastIceRestartMs[slot] = now
+        betaDiagnostics = betaDiagnostics.copy(networkRecoveryStatus = "Retrying Player $slot", iceRestartAttempts = attempts + 1)
+        rtc.restartIceAndCreateOffer({ offer ->
+            if (!isCurrentHostPeer(slot, rtc, code, generation)) return@restartIceAndCreateOffer
+            firebase.saveOffer(code, slot, offer, {
+                Log.w(TAG, "ICE_RESTART_OFFER_PUBLISHED: player=$slot attempt=${attempts + 1} reason=$reason")
+                scheduleHostIceRestart(slot, rtc, code, generation, "previous ICE restart did not recover")
+            }, { error ->
+                Log.e(TAG, "ICE_RESTART_SIGNALING_FAILED: player=$slot attempt=${attempts + 1} category=signaling error=$error")
+                scheduleHostIceRestart(slot, rtc, code, generation, "ICE restart offer save failed")
+            })
+        }, { error ->
+            Log.e(TAG, "ICE_RESTART_FAILED: player=$slot attempt=${attempts + 1} error=$error")
+            scheduleHostIceRestart(slot, rtc, code, generation, "ICE restart offer creation failed")
+        })
+    }
+
+    private fun cancelHostIceRestart(slot: Int) {
+        hostIceRestartRunnables.remove(slot)?.let(mainHandler::removeCallbacks)
     }
 
     private fun refreshHostSessionState() {
@@ -1489,7 +1587,10 @@ class MainActivity : ComponentActivity() {
             remoteSlotAssignment = assignment
             transitionJoinState(JoinSessionState.Negotiating, "P${assignment.playerSlot} assigned", "Player ${assignment.playerSlot} assigned - waiting for host...")
             firebase.listenForOffer(code, assignment.playerSlot, joinSlotOwner(assignment, generation), { offer ->
-                if (isCurrentSession(generation, code) && remoteSlotAssignment == assignment) prepareJoinPeer(code, offer, assignment, generation)
+                if (isCurrentSession(generation, code) && remoteSlotAssignment == assignment) {
+                    if (clientRtc.hasPeerConnection()) applyJoinRestartOffer(code, offer, assignment, generation)
+                    else prepareJoinPeer(code, offer, assignment, generation)
+                }
                 else staleSessionCallback("P${assignment.playerSlot} offer", generation)
             }, { error -> if (isCurrentSession(generation, code)) transitionJoinFailure("Offer load failed: $error") })
         }, { if (isCurrentSession(generation, code)) transitionJoinFailure("Join failed: $it") else staleSessionCallback("join failure", generation) })
@@ -1503,7 +1604,10 @@ class MainActivity : ComponentActivity() {
         clientRtc.onControlMessageReceived = { message -> handleControlMessage(null, clientRtc, message) }
         clientRtc.onDataChannelStateChanged = { label, state -> runOnUiThread {
             if (!isCurrentSession(generation, code)) { staleSessionCallback("data channel", generation); return@runOnUiThread }
-            if (label == "droidlink-controls") controlChannelOpen = state == DataChannel.State.OPEN
+            if (label == "droidlink-controls") {
+                controlChannelOpen = state == DataChannel.State.OPEN
+                updateControllerDiagnostics { copy(remoteControllerTransportStatus = if (controlChannelOpen) "Connected" else state.name) }
+            }
             Log.d(TAG, "P$slot client DataChannel $label $state")
         } }
         clientRtc.onDiagnostics = { update -> runOnUiThread { if (isCurrentSession(generation, code)) betaDiagnostics = mergeControllerDiagnostics(update) else staleSessionCallback("stats diagnostics", generation) } }
@@ -1532,10 +1636,15 @@ class MainActivity : ComponentActivity() {
                     Log.w(TAG, "CONTROLLER_CAPTURE_PRESERVED: transient disconnect; DataChannel state gates sends during in-place recovery")
                     transitionJoinState(JoinSessionState.Reconnecting, "PeerConnection DISCONNECTED", "Connection interrupted - recovering...")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
-                    mainHandler.postDelayed(disconnectGraceRunnable, 15_000L)
-                    Log.w(TAG, "CONNECTION INTERRUPTED: preserving renderer for 15-second automatic WebRTC recovery window")
+                    mainHandler.postDelayed(disconnectGraceRunnable, NetworkRecoveryPolicy.FAILED_SESSION_GRACE_MS)
+                    Log.w(TAG, "CONNECTION INTERRUPTED: preserving renderer for ${NetworkRecoveryPolicy.FAILED_SESSION_GRACE_MS}-ms automatic WebRTC recovery window")
                 }
-                PeerConnection.PeerConnectionState.FAILED,
+                PeerConnection.PeerConnectionState.FAILED -> {
+                    sendNeutralReset("PeerConnection FAILED")
+                    transitionJoinState(JoinSessionState.Reconnecting, "PeerConnection FAILED", if (activeNetworkState.available) "Connection lost — retrying" else "No internet connection")
+                    mainHandler.removeCallbacks(disconnectGraceRunnable)
+                    mainHandler.postDelayed(disconnectGraceRunnable, NetworkRecoveryPolicy.FAILED_SESSION_GRACE_MS)
+                }
                 PeerConnection.PeerConnectionState.CLOSED -> {
                     sendNeutralReset("PeerConnection $state")
                     mainHandler.removeCallbacks(disconnectGraceRunnable)
@@ -1560,6 +1669,21 @@ class MainActivity : ComponentActivity() {
                 }, { transitionJoinFailure("Answer error: $it") })
             }, { transitionJoinFailure("Offer error: $it") })
         }, onError = { if (isCurrentSession(generation, code)) transitionJoinFailure("PeerConnection error: $it") else staleSessionCallback("PeerConnection error", generation) })
+    }
+
+    private fun applyJoinRestartOffer(code: String, offer: String, assignment: RemoteSlotAssignment, generation: Long) {
+        if (!isCurrentSession(generation, code) || remoteSlotAssignment != assignment) return
+        Log.w(TAG, "ICE_RESTART_OFFER_RECEIVED: player=${assignment.playerSlot}")
+        if (joinSessionState == JoinSessionState.Connected) {
+            transitionJoinState(JoinSessionState.Reconnecting, "ICE restart offer received", "Connection lost — retrying")
+        }
+        clientRtc.setRemoteOffer(offer, {
+            clientRtc.createAnswer({ answer ->
+                firebase.saveAnswer(code, assignment.playerSlot, answer, {
+                    Log.w(TAG, "ICE_RESTART_ANSWER_PUBLISHED: player=${assignment.playerSlot}")
+                }, { error -> Log.e(TAG, "ICE_RESTART_SIGNALING_FAILED: side=joiner category=answer-save error=$error") })
+            }, { error -> Log.e(TAG, "ICE_RESTART_FAILED: side=joiner category=answer-create error=$error") })
+        }, { error -> Log.e(TAG, "ICE_RESTART_FAILED: side=joiner category=remote-offer error=$error") })
     }
 
     private fun transitionJoinState(next: JoinSessionState, reason: String, status: String): Boolean {
@@ -1855,8 +1979,75 @@ class MainActivity : ComponentActivity() {
             duplicateControlPacketsDropped = current.duplicateControlPacketsDropped,
             outOfOrderControlPacketsDropped = current.outOfOrderControlPacketsDropped,
             player2Status = current.player2Status,
-            player2Classification = current.player2Classification
+            player2Classification = current.player2Classification,
+            localPhysicalControllerStatus = current.localPhysicalControllerStatus,
+            remoteControllerTransportStatus = current.remoteControllerTransportStatus,
+            hostVirtualControllerStatus = current.hostVirtualControllerStatus,
+            activeNetworkTransport = current.activeNetworkTransport,
+            internetValidated = current.internetValidated,
+            networkRecoveryStatus = current.networkRecoveryStatus,
+            iceRestartAttempts = current.iceRestartAttempts
         )
+    }
+
+    private fun handleNetworkState(state: DroidLinkNetworkState, changed: Boolean) {
+        val previous = activeNetworkState
+        activeNetworkState = state
+        betaDiagnostics = betaDiagnostics.copy(activeNetworkTransport = state.transport, internetValidated = state.validated)
+        when {
+            !state.available && sessionActive -> {
+                betaDiagnostics = betaDiagnostics.copy(networkRecoveryStatus = "Waiting for network")
+                if (mode == "client") clientStatus = "No internet connection"
+                else if (mode == "host") hostStatus = "No internet connection"
+            }
+            state.available && (changed || !previous.available) -> {
+                Log.w(TAG, "ACTIVE_NETWORK_CHANGED: from=${previous.transport} to=${state.transport} validated=${state.validated} sessionActive=$sessionActive")
+                betaDiagnostics = betaDiagnostics.copy(networkRecoveryStatus = if (sessionActive) "Network restored" else "Not needed")
+                if (mode == "host") {
+                    hostRtcBySlot.forEach { (slot, rtc) ->
+                        val peerState = hostPeerStates[slot]
+                        if (peerState == PeerConnection.PeerConnectionState.DISCONNECTED || peerState == PeerConnection.PeerConnectionState.FAILED) {
+                            scheduleHostIceRestart(slot, rtc, hostRoomCode, sessionGeneration, "active network changed")
+                        }
+                    }
+                } else if (mode == "client" && joinSessionState == JoinSessionState.Reconnecting) {
+                    clientStatus = "Network restored — reconnecting"
+                }
+            }
+        }
+    }
+
+    private fun refreshLocalControllers(reason: String) {
+        localControllerDeviceIds.clear()
+        InputDevice.getDeviceIds().forEach(::inspectLocalControllerDevice)
+        updateLocalControllerAvailability(reason)
+    }
+
+    private fun inspectLocalControllerDevice(deviceId: Int) {
+        val device = InputDevice.getDevice(deviceId) ?: return
+        if (!AndroidControllerDevicePolicy.isEligible(device.sources, device.isVirtual, device.name)) return
+        localControllerDeviceIds.add(deviceId)
+        if (lastControllerDeviceId == -1) lastControllerDeviceId = deviceId
+        val sources = AndroidControllerDevicePolicy.sourceSummary(device.sources)
+        Log.d(TAG, "LOCAL_CONTROLLER_DETECTED: id=$deviceId sources=$sources virtual=${device.isVirtual} axes=${device.motionRanges.size}")
+        updateLocalControllerAvailability("detected")
+    }
+
+    private fun updateLocalControllerAvailability(reason: String) {
+        localPhysicalControllerAvailable = localControllerDeviceIds.isNotEmpty()
+        localPhysicalControllerSummary = if (localPhysicalControllerAvailable) {
+            "${localControllerDeviceIds.size} Android gamepad${if (localControllerDeviceIds.size == 1) "" else "s"}"
+        } else {
+            "Not detected"
+        }
+        updateControllerDiagnostics {
+            copy(
+                localPhysicalControllerStatus = localPhysicalControllerSummary,
+                remoteControllerTransportStatus = if (controlChannelOpen) "Connected" else "Not connected",
+                hostVirtualControllerStatus = controllerBackend.status.label
+            )
+        }
+        Log.d(TAG, "LOCAL_CONTROLLER_STATUS: available=$localPhysicalControllerAvailable count=${localControllerDeviceIds.size} reason=$reason")
     }
 
     private fun schedulePlayer2Inspection() {
@@ -1990,15 +2181,20 @@ class MainActivity : ComponentActivity() {
         val metrics = resources.displayMetrics
         val sourceWidth = metrics.widthPixels.coerceAtLeast(2)
         val sourceHeight = metrics.heightPixels.coerceAtLeast(2)
-        val targetLongEdge = when (qualityPreset) { "Low Latency" -> 1280.0; "High Quality" -> 1920.0; else -> 1280.0 }
+        val targetLongEdge = 1280.0
         val scale = minOf(1.0, targetLongEdge / maxOf(sourceWidth, sourceHeight))
         val width = ((sourceWidth * scale).toInt() / 2 * 2).coerceAtLeast(2)
         val height = ((sourceHeight * scale).toInt() / 2 * 2).coerceAtLeast(2)
-        val refreshRate = display?.refreshRate ?: 60f
-        val fps = when (qualityPreset) { "Balanced", "High Quality" -> 30; else -> if (refreshRate >= 50f) 60 else 30 }
+        val refreshRate = currentRefreshRate()
+        val fps = when (qualityPreset) { "Balanced" -> 30; else -> if (refreshRate >= 50f) 60 else 30 }
         Log.d(TAG, "Capture profile selected: preset=$qualityPreset ${width}x$height@$fps source=${sourceWidth}x$sourceHeight refreshRate=$refreshRate")
         return Triple(width, height, fps)
     }
+
+    @Suppress("DEPRECATION")
+    private fun currentRefreshRate(): Float =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display?.refreshRate ?: 60f
+        else windowManager.defaultDisplay.refreshRate
 
     private fun returnToMenu() { cleanupSession(deleteHostRoom = true); mode = "menu" }
 
@@ -2053,6 +2249,8 @@ class MainActivity : ComponentActivity() {
         if (deleteHostRoom && hostRoomCode.isNotEmpty()) firebase.deleteRoom(hostRoomCode)
         hostDisconnectGraceRunnables.values.forEach(mainHandler::removeCallbacks)
         hostDisconnectGraceRunnables.clear()
+        hostIceRestartRunnables.values.forEach(mainHandler::removeCallbacks)
+        hostIceRestartRunnables.clear(); hostIceRestartAttempts.clear(); hostLastIceRestartMs.clear()
         mainHandler.removeCallbacksAndMessages(null)
         // Remove the renderer sink while its receiver-owned VideoTrack and PeerConnection are still valid.
         detachRenderer(); remoteTrack = null
@@ -2082,6 +2280,7 @@ class MainActivity : ComponentActivity() {
         logicalControllerState = ControllerInputState(); controllerTestDisplayState = ControllerInputState(); lastControllerTestUiMs = 0L
         resetLocalDpadState("session cleanup"); dpadDuplicateDrops = 0L
         controllerWindowPackets = 0; controllerWindowStart = android.os.SystemClock.elapsedRealtime(); betaDiagnostics = BetaDiagnostics()
+        updateLocalControllerAvailability("session cleanup")
         updateSessionActive(false)
         Log.d(TAG, "Session cleanup complete")
     }
@@ -2105,18 +2304,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isControllerEvent(source: Int, device: InputDevice?): Boolean {
-        val deviceSources = device?.sources ?: 0
+        if (device != null) return AndroidControllerDevicePolicy.isEligible(device.sources, device.isVirtual, device.name)
         return source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
-            source and InputDevice.SOURCE_DPAD == InputDevice.SOURCE_DPAD ||
-            source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK ||
-            deviceSources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
-            deviceSources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+            source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
     }
 
     private fun noteController(deviceId: Int, name: String?) {
         if (lastControllerDeviceId == deviceId) return
         if (lastControllerDeviceId != -1) { sendNeutralReset("controller changed"); resetLocalDpadState("controller changed") }
         lastControllerDeviceId = deviceId
+        localControllerDeviceIds.add(deviceId)
+        updateLocalControllerAvailability("input event")
         Log.d(TAG, "CONTROLLER DETECTED: id=$deviceId name=${name ?: "unknown"}")
     }
 
@@ -2296,6 +2494,7 @@ class MainActivity : ComponentActivity() {
     private fun InputDevice.MotionRange.toAxisRange() = ControllerAxisRange(min, max, flat)
 
     override fun onDestroy() {
+        if (::networkMonitor.isInitialized) networkMonitor.stop()
         cleanupSession(deleteHostRoom = true)
         hostRtc.release(); clientRtc.release()
         menuMusicController.release()
