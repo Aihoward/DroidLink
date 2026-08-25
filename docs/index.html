@@ -22,7 +22,7 @@
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="community.css">
   <link rel="stylesheet" href="support-status.css">
-  <script src="app.js?v=20260822-1" defer></script>
+  <script src="app.js?v=20260824-1" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -45,8 +45,8 @@
         <h1>Play together.<br><span>Anywhere.</span></h1>
         <p class="hero-lede">Low-latency Android-to-Android screen streaming, game audio, and controller sharing—built for real gameplay.</p>
         <aside class="support-alert" aria-labelledby="support-alert-title">
-          <strong id="support-alert-title">Important update: v3.6 is the only supported stable version</strong>
-          <p>Earlier APKs use obsolete Firebase or TURN server configuration and can no longer connect reliably. Existing users must replace older installations with v3.6 on every participating device.</p>
+          <strong id="support-alert-title">DroidLink v3.7 Stable is available</strong>
+          <p>v3.7 begins a new permanent signing identity. If v3.6 or an older build is installed, uninstall it once before installing v3.7. Future Obtainium updates can then install normally.</p>
         </aside>
         <div class="hero-actions">
           <a class="button button-primary latest-download disabled" href="https://github.com/Aihoward/DroidLink/releases" aria-disabled="true">Checking latest APK…</a>
@@ -70,7 +70,7 @@
     </section>
 
     <section class="section" id="download">
-      <div class="section-heading"><span>01 / DOWNLOAD</span><h2>Get DroidLink 3.6</h2><p>Version 3.6 is the only supported stable build. GitHub Releases remains the source of truth, and this page links directly to its official APK.</p></div>
+      <div class="section-heading"><span>01 / DOWNLOAD</span><h2>Get DroidLink 3.7</h2><p>Version 3.7 is the current supported stable build. GitHub Releases remains the source of truth, and this page links directly to its signed APK.</p></div>
       <div id="latest-release" class="featured-release skeleton-card" aria-live="polite">
         <div><span class="badge">CHECKING GITHUB</span><h3>Finding the latest stable release…</h3><p>Release details will appear here.</p></div>
       </div>
@@ -90,7 +90,7 @@
     </section>
 
     <section class="section" id="releases">
-      <div class="section-heading"><span>03 / RELEASES</span><h2>Release history</h2><p>Version 3.6 is supported. Older entries remain visible for project history but their APKs are not recommended or linked for installation.</p></div>
+      <div class="section-heading"><span>03 / RELEASES</span><h2>Release history</h2><p>Version 3.7 is supported. Older entries remain visible for project history but their APKs are not recommended or linked for installation.</p></div>
       <div id="release-list" class="release-list" aria-live="polite"><p class="loading">Loading public GitHub releases…</p></div>
       <div class="center"><button id="show-more" class="button button-secondary" hidden>Show older releases</button></div>
     </section>
@@ -98,10 +98,10 @@
     <section class="section install-section" id="install">
       <div class="section-heading"><span>04 / INSTALL</span><h2>Install on Android</h2></div>
       <ol class="install-steps">
-        <li><span>1</span><div><h3>Download v3.6</h3><p>Download only the DroidLink v3.6 APK from this site or its GitHub release.</p></div></li>
-        <li><span>2</span><div><h3>Open the APK</h3><p>Open it from your browser download or Android file manager.</p></div></li>
+        <li><span>1</span><div><h3>Remove older DroidLink</h3><p>If v3.6 or older is installed, uninstall it once because v3.7 uses the new permanent signing identity.</p></div></li>
+        <li><span>2</span><div><h3>Download v3.7</h3><p>Download the official DroidLink v3.7 APK from this site or GitHub Releases.</p></div></li>
         <li><span>3</span><div><h3>Allow this source</h3><p>If Android asks, allow installation from that browser or file manager only.</p></div></li>
-        <li><span>4</span><div><h3>Install on both devices</h3><p>Complete installation, then confirm both participating devices are running v3.6.</p></div></li>
+        <li><span>4</span><div><h3>Install on both devices</h3><p>Confirm both devices run v3.7. Obtainium can handle later updates signed with this same key.</p></div></li>
       </ol>
       <p class="safety-note">DroidLink never asks you to disable Android security globally or bypass Play Protect.</p>
     </section>

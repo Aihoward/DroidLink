@@ -9,7 +9,7 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-Android-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![WebRTC](https://img.shields.io/badge/Streaming-WebRTC-55ff33)](https://webrtc.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/Aihoward/DroidLink?include_prereleases&label=latest%20beta&color=55ff33)](https://github.com/Aihoward/DroidLink/releases)
+[![Latest Release](https://img.shields.io/github/v/release/Aihoward/DroidLink?label=stable&color=55ff33)](https://github.com/Aihoward/DroidLink/releases/latest)
 
 [Download the latest APK](https://github.com/Aihoward/DroidLink/releases) · [All releases](https://github.com/Aihoward/DroidLink/releases) · [Report an issue](https://github.com/Aihoward/DroidLink/issues)
 
@@ -19,7 +19,7 @@
 
 DroidLink connects two Android devices for remote gameplay. The host shares game video and audio while the joining device receives the stream and sends controller input over WebRTC.
 
-The project is currently in beta. Builds are published for physical-device testing, and previous releases remain available as rollback checkpoints.
+DroidLink v3.7 is the current stable release. Previous releases remain visible as historical checkpoints but are not recommended for installation.
 
 ## Features
 
@@ -36,7 +36,7 @@ The project is currently in beta. Builds are published for physical-device testi
 
 ## Download
 
-Install the newest APK from [GitHub Releases](https://github.com/Aihoward/DroidLink/releases). Releases marked **Pre-release** are beta/debug builds intended for testing.
+Install DroidLink v3.7 from [GitHub Releases](https://github.com/Aihoward/DroidLink/releases/tag/v3.7). If v3.6 or older is installed, uninstall it once before installing v3.7 because the release signing identity changed. Future Obtainium updates can then install normally when signed with the v3.7 key.
 
 > Android may warn about installing apps from outside Google Play. Only download DroidLink APKs from this official repository.
 
@@ -80,7 +80,7 @@ Local credentials, signing keys, TURN secrets, and `local.properties` must never
 
 ## Project status
 
-DroidLink is under active beta development. Physical-device results are the source of truth for streaming, audio, controller compatibility, and latency behavior; a successful build alone does not prove those features on every device.
+DroidLink v3.7 is stable, while device, game, audio-capture, and restrictive-network behavior can still vary. Physical-device results remain the source of truth for compatibility and latency.
 
 ## Security and privacy
 
